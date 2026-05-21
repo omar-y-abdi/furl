@@ -564,6 +564,83 @@ class StreamingMixin:
             except Exception as e:
                 logger.debug(f"[{request_id}] CCR Feedback recording failed: {e}")
 
+    def _record_ccr_feedback_from_openai_sse(self, full_sse_data: str, request_id: str) -> None:
+        """Record headroom_retrieve feedback from OpenAI Chat Completions SSE.
+
+        OpenAI streams tool_calls incrementally via
+        ``choices[0].delta.tool_calls[*].function.arguments`` (chunked
+        JSON string). We accumulate per-call-index and finalize on
+        stream completion. The accumulator records each completed
+        ``headroom_retrieve`` invocation as a no-op store call for the
+        TOIN feedback side effect (matches the Anthropic streaming
+        feedback path).
+        """
+        from headroom.cache.compression_store import get_compression_store
+
+        # tool_call_index -> {"name": str, "args_buf": str}
+        tool_calls: dict[int, dict[str, str]] = {}
+
+        for raw_line in full_sse_data.split("\n"):
+            line = raw_line.strip()
+            if not line.startswith("data: "):
+                continue
+            payload = line[6:]
+            if not payload or payload == "[DONE]":
+                continue
+            try:
+                data = json.loads(payload)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            if not isinstance(data, dict):
+                continue
+
+            choices = data.get("choices") or []
+            if not choices:
+                continue
+            delta = (choices[0] or {}).get("delta") or {}
+            for tc in delta.get("tool_calls") or []:
+                if not isinstance(tc, dict):
+                    continue
+                idx = tc.get("index", 0)
+                fn = tc.get("function") or {}
+                slot = tool_calls.setdefault(idx, {"name": "", "args_buf": ""})
+                fn_name = fn.get("name")
+                if fn_name:
+                    slot["name"] = fn_name
+                fn_args = fn.get("arguments")
+                if fn_args:
+                    slot["args_buf"] = slot["args_buf"] + fn_args
+
+        if not tool_calls:
+            return
+
+        store = get_compression_store()
+        for slot in tool_calls.values():
+            if slot["name"] != "headroom_retrieve":
+                continue
+            try:
+                input_data = json.loads(slot["args_buf"]) if slot["args_buf"] else {}
+            except (json.JSONDecodeError, ValueError):
+                continue
+            if not isinstance(input_data, dict):
+                continue
+            hash_key = input_data.get("hash")
+            query = input_data.get("query")
+            if not hash_key:
+                continue
+
+            logger.info(
+                f"[{request_id}] CCR Feedback (openai stream): Recording retrieval "
+                f"hash={hash_key[:8]}... query={query!r}"
+            )
+            try:
+                if query:
+                    store.search(hash_key, query)
+                else:
+                    store.retrieve(hash_key, query=None)
+            except Exception as e:
+                logger.debug(f"[{request_id}] CCR Feedback (openai stream) failed: {e}")
+
     async def _finalize_stream_response(
         self,
         *,
@@ -1374,6 +1451,8 @@ class StreamingMixin:
         optimization_latency: float,
         pipeline_timing: dict[str, float] | None = None,
         waste_signals: dict[str, int] | None = None,
+        prefix_tracker: Any | None = None,
+        optimized_messages: list[dict] | None = None,
     ) -> StreamingResponse:
         """Stream OpenAI chat completion response from backend.
 
@@ -1389,6 +1468,19 @@ class StreamingMixin:
         separate cache-write counter, so the write portion is inferred
         via :func:`_infer_openai_cache_write_tokens`. Memory stays O(1)
         because the buffer-parser consumes whole events as they arrive.
+
+        ``prefix_tracker``/``optimized_messages`` carry the
+        :class:`PrefixCacheTracker` for the session so cache stats from
+        the FINAL usage frame can update the tracker for the next turn
+        — mirroring the direct streaming path
+        (``_stream_response``/``_finalize_stream_response``).
+
+        NOTE: CCR request-level intercept on the streaming path is
+        intentionally OUT OF SCOPE. Mirrors the Anthropic streaming
+        path, which also does not buffer-and-rewrite mid-stream — doing
+        so would require buffering the full response and would kill the
+        streaming benefit. We do still record CCR retrieval feedback
+        (cheap) for TOIN learning.
         """
         from fastapi.responses import StreamingResponse
 
@@ -1404,12 +1496,23 @@ class StreamingMixin:
                 "input_tokens": None,
                 "output_tokens": None,
                 "cache_read_input_tokens": None,
+                "cache_creation_input_tokens": None,
             }
+            # Bytes-level mirror of the SSE stream so we can parse the
+            # final response shape for CCR feedback after the stream
+            # closes (cheap, no buffering of in-flight chunks back to
+            # the client).
+            full_sse_bytes = bytearray()
 
             def _absorb(usage: dict[str, int] | None) -> None:
                 if not usage:
                     return
-                for key in ("input_tokens", "output_tokens", "cache_read_input_tokens"):
+                for key in (
+                    "input_tokens",
+                    "output_tokens",
+                    "cache_read_input_tokens",
+                    "cache_creation_input_tokens",
+                ):
                     if key in usage and not stream_state.get(key):
                         stream_state[key] = usage[key]
 
@@ -1417,6 +1520,7 @@ class StreamingMixin:
                 async for sse_chunk in self.anthropic_backend.stream_openai_message(body, headers):
                     chunk_bytes = sse_chunk.encode() if isinstance(sse_chunk, str) else sse_chunk
                     stream_state["sse_buffer"].extend(chunk_bytes)
+                    full_sse_bytes.extend(chunk_bytes)
                     _absorb(self._parse_sse_usage_from_buffer(stream_state, "openai"))
                     # Per-chunk fallback for upstreams that emit only
                     # ``completion_tokens`` and not a full usage frame.
@@ -1454,9 +1558,20 @@ class StreamingMixin:
                 upstream_input = stream_state["input_tokens"]
                 output_tokens = stream_state["output_tokens"] or 0
                 cache_read_tokens = stream_state["cache_read_input_tokens"] or 0
+                # Prefer authoritative cache_creation_input_tokens from
+                # Bedrock/Anthropic shape when present. Fall back to
+                # inferring write count from total - read for OpenAI
+                # shape (which has no separate write counter).
+                cache_creation_input_tokens = stream_state.get("cache_creation_input_tokens") or 0
                 if upstream_input is None:
                     cache_write_tokens = 0
                     uncached_input_tokens = 0
+                    cache_inferred = False
+                elif cache_creation_input_tokens > 0:
+                    cache_write_tokens = cache_creation_input_tokens
+                    uncached_input_tokens = max(
+                        upstream_input - cache_read_tokens - cache_write_tokens, 0
+                    )
                     cache_inferred = False
                 else:
                     cache_write_tokens = _infer_openai_cache_write_tokens(
@@ -1464,6 +1579,35 @@ class StreamingMixin:
                     )
                     uncached_input_tokens = max(upstream_input - cache_read_tokens, 0)
                     cache_inferred = True
+
+                # Update prefix cache tracker for the next turn — mirrors
+                # the non-streaming sibling. Done before outcome funnel
+                # so prefix state is consistent regardless of metric
+                # path.
+                if prefix_tracker is not None:
+                    tracker_messages = (
+                        optimized_messages
+                        if optimized_messages is not None
+                        else body.get("messages", [])
+                    )
+                    prefix_tracker.update_from_response(
+                        cache_read_tokens=cache_read_tokens,
+                        cache_write_tokens=cache_write_tokens,
+                        messages=tracker_messages,
+                    )
+
+                # CCR Feedback: record headroom_retrieve tool calls so
+                # TOIN learns which fields matter. Streaming path can't
+                # do request-level intercept (would require buffering
+                # the full stream), so we just close the feedback loop.
+                if self.config.ccr_inject_tool and len(full_sse_bytes) > 0:
+                    try:
+                        full_sse_data = full_sse_bytes.decode("utf-8", errors="replace")
+                        self._record_ccr_feedback_from_openai_sse(full_sse_data, request_id)
+                    except Exception as e:
+                        logger.debug(
+                            f"[{request_id}] CCR feedback recording (openai stream) failed: {e}"
+                        )
 
                 total_latency = (time.time() - start_time) * 1000
                 # Active-compression denominator for backend-routed

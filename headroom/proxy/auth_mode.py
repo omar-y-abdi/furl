@@ -207,6 +207,13 @@ CLIENT_UA_MAP: tuple[tuple[str, str], ...] = (
     ("github-copilot/", "copilot"),
     # Google's experimental harness
     ("antigravity/", "antigravity"),
+    # AWS Strands Agents SDK. The default openai-python User-Agent
+    # is `OpenAI/Python <ver>` which does not embed any Strands
+    # signal, so production callers should set `X-Client: strands`
+    # explicitly (see `headroom/integrations/strands/README.md`).
+    # The UA prefix below covers any Strands runtime that injects
+    # its own segment ahead of the openai-python UA.
+    ("strands-agents/", "strands"),
 )
 
 

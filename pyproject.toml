@@ -81,6 +81,11 @@ code = [
 ml = [
     "torch>=2.0.0",
     "transformers>=4.30.0",
+    # transformers >= 5.x requires huggingface-hub >= 1.5.0,<2.0; pinning
+    # the floor here prevents Kompress from silently falling back to
+    # "unavailable" when a sibling install (e.g. `pip install
+    # strands-agents`) drags huggingface-hub backwards.
+    "huggingface-hub>=1.5.0,<2.0",
 ]
 # Memory system (hierarchical memory with vector search)
 memory = [

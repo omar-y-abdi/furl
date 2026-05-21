@@ -1806,6 +1806,8 @@ class OpenAIHandlerMixin:
                         optimization_latency,
                         pipeline_timing=pipeline_timing,
                         waste_signals=waste_signals_dict,
+                        prefix_tracker=openai_prefix_tracker,
+                        optimized_messages=optimized_messages,
                     )
                 else:
                     # Non-streaming: use send_openai_message() → JSON
@@ -1847,19 +1849,126 @@ class OpenAIHandlerMixin:
                             content=backend_response.body,
                         )
 
-                    # OpenAI Chat via backend (LiteLLM/AnyLLM), non-
-                    # streaming. No per-message live-zone tracking yet
-                    # — use full pre-comp request size as the attempted
-                    # denominator so this provider's contribution to
-                    # active_savings is its whole-request ratio.
-                    # Cache extraction from the backend response body
-                    # is not wired here yet (follow-up); funnel passes
-                    # zeros for cache fields, matching pre-refactor
-                    # behaviour.
+                    # CCR Response Handling: intercept headroom_retrieve
+                    # tool calls server-side so a Bedrock/LiteLLM
+                    # OpenAI-shape response doesn't propagate a tool_call
+                    # the downstream caller (e.g. Strands) can't resolve.
+                    # Mirrors the Anthropic handler block (anthropic.py
+                    # ~1893-2034) but on the OpenAI provider shape.
+                    #
+                    # NO SILENT FALLBACK: per feedback_no_silent_fallbacks
+                    # we re-raise on CCR errors instead of swallowing
+                    # them. The Anthropic version still swallows for
+                    # legacy reasons; align it in a follow-up.
+                    # TODO(#realignment): align anthropic.py CCR block to
+                    # re-raise on exception so both providers fail loud.
+                    if (
+                        self.ccr_response_handler
+                        and backend_response.body
+                        and backend_response.status_code == 200
+                        and self.ccr_response_handler.has_ccr_tool_calls(
+                            backend_response.body, "openai"
+                        )
+                    ):
+                        logger.info(
+                            f"[{request_id}] CCR: Detected retrieval tool call "
+                            f"on backend path, handling via {self.anthropic_backend.name}"
+                        )
+
+                        # Continuation closure — delegates transport to
+                        # the backend abstraction. We strip encoding
+                        # headers for safety even though the backend
+                        # owns transport (mirrors the Anthropic block).
+                        async def api_call_fn(
+                            msgs: list[dict[str, Any]],
+                            tls: list[dict[str, Any]] | None,
+                        ) -> dict[str, Any]:
+                            continuation_body = {**body, "messages": msgs}
+                            if tls is not None:
+                                continuation_body["tools"] = tls
+
+                            continuation_headers = {
+                                k: v
+                                for k, v in headers.items()
+                                if k.lower()
+                                not in (
+                                    "content-encoding",
+                                    "transfer-encoding",
+                                    "accept-encoding",
+                                    "content-length",
+                                )
+                            }
+
+                            assert self.anthropic_backend is not None
+                            logger.info(
+                                f"[{request_id}] CCR: Issuing continuation via "
+                                f"{self.anthropic_backend.name} backend "
+                                f"({len(msgs)} messages)"
+                            )
+                            cont_resp = await self.anthropic_backend.send_openai_message(
+                                continuation_body, continuation_headers
+                            )
+                            return cont_resp.body
+
+                        try:
+                            final_resp_json = await self.ccr_response_handler.handle_response(
+                                backend_response.body,
+                                optimized_messages,
+                                tools,
+                                api_call_fn,
+                                provider="openai",
+                            )
+                            backend_response.body = final_resp_json
+                            logger.info(
+                                f"[{request_id}] CCR: Retrieval handled "
+                                "successfully on backend path"
+                            )
+                        except Exception as e:
+                            import traceback
+
+                            logger.error(
+                                f"[{request_id}] CCR: Response handling failed on "
+                                f"backend path: {e}\n"
+                                f"Traceback: {traceback.format_exc()}"
+                            )
+                            # No silent fallback — fail loud per
+                            # feedback_no_silent_fallbacks.md.
+                            raise
+
+                    # Extract usage from the FINAL backend body (after
+                    # any CCR resolution) so the prefix tracker counts
+                    # cache stats from the LAST upstream call.
                     total_latency = (time.time() - start_time) * 1000
                     usage = backend_response.body.get("usage", {})
                     output_tokens = usage.get("completion_tokens", 0)
                     total_input_tokens = usage.get("prompt_tokens", optimized_tokens)
+
+                    # Cache stats: prefer the Anthropic/Bedrock top-level
+                    # keys when present (authoritative). Fall back to
+                    # OpenAI's `prompt_tokens_details.cached_tokens` only
+                    # if the top-level keys are absent/zero.
+                    cache_read_tokens = usage.get("cache_read_input_tokens", 0) or 0
+                    cache_creation_input_tokens = usage.get("cache_creation_input_tokens", 0) or 0
+                    if cache_read_tokens == 0:
+                        prompt_details = usage.get("prompt_tokens_details") or {}
+                        cache_read_tokens = prompt_details.get("cached_tokens", 0) or 0
+
+                    # Bedrock reports cache creation directly. Only infer
+                    # when no explicit count is available.
+                    if cache_creation_input_tokens > 0:
+                        cache_write_tokens = cache_creation_input_tokens
+                    else:
+                        cache_write_tokens = _infer_openai_cache_write_tokens(
+                            total_input_tokens,
+                            cache_read_tokens,
+                        )
+
+                    openai_prefix_tracker.update_from_response(
+                        cache_read_tokens=cache_read_tokens,
+                        cache_write_tokens=cache_write_tokens,
+                        messages=optimized_messages,
+                    )
+
                     await self._record_request_outcome(
                         RequestOutcome(
                             request_id=request_id,
@@ -2688,10 +2797,47 @@ class OpenAIHandlerMixin:
                         model or "unknown",
                     )
             except Exception as _e:
+                _http_body_bytes = len(json.dumps(body).encode("utf-8", errors="replace"))
                 logger.warning(
-                    f"[{request_id}] /v1/responses compression failed; "
-                    f"forwarding original body: {type(_e).__name__}: {_e}"
+                    f"[{request_id}] /v1/responses compression failed "
+                    f"(bytes={_http_body_bytes}): {type(_e).__name__}: {_e}"
                 )
+                # Fail-closed protection (default): refuse to forward
+                # oversized requests after compression failure. Same
+                # decision matrix and override env var as the WS path
+                # (HEADROOM_WS_FAIL_OPEN_ON_COMPRESSION_FAILURE) — see
+                # helpers.decide_compression_failure_action.
+                from headroom.proxy.helpers import (
+                    decide_compression_failure_action,
+                )
+
+                _http_action = decide_compression_failure_action(_e, _http_body_bytes)
+                if _http_action.refuse:
+                    logger.error(
+                        "[%s] /v1/responses REFUSING to forward request "
+                        "after compression failure (reason=%s, bytes=%d); "
+                        "returning HTTP 413 so the client can compact "
+                        "context and retry. To restore legacy passthrough "
+                        "behaviour set "
+                        "HEADROOM_WS_FAIL_OPEN_ON_COMPRESSION_FAILURE=1.",
+                        request_id,
+                        _http_action.reason,
+                        _http_action.frame_bytes,
+                    )
+                    raise HTTPException(
+                        status_code=413,
+                        detail={
+                            "error": {
+                                "type": "compression_refused",
+                                "message": (
+                                    f"headroom: compression "
+                                    f"{_http_action.reason} on a "
+                                    f"{_http_body_bytes}-byte request "
+                                    "— please compact context and retry."
+                                ),
+                            }
+                        },
+                    ) from _e
 
         capture_codex_wire_debug(
             "http_upstream_request",
@@ -3794,6 +3940,7 @@ class OpenAIHandlerMixin:
                             frame_type="unknown",
                         )
                 except Exception as _ce:
+                    _ws_frame_bytes = len(first_msg_raw.encode("utf-8", errors="replace"))
                     if _first_frame_compression_elapsed_ms > 0:
                         record_frame = getattr(
                             getattr(self, "metrics", None), "record_codex_ws_frame", None
@@ -3801,22 +3948,62 @@ class OpenAIHandlerMixin:
                         if record_frame is not None:
                             record_frame(
                                 elapsed_ms=_first_frame_compression_elapsed_ms,
-                                bytes_before=len(first_msg_raw.encode("utf-8", errors="replace")),
+                                bytes_before=_ws_frame_bytes,
                                 failed=True,
                             )
                     logger.warning(
-                        f"[{request_id}] WS /v1/responses compression failed; "
-                        f"forwarding original frame: {type(_ce).__name__}: {_ce}"
+                        f"[{request_id}] WS /v1/responses compression failed "
+                        f"(bytes={_ws_frame_bytes}): {type(_ce).__name__}: {_ce}"
                     )
                     _log_ws_passthrough(
                         "compression_exception",
                         frame_index=1,
-                        raw_bytes=len(first_msg_raw.encode("utf-8", errors="replace")),
+                        raw_bytes=_ws_frame_bytes,
                         frame_type="response.create" if body else "unknown",
                         model=str(body.get("model") or "unknown")
                         if isinstance(body, dict)
                         else "unknown",
                     )
+                    # Fail-closed protection (default): refuse to forward
+                    # oversized frames after a compression failure. Forwarding
+                    # the original to the upstream would cause a
+                    # context-window-exceeded response that the client
+                    # (e.g. Codex) cannot recover from, because Headroom's
+                    # earlier successful compressions hid the cumulative
+                    # context pressure from the client's auto-compaction
+                    # heuristic. Close the client WS with 1009 instead so the
+                    # client gets a clear "compact and retry" signal.
+                    # See helpers.decide_compression_failure_action for the
+                    # decision matrix and env-var overrides.
+                    from headroom.proxy.helpers import (
+                        decide_compression_failure_action,
+                    )
+
+                    _ws_action = decide_compression_failure_action(_ce, _ws_frame_bytes)
+                    if _ws_action.refuse:
+                        logger.error(
+                            "[%s] WS /v1/responses REFUSING to forward "
+                            "frame after compression failure "
+                            "(reason=%s, bytes=%d); closing client "
+                            "websocket with 1009 so client can compact "
+                            "context and retry. To restore legacy "
+                            "passthrough behaviour set "
+                            "HEADROOM_WS_FAIL_OPEN_ON_COMPRESSION_FAILURE=1.",
+                            request_id,
+                            _ws_action.reason,
+                            _ws_action.frame_bytes,
+                        )
+                        termination_cause = "compression_refused"
+                        with contextlib.suppress(Exception):
+                            await websocket.close(
+                                code=1009,
+                                reason=(
+                                    "headroom: compression "
+                                    f"{_ws_action.reason} — please "
+                                    "compact context and retry"
+                                ),
+                            )
+                        return
             else:
                 _log_ws_passthrough(
                     "bypass_header" if _ws_bypass else "optimize_disabled",

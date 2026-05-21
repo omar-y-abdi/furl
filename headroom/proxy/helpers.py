@@ -8,6 +8,7 @@ Extracted from server.py for maintainability.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -17,6 +18,7 @@ import subprocess
 import threading
 import time
 from collections import OrderedDict
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, cast
 
@@ -755,6 +757,111 @@ COMPRESSION_TIMEOUT_SECONDS = 30
 
 # Maximum compression cache sessions (prevents unbounded memory growth)
 MAX_COMPRESSION_CACHE_SESSIONS = 500
+
+
+# ---------------------------------------------------------------------------
+# Compression-failure escape hatch
+# ---------------------------------------------------------------------------
+# When the proxy's compression stage fails (timeout, exception) on a frame
+# Headroom thought was large enough to compress, the legacy behaviour was to
+# fall through and forward the *original* uncompressed frame to the upstream.
+# That fail-open turned a recoverable timeout into a context-window overflow
+# downstream: Codex's auto-compaction reads ``total_usage_tokens`` from
+# upstream (which Headroom's earlier successful compressions shrunk), then
+# the un-compressed retry overflows the model context and the client
+# locks up.
+#
+# Default behaviour is now fail-CLOSED: refuse to forward, close the client
+# WS with code 1009 (or return HTTP 413) so the client knows to compact and
+# retry. Operators who want the old behaviour can set
+# ``HEADROOM_WS_FAIL_OPEN_ON_COMPRESSION_FAILURE=1``. The oversize threshold
+# below which transient errors still fall through to passthrough is
+# configurable via ``HEADROOM_WS_COMPRESSION_FAIL_THRESHOLD_BYTES``
+# (default 256 KiB ≈ 64K tokens).
+WS_COMPRESSION_FAIL_OPEN_ENV = "HEADROOM_WS_FAIL_OPEN_ON_COMPRESSION_FAILURE"
+WS_COMPRESSION_OVERSIZE_BYTES_ENV = "HEADROOM_WS_COMPRESSION_FAIL_THRESHOLD_BYTES"
+WS_COMPRESSION_OVERSIZE_BYTES_DEFAULT = 256 * 1024
+
+
+@dataclass(frozen=True)
+class CompressionFailureAction:
+    """Decision returned by :func:`decide_compression_failure_action`."""
+
+    refuse: bool
+    """If True, the caller MUST NOT forward the original frame. Close the
+    client connection with a clear error code instead."""
+
+    reason: str
+    """Short machine-readable label for telemetry. One of:
+    ``timeout``, ``oversize:bytes=<n>>threshold=<m>``,
+    ``small_frame_transient``, or ``env_override:fail_open``."""
+
+    frame_bytes: int
+    """Original frame size in bytes (for logging / metrics)."""
+
+
+def decide_compression_failure_action(
+    exception: BaseException,
+    frame_bytes: int,
+) -> CompressionFailureAction:
+    """Decide whether to refuse-and-close vs forward-original after the
+    proxy's compression pipeline fails on a Realtime WebSocket frame
+    (or analogous HTTP body).
+
+    Decision matrix:
+
+    * env :data:`WS_COMPRESSION_FAIL_OPEN_ENV` truthy → forward (legacy
+      behaviour, opt-in for debugging or strict compatibility).
+    * exception is :class:`asyncio.TimeoutError` → refuse (the compression
+      stage hit its own timeout, which only fires on frames Headroom
+      thought were big enough to need compression in the first place).
+    * ``frame_bytes`` > :data:`WS_COMPRESSION_OVERSIZE_BYTES_ENV`
+      (default 256 KiB) → refuse (large + any compression failure is a
+      strong signal the upstream will reject the original).
+    * otherwise → forward (a transient pipeline error on a small frame
+      shouldn't break the request).
+    """
+    fail_open = os.environ.get(WS_COMPRESSION_FAIL_OPEN_ENV, "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+    if fail_open:
+        return CompressionFailureAction(
+            refuse=False,
+            reason="env_override:fail_open",
+            frame_bytes=frame_bytes,
+        )
+
+    threshold = WS_COMPRESSION_OVERSIZE_BYTES_DEFAULT
+    raw_threshold = os.environ.get(WS_COMPRESSION_OVERSIZE_BYTES_ENV, "").strip()
+    if raw_threshold:
+        try:
+            parsed = int(raw_threshold)
+            if parsed > 0:
+                threshold = parsed
+        except ValueError:
+            # Operator typo'd the env value — keep the default rather than
+            # raise on every WS frame. Loud warning instead.
+            logger.warning(
+                "Ignoring non-integer %s=%r; using default %d",
+                WS_COMPRESSION_OVERSIZE_BYTES_ENV,
+                raw_threshold,
+                WS_COMPRESSION_OVERSIZE_BYTES_DEFAULT,
+            )
+
+    if isinstance(exception, asyncio.TimeoutError):
+        return CompressionFailureAction(refuse=True, reason="timeout", frame_bytes=frame_bytes)
+    if frame_bytes > threshold:
+        return CompressionFailureAction(
+            refuse=True,
+            reason=f"oversize:bytes={frame_bytes}>threshold={threshold}",
+            frame_bytes=frame_bytes,
+        )
+    return CompressionFailureAction(
+        refuse=False, reason="small_frame_transient", frame_bytes=frame_bytes
+    )
 
 
 def jitter_delay_ms(base_ms: int, max_ms: int, attempt: int) -> float:
