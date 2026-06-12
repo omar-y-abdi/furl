@@ -383,13 +383,87 @@ def build_repeated_logs_dataset(*, limit: int = 90, refresh: bool = False) -> Da
     )
 
 
+# ---------------------------------------------------------------------------
+# Dataset 5 — DISK: real `df -k` rows (small array, ≤ adaptive_k).
+# The canonical "small tool output" case: most real tool results are a
+# handful of rows, which the engine used to pass through untouched.
+# ---------------------------------------------------------------------------
+
+_DF_CMD: tuple[str, ...] = ("df", "-k")
+
+
+def _parse_df(raw: str) -> list[dict[str, Any]]:
+    """Parse captured ``df -k`` stdout into structured filesystem rows.
+
+    The header line is skipped. Fields are split from the RIGHT (8
+    splits) so a filesystem name containing spaces (e.g. ``map
+    auto_home``) stays intact; rows whose numeric fields don't parse are
+    skipped. Every kept value is the real tool output, verbatim.
+    """
+    rows: list[dict[str, Any]] = []
+    for line in raw.splitlines()[1:]:
+        parts = line.rsplit(None, 8)
+        if len(parts) != 9:
+            continue
+        try:
+            rows.append(
+                {
+                    "filesystem": parts[0],
+                    "kbytes": int(parts[1]),
+                    "used": int(parts[2]),
+                    "avail": int(parts[3]),
+                    "capacity": parts[4],
+                    "iused": int(parts[5]),
+                    "ifree": int(parts[6]),
+                    "piused": parts[7],
+                    "mounted_on": parts[8],
+                }
+            )
+        except ValueError:
+            continue
+    return rows
+
+
+def build_disk_dataset(*, refresh: bool = False) -> Dataset:
+    """Real ``df -k`` rows — a SMALL array (≈10 rows, under adaptive_k).
+
+    Exercises the small-array lossless path: arrays at or below the
+    tier-1 boundary used to pass through with 0% reduction even when a
+    lossless tabular rendering saves 30%+ (repeated keys, constant and
+    consecutively-repeated column values are common in df/ps-style
+    output).
+    """
+    name = "disk"
+    provenance = (
+        "df -k — real filesystem table from this machine, header skipped, "
+        "fields right-split into {filesystem,kbytes,used,avail,capacity,"
+        "iused,ifree,piused,mounted_on} rows."
+    )
+    raw = _capture(name, list(_DF_CMD), provenance, refresh=refresh)
+    rows = _parse_df(raw)
+    items: list[Any] = rows
+    content = json.dumps(items, ensure_ascii=False)
+    messages = [
+        {"role": "user", "content": "How full are the disks?"},
+        {"role": "tool", "content": content, "tool_call_id": "disk_call"},
+    ]
+    return Dataset(
+        name=name,
+        query="How full are the disks?",
+        items=items,
+        messages=messages,
+        provenance=provenance,
+    )
+
+
 def all_datasets(*, refresh: bool = False) -> list[Dataset]:
-    """Build the four real datasets. Deterministic from committed snapshots."""
+    """Build the five real datasets. Deterministic from committed snapshots."""
     return [
         build_code_dataset(refresh=refresh),
         build_logs_dataset(refresh=refresh),
         build_search_dataset(refresh=refresh),
         build_repeated_logs_dataset(refresh=refresh),
+        build_disk_dataset(refresh=refresh),
     ]
 
 

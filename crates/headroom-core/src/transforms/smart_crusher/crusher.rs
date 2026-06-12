@@ -642,9 +642,49 @@ impl SmartCrusher {
         };
         let adaptive_k = compute_optimal_k(&item_str_refs, bias, 3, max_k);
 
-        // Tier-1 boundary: array already small enough — passthrough,
-        // nothing to compact, nothing to drop.
+        // Tier-1 boundary: array already small enough — nothing to
+        // drop. Still worth a LOSSLESS look: a cleanly-tabular small
+        // array (df/ps-style tool output) shrinks 30%+ with zero loss,
+        // and small arrays are the COMMON case for tool output. Three
+        // gates protect the passthrough default beyond the big-array
+        // ratio check:
+        // - no `OpaqueRef` substitution anywhere — on a small array
+        //   every value must stay verbatim in the visible output
+        //   (substituting a file's content with a CCR pointer would
+        //   hide exactly what the model was asked to read);
+        // - absolute saving ≥ `SMALL_ARRAY_LOSSLESS_MIN_SAVED_BYTES` —
+        //   the schema line must pay for itself; toy arrays stay
+        //   passthrough;
+        // - the same `lossless_min_savings_ratio` gate as the
+        //   big-array attempt.
         if items.len() <= adaptive_k {
+            if items.len() >= 2 {
+                if let Some(stage) = &self.compaction {
+                    let (c, rendered) = stage.run(items);
+                    if c.was_compacted() && !c.contains_opaque_ref() {
+                        let input_bytes = estimate_array_bytes(&item_strings);
+                        let saved = input_bytes.saturating_sub(rendered.len());
+                        let savings_ratio = if input_bytes > 0 {
+                            saved as f64 / input_bytes as f64
+                        } else {
+                            0.0
+                        };
+                        if saved >= SMALL_ARRAY_LOSSLESS_MIN_SAVED_BYTES
+                            && savings_ratio >= self.config.lossless_min_savings_ratio
+                        {
+                            let kind = compaction_kind_str(&c);
+                            return CrushArrayResult {
+                                items: items.to_vec(), // nothing dropped
+                                strategy_info: format!("lossless:{kind}"),
+                                ccr_hash: None,
+                                dropped_summary: String::new(),
+                                compacted: Some(rendered),
+                                compaction_kind: Some(kind),
+                            };
+                        }
+                    }
+                }
+            }
             return CrushArrayResult {
                 items: items.to_vec(),
                 strategy_info: "none:adaptive_at_limit".to_string(),
@@ -1086,6 +1126,14 @@ fn annotate_dup_counts(
     }
 }
 
+/// Minimum ABSOLUTE byte saving required before a small array
+/// (`len <= adaptive_k`, the tier-1 passthrough zone) ships the
+/// lossless compacted rendering instead of passing through. The
+/// big-array path uses the ratio gate alone; small arrays additionally
+/// need the `[N]{cols}` schema line to pay for itself — re-encoding a
+/// 3-row toy array to save a dozen bytes is churn, not compression.
+const SMALL_ARRAY_LOSSLESS_MIN_SAVED_BYTES: usize = 256;
+
 /// Maps a `Compaction` to a stable kind tag exposed via `CrushArrayResult`.
 fn compaction_kind_str(c: &Compaction) -> &'static str {
     match c {
@@ -1214,6 +1262,84 @@ mod tests {
         assert_eq!(result.items.len(), 3);
         assert_eq!(result.strategy_info, "none:adaptive_at_limit");
         assert!(result.ccr_hash.is_none());
+    }
+
+    #[test]
+    fn small_array_ships_lossless_when_savings_substantial() {
+        // 8 rows — `compute_optimal_k` returns n for n <= 8, so this is
+        // guaranteed inside the tier-1 passthrough zone (the SMALL
+        // path, not the big-array lossless attempt). Enough repeated-
+        // key overhead that the CSV rendering saves ≥ 256 bytes AND
+        // ≥ the ratio gate → lossless ships, nothing dropped.
+        let c = crusher();
+        let items: Vec<Value> = (0..8)
+            .map(|i| {
+                json!({
+                    "filesystem": format!("/dev/disk1s{i}"),
+                    "kilobytes_total": 971350180,
+                    "kilobytes_used": 543210 + i,
+                    "capacity_percent": "85%",
+                    "mounted_on": format!("/Volumes/vol_{i}"),
+                })
+            })
+            .collect();
+        let result = c.crush_array(&items, "", 1.0);
+        assert_eq!(result.items.len(), 8, "nothing may be dropped");
+        assert!(
+            result.strategy_info.starts_with("lossless:table"),
+            "got: {}",
+            result.strategy_info
+        );
+        let compacted = result.compacted.expect("compacted must be set");
+        assert!(compacted.starts_with("[8]{"), "got: {compacted}");
+        assert!(result.ccr_hash.is_none());
+        assert!(result.dropped_summary.is_empty());
+    }
+
+    #[test]
+    fn small_toy_array_stays_passthrough_below_absolute_floor() {
+        // 3 tiny rows save well above the RATIO gate but only ~a dozen
+        // absolute bytes — the schema line doesn't pay for itself.
+        let c = crusher();
+        let items: Vec<Value> = (0..3).map(|i| json!({"id": i})).collect();
+        let result = c.crush_array(&items, "", 1.0);
+        assert_eq!(result.strategy_info, "none:adaptive_at_limit");
+        assert!(result.compacted.is_none());
+    }
+
+    #[test]
+    fn small_array_with_opaque_cells_stays_passthrough() {
+        // A small array whose cells would be CCR-substituted (file
+        // contents!) must NOT take the small-array lossless path — the
+        // model needs those values visible verbatim.
+        let c = crusher();
+        let blob = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/".repeat(64);
+        let items: Vec<Value> = (0..4)
+            .map(|i| json!({"path": format!("src/f{i}.py"), "content": blob.clone()}))
+            .collect();
+        let result = c.crush_array(&items, "", 1.0);
+        assert_eq!(result.strategy_info, "none:adaptive_at_limit");
+        assert!(result.compacted.is_none());
+        assert_eq!(result.items.len(), 4);
+    }
+
+    #[test]
+    fn small_array_without_compaction_stage_stays_passthrough() {
+        let c = SmartCrusher::without_compaction(SmartCrusherConfig::default());
+        let items: Vec<Value> = (0..8)
+            .map(|i| {
+                json!({
+                    "filesystem": format!("/dev/disk1s{i}"),
+                    "kilobytes_total": 971350180,
+                    "kilobytes_used": 543210 + i,
+                    "capacity_percent": "85%",
+                    "mounted_on": format!("/Volumes/vol_{i}"),
+                })
+            })
+            .collect();
+        let result = c.crush_array(&items, "", 1.0);
+        assert_eq!(result.strategy_info, "none:adaptive_at_limit");
+        assert!(result.compacted.is_none());
     }
 
     #[test]
