@@ -7,8 +7,11 @@ tokenizer backends must implement.
 from __future__ import annotations
 
 import json
+import logging
 from abc import ABC, abstractmethod
 from typing import Any, Protocol, runtime_checkable
+
+logger = logging.getLogger(__name__)
 
 
 @runtime_checkable
@@ -249,7 +252,9 @@ class BaseTokenizer(ABC):
                     w, h = int(w * scale), int(h * scale)
                 return max(100, (w * h) // 750)
             except Exception:
-                pass
+                # Pillow missing or undecodable bytes — use the byte-size
+                # fallback below, but leave a trace for debugging.
+                logger.debug("Image dimension probe failed; using byte-size estimate")
 
         # Fallback: estimate from byte size.
         # Typical screenshot: ~200KB ≈ 1200x800 ≈ 1280 tokens

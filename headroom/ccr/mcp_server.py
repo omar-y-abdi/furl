@@ -227,9 +227,9 @@ def _read_shared_events(window_seconds: int = SESSION_WINDOW_SECONDS) -> list[di
                     if _HAS_FCNTL:
                         fcntl.flock(f, fcntl.LOCK_UN)
             except Exception:
-                pass
+                logger.debug("Shared-stats prune failed (non-fatal)", exc_info=True)
     except Exception:
-        pass
+        logger.debug("Shared-stats read failed (non-fatal)", exc_info=True)
     return events
 
 
