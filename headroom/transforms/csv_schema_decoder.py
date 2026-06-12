@@ -36,6 +36,10 @@ Encodings understood:
   that column are dictionary indexes. A plain data cell starting with
   ``__dict:`` is CSV-quoted by the formatter, so the preamble lines are
   unambiguous.
+* **Decimal scale-fold** — ``name:float%k`` marks a float column whose
+  cells are the integer value × 10^k (``53`` at k=3 decodes to
+  ``0.053``). Decoding is pure string manipulation followed by a float
+  parse — no float arithmetic — so the reconstructed value is exact.
 
 Lines that do not parse as rows (e.g. the lossy-survivor
 ``{"_ccr_dropped": ...}`` sentinel line) are skipped; callers treat
@@ -136,6 +140,9 @@ class ColumnSpec:
     arith: tuple[int, int] | None = None
     # True when the column is ISO-delta encoded (``name:string~``).
     iso_delta: bool = False
+    # Fractional-digit count of a decimal scale-fold (``name:float%k``);
+    # None when not scale-encoded.
+    dec_scale: int | None = None
 
 
 def split_unquoted(s: str) -> list[str]:
@@ -225,6 +232,17 @@ def _parse_header_segment(seg: str) -> ColumnSpec | None:
             has_const=False,
             const_value=None,
             iso_delta=True,
+        )
+    scale_m = re.match(r"^(.+)%(\d+)$", decl)
+    if scale_m:
+        bare = scale_m.group(1)
+        return ColumnSpec(
+            name=name,
+            type_tag=bare.rstrip("?"),
+            nullable=bare.endswith("?"),
+            has_const=False,
+            const_value=None,
+            dec_scale=int(scale_m.group(2)),
         )
     return ColumnSpec(
         name=name,
@@ -327,6 +345,12 @@ def decode_csv_schema_rows(text: str) -> list[dict[str, Any]] | None:
                     ok = False
                     break
                 row[spec.name] = value
+            elif spec.dec_scale is not None:
+                value = _decode_decimal_scaled_cell(resolved, spec.dec_scale)
+                if value is None:
+                    ok = False  # never invent data on a bad cell
+                    break
+                row[spec.name] = value
             elif spec.name in dict_values:
                 values = dict_values[spec.name]
                 if not resolved.isdigit() or int(resolved) >= len(values):
@@ -346,6 +370,28 @@ def decode_csv_schema_rows(text: str) -> list[dict[str, Any]] | None:
         rows.append(row)
         ordinal += 1
     return rows
+
+
+def _decode_decimal_scaled_cell(resolved: str, scale: int) -> float | None:
+    """Decode one cell of a decimal scale-fold column (``name:float%k``).
+
+    Pure string manipulation: pad the integer digits to at least
+    ``scale+1`` places and re-insert the decimal point, then parse — no
+    float arithmetic, so the value is exactly the one the formatter
+    encoded. Returns ``None`` for malformed cells (never invent data).
+    """
+    sign = ""
+    digits = resolved
+    if digits.startswith("-"):
+        sign, digits = "-", digits[1:]
+    if not digits.isdigit():
+        return None
+    padded = digits.zfill(scale + 1)
+    split = len(padded) - scale
+    try:
+        return float(f"{sign}{padded[:split]}.{padded[split:]}")
+    except ValueError:  # pragma: no cover — digits guarantee parse
+        return None
 
 
 def _decode_iso_delta_cell(

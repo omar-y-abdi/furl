@@ -70,6 +70,14 @@ pub enum ColumnEncoding {
     /// newline (line-grammar integrity), and the dictionary line plus
     /// index cells are strictly smaller than the plain cells.
     DictString { values: Vec<String> },
+    /// Float column whose every value renders as a plain decimal with
+    /// ≤ `scale` fractional digits. The CSV-schema formatter declares
+    /// `name:float%scale` and renders each cell as the integer value ×
+    /// 10^scale (`0.053` → `53` at scale 3). Encode/decode are pure
+    /// string manipulation (no float arithmetic); the compactor proves
+    /// the round-trip at stamp time by re-parsing and re-rendering
+    /// every decoded value against the original rendering.
+    DecimalScaled { scale: usize },
 }
 
 /// One column's metadata in a tabular compaction.
