@@ -2,9 +2,7 @@
 
 import json
 
-import pytest
-
-from headroom.compress import CompressResult, compress
+from headroom.compress import CompressConfig, CompressResult, compress
 from headroom.hooks import CompressionHooks
 
 
@@ -83,6 +81,23 @@ class TestCompressFunction:
         result = compress(messages, optimize=False)
         assert result.messages is messages
         assert result.tokens_saved == 0
+
+    def test_kwargs_do_not_mutate_caller_config(self):
+        """kwarg overrides must not mutate the caller's CompressConfig."""
+        cfg = CompressConfig()
+        messages = [{"role": "user", "content": "hi"}]
+        compress(messages, config=cfg, target_ratio=0.5, protect_recent=0)
+        assert cfg.target_ratio is None
+        assert cfg.protect_recent == 4
+
+    def test_unknown_kwargs_are_logged(self, caplog):
+        """Unknown kwargs (typos) must be surfaced, not silently ignored."""
+        import logging
+
+        messages = [{"role": "user", "content": "hi"}]
+        with caplog.at_level(logging.WARNING, logger="headroom.compress"):
+            compress(messages, target_ration=0.5)  # deliberate typo
+        assert any("target_ration" in record.message for record in caplog.records)
 
     def test_with_custom_hooks(self):
         """Hooks are called when provided."""
