@@ -1,5 +1,89 @@
 # BENCHMARKS — Headroom Engine honest benchmarks
 
+## Phase-5: reversible column encodings — reconstruction-aware lossless (before → after)
+
+- Baseline commit: `cc90e5f3` (Phase-4 final). Final commit: `717c0568`
+  (reference decoder `ad7d2a5a` → arith fold `d3934ba1` → ISO delta
+  `17a21efc` → dict encoding `970069d5` → decimal scale-fold `717c0568`).
+- Frontier change: "lossless" is now **exact reconstruction through the
+  documented decoder** (`headroom/transforms/csv_schema_decoder.py`),
+  NOT verbatim string presence. Retention and needle-visibility on
+  columnar renderings are measured by DECODE-AND-COMPARE (canonical-
+  signature equality of decoded rows); verbatim substring scanning
+  survives only as the fallback for non-decodable renderings.
+
+Four additive encodings on the CSV-schema path (JSON / Markdown-KV
+formatters byte-identical; every encoding stamps only after a stamp-time
+proof that decode == original, plus a strict rendered-byte gate
+simulated WITH ditto):
+
+1. **Arithmetic fold** — a non-nullable int column that is an exact
+   progression (`value_i == base + step*i`, checked i64 math) declares
+   `name:int=BASE+STEP` and vanishes from the rows. repeated_logs'
+   `icmp_seq` 0..89: 588 → 412 tok.
+2. **ISO-8601 delta** — a strict-shape timestamp column
+   (`YYYY-MM-DDTHH:MM:SS(Z|±HH:MM)`) declares `name:string~`, ships the
+   first value verbatim and `{±delta_seconds}[/tz]` after; pure integer
+   civil-calendar math both sides, spelling-preserving (`Z` stays `Z`).
+   **logs@90 FLIPS LOSSY → LOSSLESS**: the render crosses the 0.30 gate.
+3. **Dictionary encoding** — a low-cardinality string column ships a
+   `__dict:name=v0,v1,...` line (every distinct value verbatim exactly
+   once) + per-row indexes. Catches NON-consecutive repetition ditto
+   can't see (git-log author/email, 36 distinct / 90 rows): 5459 → 5274
+   tok on logs.
+4. **Decimal scale-fold** — a plain-decimal float column declares
+   `name:float%k` and ships integer×10^k cells (`0.053` → `53`); encode
+   and decode are pure string manipulation (zero float arithmetic).
+   repeated_logs' `time_ms`: 412 → 240 tok.
+
+| dataset | tok before | tok after (P4 → P5) | lossless reduction | drop | retention |
+|---|---:|---:|---:|---:|---:|
+| code@7 | 41025 | 41025 → 41025 | 0.0% (entropy floor — unchanged) | 0% | 100% |
+| logs@90 | 8595 | 665 (LOSSY, 91.1% drop) → **5274 LOSSLESS** | — → **38.6%** | 91.1% → **0%** | 100% → 100% |
+| search@90 | 4102 | 1803 → 1803 | 56.0% (unchanged, see honest read) | 0% | 100% |
+| repeated_logs@90 | 3621 | 588 → **240** | 83.8% → **93.4%** (arith + scale folds) | 0% | 100% |
+| disk@9 | 694 | 347 → 347 | 50.0% (unchanged) | 0% | 100% |
+
+Needle-recall: overall (output OR CCR) **100.0%**, visible-in-output
+**100.0%** (both families, all positions/cardinalities — logs trials now
+route lossless, keeping every needle visible). Reconstruction proof:
+for every CSV-schema dataset, `decode(output) == original` as an ORDERED
+list with exact values (logs 90/90, search 90/90, repeated_logs 90/90,
+disk 9/9).
+
+**Honest read (Phase-5).**
+- `logs@90` is the regime change to be clear about: the visible output
+  grew 665 → 5274 tokens because the engine's lossless-first contract
+  now routes it lossless (38.6% ≥ the 0.30 gate). Nothing is dropped,
+  nothing needs CCR recovery. The 91.1%-drop lossy rendering was
+  smaller but removed 82 rows from view. Route-by-min-tokens remains
+  rejected (Phase-4) — this phase widens the lossless regime, exactly
+  as designed.
+- **Delta encoding of `absolute_offset` / `line_number` (search) did
+  NOT pan out — measured NEGATIVE** (-2B and -5B on the real rg
+  capture): per-file offsets reset and deltas carry a mandatory sign,
+  so deltas render no shorter than absolutes. Not implemented; search
+  stays 56.0%. The remaining search bytes are the `lines` source-text
+  column — genuine entropy.
+- **Dictionary encoding on search's `path` column correctly refuses**:
+  paths repeat in consecutive runs, which ditto already collapses to
+  1 byte; a dictionary line would re-pay every path plus indexes
+  (measured +42B). The gate said no.
+- **Hex→base64 recoding of the 40-char commit hashes was evaluated and
+  rejected**: it saves bytes (~13/row) but LOSES tokens — BPE
+  tokenizes hex at ~2.5 chars/token vs ~1.3 for base64; the byte win
+  inverts at the token layer. Same reasoning kills binary varint /
+  bit-packing in a text channel.
+- `logs` residual (38.6% vs theoretical): commit hashes (true entropy,
+  see above) and 90 distinct subjects (true content). The date and
+  email/author columns — the structured redundancy — are now encoded.
+- `code@7` stays 0% — distinct source files at the entropy floor.
+- The recovery-invariant lossy-survivor fixture gained microsecond
+  timestamps (realistic; strict encoder honestly refuses fractional
+  seconds) so it keeps pinning the lossy sentinel path; its assertions
+  are unchanged. All 21 recovery-invariant tests pass; the decoder the
+  contract uses is the same reference decoder the benchmarks use.
+
 ## Phase-4: CCR-backed removal maximization (before → after)
 
 - Baseline commit: `957ef601` (Phase-3 final). Final commit: `9ad7b4c2`
