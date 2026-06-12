@@ -10,7 +10,6 @@ description = "Core Headroom types and compression transform traits (Rust)."
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
-bytes = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tiktoken-rs = "0.11"

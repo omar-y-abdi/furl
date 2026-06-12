@@ -1110,7 +1110,6 @@ version = "0.1.0"
 dependencies = [
  "aho-corasick",
  "blake3",
- "bytes",
  "criterion",
  "dashmap",
  "fastembed",
