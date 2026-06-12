@@ -1,5 +1,90 @@
 # BENCHMARKS — Headroom Engine honest benchmarks
 
+## Phase-6: cross-message dedup — conversation-level redundancy (before → after)
+
+- Baseline commit: `986bbc37` (Phase-5 final). Final commit: `357dbad8`
+  (multiturn dataset `e7d98416` → exact cross-message dedup `4357aecb` →
+  near-duplicate tier + counterfactual gate `357dbad8`).
+- Frontier change: the untapped lever was CROSS-MESSAGE. Every prior
+  phase compressed per-array WITHIN one message; the same tool output
+  repeated across turns (an agent re-running `rg`/`git log`/`df`) paid
+  full price per copy. A new pipeline stage (`CrossMessageDeduper`,
+  between CacheAligner and ContentRouter) removes that waste at the
+  conversation level, pointer-backed:
+  1. **Exact tier** — a later byte-identical tool output is replaced by a
+     `{"_ccr_dropped": "... <<ccr:HASH N_bytes_duplicate>>"}` sentinel
+     naming the message that still carries the bytes. Store-before-replace:
+     the original is persisted in the CCR store under the surfaced hash
+     (SHA-256[:24]) BEFORE the swap; a failed store write vetoes the
+     replacement.
+  2. **Near tier** — a later JSON dict-array sharing byte-identical rows
+     with an earlier kept-verbatim array ships only its DIFFERING rows +
+     the sentinel; the full original stays recoverable under the hash, and
+     reference sources are always kept-verbatim units so every elided row
+     remains visible somewhere in the conversation. Gated on the
+     COUNTERFACTUAL (rewrite must come in under ~45% of original bytes —
+     what per-message lossless compression achieves on row-shaped data),
+     not on the raw original.
+
+New REAL dataset `multiturn` (all six raw captures committed): the same
+`rg --json --sort path` run twice (parsed rows byte-identical), `df -k`
+run twice ~3s apart (4/9 rows genuinely drift), and `git log -n 30`
+viewed one real commit apart (29/30 rows byte-identical — the canonical
+post-commit history re-check). Scored conversation-level: an item is
+retained when visible in ANY message or recoverable via a surfaced
+pointer (same strictness ladder as the single-message harness, per
+message).
+
+| dataset | tok before | tok after (P5 → P6) | lossless reduction | drop | retention |
+|---|---:|---:|---:|---:|---:|
+| multiturn@135 (NEW) | 14866 | 9996 (per-msg only) → **5674** | 32.8% → **61.8%** | 0% | 100% |
+| code@7 | 41025 | 41025 → 41025 | 0.0% (entropy floor) | 0% | 100% |
+| logs@90 | 8595 | 5274 → 5274 | 38.6% (unchanged) | 0% | 100% |
+| search@90 | 4102 | 1803 → 1803 | 56.0% (unchanged) | 0% | 100% |
+| repeated_logs@90 | 3621 | 240 → 240 | 93.4% (unchanged) | 0% | 100% |
+| disk@9 | 694 | 347 → 347 | 50.0% (unchanged) | 0% | 100% |
+
+Within Phase-6 the multiturn movement decomposes (same data, measured):
+per-message engine only 9996 (32.8%) → exact tier 8232 (44.6% — the
+second rg table, ~1.8k tok, collapses to a ~50-tok pointer) → near tier
+**5674** (61.8% — the second git-log view, ~2.6k tok as a table,
+collapses to one changed row + pointer). Needle-recall (output OR CCR) stays **100.0%**, visible
+**100.0%**; recovery of every elided payload is byte-exact through the
+Python `compression_store` under the surfaced hash.
+
+Prompt-cache contract (P0, pinned by 14 tests in
+`tests/test_cross_message_dedup.py` through public `compress()`):
+message count/order/roles never change; index 0 is never modified (not
+even duplicate blocks inside it); the frozen prefix is never modified;
+`cache_control`-bearing blocks pass through byte-faithful; only LATER
+occurrences are rewritten, so the cached prefix stays byte-stable.
+Scope: tool outputs only (role tool/function strings + `tool_result`
+blocks); user/system/assistant and `is_error` outputs untouched.
+Additive Python pipeline stage — Rust per-array outputs and parity
+fixtures untouched (`cross_message_dedup_enabled=True` config gate).
+
+**Honest read (Phase-6).**
+- **The naive near-dup gate measurably REGRESSED before being fixed**:
+  on the real drifted `df -k` pair (4/9 rows shared) shipping 5 raw JSON
+  rows + sentinel cost ~430 tok where the router's lossless CSV table of
+  all 9 rows costs 347 (multiturn 2654 → 2828 at the v1 dataset). The
+  tier is therefore counterfactual-gated and now correctly REFUSES the
+  df pair (pinned by test); low-overlap drift stays with per-message
+  compression. Near-dup only wins on high-overlap pairs (the 29/30
+  git-log case), and the benchmark shows both behaviors on real data.
+- The raw `rg --json` streams differ between runs (elapsed-time stats
+  events); the PARSED match rows are byte-identical only with `--sort
+  path` (unsorted parallel traversal reorders rows run-to-run). The
+  dataset uses the sorted form and documents it.
+- **Tightening the lossy visible keep-set did NOT happen — measured no
+  surface**: since Phase-5 flipped logs lossless, NO real dataset and NO
+  needle trial takes the lossy path (0/18 trials; every case routes
+  lossless with 0 drops), so CCR-backing currently-kept critical rows
+  has nothing real to measure against and Phase-4 already established
+  the survivor set as the principled floor. Deferred until a real
+  capture exercises the lossy path again.
+- `code@7` stays 0% — entropy floor; no fake gains.
+
 ## Phase-5: reversible column encodings — reconstruction-aware lossless (before → after)
 
 - Baseline commit: `cc90e5f3` (Phase-4 final). Final commit: `717c0568`
