@@ -52,6 +52,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 from dataclasses import dataclass
 from typing import Any
 
@@ -298,10 +299,15 @@ class SmartCrusher(Transform):
         # Defaults to ``None`` so the direct ``crush()`` / ``crush_array_json()``
         # / ``compact_document_json()`` entry points (which don't go
         # through ``apply()``) keep their pre-F2.2 behaviour: TOIN
-        # writes are not gated. Same pattern as the existing
-        # ``_runtime_target_ratio`` / ``_runtime_kompress_model``
-        # fields in ContentRouter.
-        self._runtime_compression_policy: Any = None
+        # writes are not gated.
+        #
+        # Backed by ``threading.local`` because the pipeline reuses ONE
+        # SmartCrusher across every ``compress()`` call: a plain instance
+        # attribute would let two concurrent calls with different
+        # policies clobber each other. The property getter returns
+        # ``None`` when the current thread hasn't set a value, preserving
+        # single-threaded behaviour exactly.
+        self._tls = threading.local()
 
         # Build the Rust crusher with every field from the Python
         # config, plus the relevance_threshold default (0.3) — the
@@ -363,6 +369,20 @@ class SmartCrusher(Transform):
             self._rust = _RustSmartCrusher(rust_cfg)
         else:
             self._rust = _RustSmartCrusher.with_compaction_format(rust_cfg, resolved_format)
+
+    @property
+    def _runtime_compression_policy(self) -> Any:
+        """Per-request CompressionPolicy (thread-local backed).
+
+        Returns ``None`` when the current thread hasn't set a policy,
+        matching the pre-thread-local default. See ``__init__`` for why
+        this is thread-local rather than a plain instance attribute.
+        """
+        return getattr(self._tls, "compression_policy", None)
+
+    @_runtime_compression_policy.setter
+    def _runtime_compression_policy(self, value: Any) -> None:
+        self._tls.compression_policy = value
 
     def crush(self, content: str, query: str = "", bias: float = 1.0) -> CrushResult:
         """Crush a single JSON content string.

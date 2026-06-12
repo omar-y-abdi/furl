@@ -39,6 +39,7 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -777,18 +778,65 @@ class ContentRouter(Transform):
         # TOIN integration for cross-strategy learning
         self._toin: Any = None
 
-        # F2.2: per-request CompressionPolicy, set from
-        # ``kwargs["compression_policy"]`` at the start of ``apply()``
-        # and read by ``_record_to_toin`` to gate TOIN writes when
-        # ``policy.toin_read_only`` is true (Subscription mode).
-        # Defaults to ``None`` so direct ``compress()`` callers (e.g.
-        # tests, hand-written pipelines that don't go through the
-        # proxy) keep pre-F2.2 behaviour: TOIN writes are not gated.
-        # Same pattern the existing ``_runtime_target_ratio`` /
-        # ``_runtime_kompress_model`` fields below use.
-        self._runtime_compression_policy: Any = None
+        # Per-request runtime options (``_runtime_target_ratio``,
+        # ``_runtime_force_kompress``, ``_runtime_kompress_model``,
+        # ``_runtime_compression_policy``) are exposed as properties
+        # backed by this ``threading.local``. The pipeline reuses ONE
+        # ContentRouter across every ``compress()`` call, so storing
+        # per-request state as plain instance attributes let two
+        # concurrent calls with different configs clobber each other.
+        # Thread-local storage isolates each in-flight request: the
+        # property getters fall back to the documented defaults
+        # (``None`` / ``False``) when the current thread hasn't set a
+        # value, preserving single-threaded behaviour exactly and
+        # keeping every ``getattr(self, "_runtime_*", default)`` read
+        # site below working unchanged.
+        self._tls = threading.local()
 
         self._cache = CompressionCache()
+
+    # ------------------------------------------------------------------
+    # Per-request runtime options (thread-local backed).
+    #
+    # F2.2: ``_runtime_compression_policy`` carries the per-request
+    # CompressionPolicy, set from ``kwargs["compression_policy"]`` at
+    # the start of ``apply()`` and read by ``_record_to_toin`` to gate
+    # TOIN writes when ``policy.toin_read_only`` is true (Subscription
+    # mode). Defaults to ``None`` so direct ``compress()`` callers (e.g.
+    # tests, hand-written pipelines that don't go through the proxy)
+    # keep pre-F2.2 behaviour: TOIN writes are not gated.
+    # ------------------------------------------------------------------
+    @property
+    def _runtime_target_ratio(self) -> float | None:
+        return getattr(self._tls, "target_ratio", None)
+
+    @_runtime_target_ratio.setter
+    def _runtime_target_ratio(self, value: float | None) -> None:
+        self._tls.target_ratio = value
+
+    @property
+    def _runtime_force_kompress(self) -> bool:
+        return getattr(self._tls, "force_kompress", False)
+
+    @_runtime_force_kompress.setter
+    def _runtime_force_kompress(self, value: bool) -> None:
+        self._tls.force_kompress = value
+
+    @property
+    def _runtime_kompress_model(self) -> str | None:
+        return getattr(self._tls, "kompress_model", None)
+
+    @_runtime_kompress_model.setter
+    def _runtime_kompress_model(self, value: str | None) -> None:
+        self._tls.kompress_model = value
+
+    @property
+    def _runtime_compression_policy(self) -> Any:
+        return getattr(self._tls, "compression_policy", None)
+
+    @_runtime_compression_policy.setter
+    def _runtime_compression_policy(self, value: Any) -> None:
+        self._tls.compression_policy = value
 
     def _record_to_toin(
         self,
@@ -1874,10 +1922,13 @@ class ContentRouter(Transform):
             "min_chars_for_block_compression",
             self.config.min_chars_for_block_compression,
         )
-        # Store runtime options on self for access by _route_and_compress_block
-        self._runtime_target_ratio: float | None = kwargs.get("target_ratio")
-        self._runtime_force_kompress: bool = bool(kwargs.get("force_kompress", False))
-        self._runtime_kompress_model: str | None = kwargs.get("kompress_model")
+        # Store runtime options for access by _route_and_compress_block.
+        # These write through to thread-local storage (see the
+        # ``_runtime_*`` properties on __init__), so concurrent
+        # compress() calls with different configs stay isolated.
+        self._runtime_target_ratio = kwargs.get("target_ratio")
+        self._runtime_force_kompress = bool(kwargs.get("force_kompress", False))
+        self._runtime_kompress_model = kwargs.get("kompress_model")
         # F2.2: capture the per-request CompressionPolicy so
         # ``_record_to_toin`` can gate TOIN writes on
         # ``policy.toin_read_only``. ``None`` when the caller didn't
