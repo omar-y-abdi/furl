@@ -1023,8 +1023,8 @@ fn normalize_for_dedupe(content: &str) -> String {
 }
 
 /// Template a single leading identity token (ISO-8601 datetime, UUID, or
-/// >=12-char hex run) plus any immediately-following whitespace into the
-/// fixed placeholder `<TS> `. Returns the original string unchanged when no
+/// a hex run of 12+ chars) plus any immediately-following whitespace into
+/// the fixed placeholder `<TS> `. Returns the original string unchanged when no
 /// leading identity token is present, so non-timestamped lines are
 /// untouched. Only the FIRST token is considered — the message body that
 /// distinguishes error categories is preserved.

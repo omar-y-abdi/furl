@@ -706,8 +706,10 @@ mod tests {
         ];
 
         let store: Arc<dyn CcrStore> = Arc::new(InMemoryCcrStore::new());
-        let mut config = CompactConfig::default();
-        config.ccr_store = Some(Arc::clone(&store));
+        let config = CompactConfig {
+            ccr_store: Some(Arc::clone(&store)),
+            ..Default::default()
+        };
 
         let hash_big = hash_opaque(big.as_bytes());
         let hash_other = hash_opaque(other.as_bytes());

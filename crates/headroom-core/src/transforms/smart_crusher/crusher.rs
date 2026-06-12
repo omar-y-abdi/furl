@@ -776,7 +776,7 @@ impl SmartCrusher {
     /// **unconditionally** write `(hash → canonical)` to the configured
     /// CCR store (if any), then **unconditionally** build the
     /// `<<ccr:HASH N_rows_offloaded>>` recovery pointer. The store write
-    /// + pointer together are the cornerstone of the no-data-loss
+    /// and pointer together are the cornerstone of the no-data-loss
     /// guarantee: a dropped needle is always retrievable via
     /// `ccr_get(hash)` AND nameable from the output via the pointer —
     /// never silently lost. Neither is gated by `enable_ccr_marker`
