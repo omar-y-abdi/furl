@@ -295,6 +295,11 @@ fn write_table(
                 // verbatim ISO timestamp and later cells are
                 // `{±delta_seconds}[/tz]` carry-forwards.
                 Some(ColumnEncoding::IsoDeltaSeconds) => return format!("{base}~"),
+                // Decimal scale marker: `name:float%k` — cells are the
+                // integer value × 10^k.
+                Some(ColumnEncoding::DecimalScaled { scale }) => {
+                    return format!("{base}%{scale}");
+                }
                 // Dictionary columns keep a plain declaration — the
                 // `__dict:name=...` preamble line is their marker.
                 Some(ColumnEncoding::DictString { .. }) | None => {}
@@ -388,6 +393,11 @@ fn write_table(
                         None => format_cell(c),
                     }
                 }
+                (
+                    Some(ColumnEncoding::DecimalScaled { scale }),
+                    CellValue::Scalar(Value::Number(n)),
+                ) => encodings::encode_decimal_cell(&n.to_string(), *scale)
+                    .unwrap_or_else(|| format_cell(c)),
                 _ => format_cell(c),
             };
             rendered.push(cell);
@@ -915,12 +925,14 @@ mod tests {
         );
         // The monotone counter folds as an arithmetic progression.
         assert!(lines[0].contains("seq:int=0+1"), "got: {}", lines[0]);
+        // The float column scale-folds (`%1`): cells are value × 10.
+        assert!(lines[0].contains("t:float%1"), "got: {}", lines[0]);
         // Rows hold ONLY the remaining variable cells (fields sort
         // alphabetically at equal frequency: bytes,from,seq,t → t after
-        // const + arith folds).
-        assert_eq!(lines[1], "0.1");
-        assert_eq!(lines[2], "0.2");
-        assert_eq!(lines[3], "0.3");
+        // const + arith folds), scale-encoded.
+        assert_eq!(lines[1], "1");
+        assert_eq!(lines[2], "2");
+        assert_eq!(lines[3], "3");
     }
 
     #[test]
@@ -1228,6 +1240,55 @@ mod tests {
         let out = CsvSchemaFormatter::new().format(&c);
         assert!(!out.contains("string~"), "got: {out}");
         assert!(out.contains("2026-06-11T21:02:05.123+02:00"), "got: {out}");
+    }
+
+    // ── Decimal scale-fold (CSV) ──
+
+    #[test]
+    fn csv_decimal_scale_round_trips_losslessly() {
+        use super::super::encodings::decode_decimal_cell;
+        // Real-ping-shaped latencies (varied fractional digits).
+        let latencies = [0.053, 0.09, 0.116, 12.5, 0.046, 0.071];
+        let items: Vec<Value> = latencies
+            .iter()
+            .enumerate()
+            .map(|(i, t)| json!({"ms": t, "v": format!("reply {i}")}))
+            .collect();
+        let c = compact(&items, &cfg());
+        let out = CsvSchemaFormatter::new().format(&c);
+        let mut lines = out.trim_end().lines();
+        let decl = lines.next().expect("decl");
+        assert!(decl.contains("ms:float%3"), "got decl: {decl}");
+        let cells: Vec<&str> = lines.map(|l| l.split(',').next().unwrap()).collect();
+        assert_eq!(cells[0], "53", "0.053 at scale 3");
+        assert_eq!(cells[1], "90", "0.09 pads to 090 -> 90");
+        assert_eq!(cells[3], "12500", "12.5 scales by 10^3");
+        for (cell, orig) in cells.iter().zip(latencies.iter()) {
+            let dec = decode_decimal_cell(cell, 3).expect("decode");
+            let back: f64 = dec.parse().expect("parse");
+            assert_eq!(back, *orig, "value round-trip {cell} -> {dec}");
+        }
+    }
+
+    #[test]
+    fn csv_decimal_scale_refuses_mixed_and_exponent_columns() {
+        // A mixed int/float column gets the `json` tag — must not stamp.
+        let items = vec![
+            json!({"x": 1, "v": "a"}),
+            json!({"x": 2.5, "v": "b"}),
+            json!({"x": 3, "v": "c"}),
+        ];
+        let c = compact(&items, &cfg());
+        let out = CsvSchemaFormatter::new().format(&c);
+        assert!(!out.contains('%'), "mixed column must stay plain: {out}");
+        // Exponent renderings refuse too (values stay verbatim).
+        let items: Vec<Value> = (1..5)
+            .map(|i| json!({"x": 1e300 * i as f64, "v": format!("b{i}")}))
+            .collect();
+        let c = compact(&items, &cfg());
+        let out = CsvSchemaFormatter::new().format(&c);
+        assert!(!out.contains('%'), "exponent column must stay plain: {out}");
+        assert!(out.contains("1e+300"), "got: {out}");
     }
 
     // ── Dictionary encoding (CSV) ──

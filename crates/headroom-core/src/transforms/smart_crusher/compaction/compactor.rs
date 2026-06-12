@@ -207,6 +207,7 @@ fn build_homogeneous_table(
     stamp_constant_columns(&mut field_specs, &rows);
     stamp_arith_int_columns(&mut field_specs, &rows);
     stamp_iso_delta_columns(&mut field_specs, &rows);
+    stamp_decimal_scaled_columns(&mut field_specs, &rows);
     stamp_dict_string_columns(&mut field_specs, &rows);
 
     Compaction::Table {
@@ -496,6 +497,76 @@ fn stamp_iso_delta_columns(specs: &mut [FieldSpec], rows: &[Row]) {
         let enc = ditto_rendered_cost(encoded.iter().map(|s| s.as_str()));
         if enc < plain {
             spec.encoding = Some(ColumnEncoding::IsoDeltaSeconds);
+        }
+    }
+}
+
+/// Stamp [`ColumnEncoding::DecimalScaled`] on every float column whose
+/// values all render as plain decimals (`-?\d+\.\d{1,6}`, no exponent).
+/// Cells become the integer value × 10^scale via PURE STRING
+/// MANIPULATION — no float arithmetic — and the round-trip is proven at
+/// stamp time: each encoded cell is decoded back to a decimal string,
+/// parsed as f64, re-rendered, and compared to the original rendering.
+/// Strict byte gate WITH ditto plus the `%scale` declaration suffix.
+fn stamp_decimal_scaled_columns(specs: &mut [FieldSpec], rows: &[Row]) {
+    use super::encodings::{decimal_frac_digits, decode_decimal_cell, encode_decimal_cell};
+
+    if rows.len() < 3 {
+        return;
+    }
+    for (col, spec) in specs.iter_mut().enumerate() {
+        if spec.const_value.is_some() || spec.encoding.is_some() {
+            continue;
+        }
+        // Collect every cell's serde rendering; bail on anything that
+        // is not a plain-decimal float.
+        let mut rendered: Vec<String> = Vec::with_capacity(rows.len());
+        let mut scale = 0usize;
+        let mut eligible = true;
+        for row in rows {
+            match row.0.get(col) {
+                Some(CellValue::Scalar(Value::Number(n))) if !n.is_i64() && !n.is_u64() => {
+                    let r = n.to_string();
+                    match decimal_frac_digits(&r) {
+                        Some(k) => scale = scale.max(k),
+                        None => {
+                            eligible = false;
+                            break;
+                        }
+                    }
+                    rendered.push(r);
+                }
+                _ => {
+                    eligible = false;
+                    break;
+                }
+            }
+        }
+        if !eligible || scale == 0 {
+            continue;
+        }
+        let encoded: Option<Vec<String>> = rendered
+            .iter()
+            .map(|r| encode_decimal_cell(r, scale))
+            .collect();
+        let Some(encoded) = encoded else { continue };
+        // Prove the round-trip: decode -> parse f64 -> re-render must
+        // equal the original serde rendering for EVERY cell.
+        let round_trip_ok = encoded.iter().zip(rendered.iter()).all(|(cell, orig)| {
+            decode_decimal_cell(cell, scale)
+                .and_then(|dec| dec.parse::<f64>().ok())
+                .and_then(serde_json::Number::from_f64)
+                .map(|n| n.to_string() == *orig)
+                .unwrap_or(false)
+        });
+        if !round_trip_ok {
+            continue;
+        }
+        let plain = ditto_rendered_cost(rendered.iter().map(|s| s.as_str()));
+        let enc = ditto_rendered_cost(encoded.iter().map(|s| s.as_str()));
+        let decl_extra = 1 + scale.to_string().len(); // "%k"
+        if enc + decl_extra < plain {
+            spec.encoding = Some(ColumnEncoding::DecimalScaled { scale });
         }
     }
 }
@@ -1247,7 +1318,11 @@ mod tests {
         match compact(&floats, &cfg()) {
             Compaction::Table { schema, .. } => {
                 let x = schema.fields.iter().find(|f| f.name == "x").unwrap();
-                assert_eq!(x.encoding, None, "float column must not stamp");
+                assert!(
+                    !matches!(x.encoding, Some(ColumnEncoding::ArithInt { .. })),
+                    "float column must not stamp ARITH (decimal scale-fold may apply): {:?}",
+                    x.encoding
+                );
             }
             other => panic!("expected Table, got {other:?}"),
         }

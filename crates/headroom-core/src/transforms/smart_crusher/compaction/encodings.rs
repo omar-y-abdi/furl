@@ -251,6 +251,78 @@ fn parse_delta_cell(cell: &str) -> Option<(i64, Option<&str>)> {
     Some((delta, tz))
 }
 
+// ─────────────────────── decimal scale-fold ───────────────────────
+//
+// A float column whose every value renders as a plain decimal
+// (`-?\d+\.\d{1,6}`, no exponent) encodes as the integer value × 10^k
+// (k = the column's max fractional digits), e.g. `0.053` → `53` at
+// k=3. Encoding and decoding are PURE STRING MANIPULATION — no float
+// arithmetic anywhere — so exactness is structural: the digits move,
+// nothing is computed. The compactor still proves the round-trip at
+// stamp time by re-parsing and re-rendering each decoded value.
+
+/// Fractional digit count of a plain-decimal rendering. `None` for
+/// anything else (exponent form, integers, NaN spellings, ...).
+pub fn decimal_frac_digits(rendered: &str) -> Option<usize> {
+    let rest = rendered.strip_prefix('-').unwrap_or(rendered);
+    let (int_part, frac_part) = rest.split_once('.')?;
+    if int_part.is_empty() || frac_part.is_empty() {
+        return None;
+    }
+    if !int_part.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if !frac_part.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if frac_part.len() > 6 {
+        return None; // cap: beyond this the cells barely shrink
+    }
+    Some(frac_part.len())
+}
+
+/// `0.053` at k=3 → `53`; `-0.5` at k=1 → `-5`; `12.5` at k=3 → `12500`.
+pub fn encode_decimal_cell(rendered: &str, k: usize) -> Option<String> {
+    let frac_len = decimal_frac_digits(rendered)?;
+    if frac_len > k {
+        return None;
+    }
+    let (sign, rest) = match rendered.strip_prefix('-') {
+        Some(r) => ("-", r),
+        None => ("", rendered),
+    };
+    let (int_part, frac_part) = rest.split_once('.')?;
+    let mut digits = String::with_capacity(int_part.len() + k);
+    digits.push_str(int_part);
+    digits.push_str(frac_part);
+    for _ in frac_len..k {
+        digits.push('0');
+    }
+    let trimmed = digits.trim_start_matches('0');
+    let body = if trimmed.is_empty() { "0" } else { trimmed };
+    Some(format!("{sign}{body}"))
+}
+
+/// Inverse of [`encode_decimal_cell`]: digits back to a decimal string
+/// (`90` at k=3 → `0.090` — parses to the same f64 as the original
+/// shortest rendering `0.09`).
+pub fn decode_decimal_cell(cell: &str, k: usize) -> Option<String> {
+    let (sign, digits) = match cell.strip_prefix('-') {
+        Some(r) => ("-", r),
+        None => ("", cell),
+    };
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let padded = if digits.len() <= k {
+        format!("{digits:0>width$}", width = k + 1)
+    } else {
+        digits.to_string()
+    };
+    let split = padded.len() - k;
+    Some(format!("{sign}{}.{}", &padded[..split], &padded[split..]))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -325,6 +397,36 @@ mod tests {
     fn column_with_any_nonconforming_value_refuses() {
         let values = ["2026-06-11T21:02:05Z", "not a date"];
         assert!(encode_iso_column(&values).is_none());
+    }
+
+    #[test]
+    fn decimal_scale_encode_decode_pure_string_round_trip() {
+        for (rendered, k, expect_enc) in [
+            ("0.053", 3, "53"),
+            ("0.09", 3, "90"),
+            ("12.5", 3, "12500"),
+            ("-0.5", 1, "-5"),
+            ("0.0", 1, "0"),
+            ("100.116", 3, "100116"),
+        ] {
+            let enc = encode_decimal_cell(rendered, k).expect(rendered);
+            assert_eq!(enc, expect_enc, "encode {rendered}");
+            let dec = decode_decimal_cell(&enc, k).expect(rendered);
+            // The decoded decimal string parses to the SAME f64 as the
+            // original rendering (the value is what must round-trip).
+            let orig: f64 = rendered.parse().unwrap();
+            let back: f64 = dec.parse().unwrap();
+            assert_eq!(orig, back, "value round-trip {rendered} -> {enc} -> {dec}");
+        }
+    }
+
+    #[test]
+    fn decimal_scale_refuses_non_plain_renderings() {
+        for s in ["1e10", "5", "NaN", "0.1234567", "-", ".5", "5."] {
+            assert!(decimal_frac_digits(s).is_none(), "must refuse {s}");
+        }
+        assert!(decode_decimal_cell("12a", 3).is_none());
+        assert!(decode_decimal_cell("", 3).is_none());
     }
 
     #[test]

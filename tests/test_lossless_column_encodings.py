@@ -288,6 +288,33 @@ def test_all_distinct_string_column_never_dict_encodes() -> None:
     assert not missing
 
 
+def test_decimal_scale_fold_round_trips() -> None:
+    # Shape mirrors the real `ping` benchmark capture: after const +
+    # arith folds the rows are just the latency column; the decimal
+    # scale-fold renders `0.053` as `53` (`time_ms:float%3`).
+    # Decode is pure string manipulation — exact value reconstruction.
+    items = [
+        {
+            "bytes": 64,
+            "from": "127.0.0.1",
+            "icmp_seq": i,
+            "ttl": 64,
+            "time_ms": round(0.031 + (i % 23) * 0.013, 3),
+        }
+        for i in range(60)
+    ]
+    text = _compress_to_text(items)
+    decl = text.split("\n", 1)[0]
+    assert "time_ms:float%3" in decl, decl
+    body = text.split("\n")[1:]
+    assert "0.031" not in text, "latency cells must be scale-encoded"
+    assert any(line == "31" for line in body), body[:4]
+
+    recovered = _reconstruct(text)
+    missing = {_repr(it) for it in items} - recovered
+    assert not missing, f"{len(missing)} rows unrecoverable; first: {sorted(missing)[:2]}"
+
+
 def test_arith_fold_negative_step_round_trips() -> None:
     # Descending counters (e.g. remaining-retries) fold with a negative
     # step and reconstruct exactly.
