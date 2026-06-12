@@ -477,9 +477,29 @@ def build_disk_dataset(*, refresh: bool = False) -> Dataset:
 # `--json` streams differ only in elapsed-time stats events, which the
 # parser never reads). `df -k` runs seconds apart genuinely DRIFT (free
 # blocks / inode counts move), giving the honest near-identical pair.
+# The third pair is `git log -n 30` viewed one REAL commit apart
+# (HEAD~1 then HEAD — the canonical "agent commits, re-checks history"
+# turn pair): 29 of 30 rows are byte-identical, one row is new and one
+# falls off the window. Both views come from this repo's real history, so
+# a --refresh stays deterministic at any given HEAD.
 _MULTITURN_RG_CMD: tuple[str, ...] = ("rg", "--json", "--sort", "path", "def ", "headroom/")
 _MULTITURN_DF_CMD: tuple[str, ...] = ("df", "-k")
 _MULTITURN_RG_LIMIT = 90
+_MULTITURN_GIT_LOG_N = 30
+
+
+def _multiturn_git_log_cmd(ref: str) -> list[str]:
+    """The logs-dataset git-log capture, pinned to ``ref``."""
+    return [
+        "git",
+        "-C",
+        ".",
+        "log",
+        f"--pretty=format:{_GIT_LOG_FMT}",
+        "-n",
+        str(_MULTITURN_GIT_LOG_N),
+        ref,
+    ]
 # Successive agent turns are seconds apart, not microseconds — space the two
 # df captures accordingly so the snapshot reflects real inter-turn drift
 # (free-space / inode counters move on a live machine).
@@ -506,10 +526,13 @@ def build_multiturn_dataset(*, refresh: bool = False) -> Dataset:
         "Two real consecutive invocations each of: "
         f"`{' '.join(_MULTITURN_RG_CMD)}` (match rows parsed like the search "
         "dataset, first 90 rows per run — byte-identical across the two runs "
-        "of the unchanged tree) and `df -k` (rows parsed like the disk "
-        "dataset, the two runs spaced ~3s apart like successive agent turns "
-        "— free-space/inode cells genuinely drift between runs). All four "
-        "raw captures snapshotted."
+        "of the unchanged tree), `df -k` (rows parsed like the disk dataset, "
+        "the two runs spaced ~3s apart like successive agent turns — "
+        "free-space/inode cells genuinely drift between runs), and "
+        f"`git log -n {_MULTITURN_GIT_LOG_N}` viewed one real commit apart "
+        "(HEAD~1 then HEAD, parsed like the logs dataset — 29/30 rows "
+        "byte-identical, the canonical post-commit re-check). All six raw "
+        "captures snapshotted."
     )
     cached = None if refresh else _load_snapshot(name)
     if cached is not None:
@@ -520,18 +543,29 @@ def build_multiturn_dataset(*, refresh: bool = False) -> Dataset:
         captures["df_run1"] = _run(list(_MULTITURN_DF_CMD))
         time.sleep(_MULTITURN_TURN_SPACING_S)
         captures["df_run2"] = _run(list(_MULTITURN_DF_CMD))
+        captures["gitlog_run1"] = _run(_multiturn_git_log_cmd("HEAD~1"))
+        captures["gitlog_run2"] = _run(_multiturn_git_log_cmd("HEAD"))
         _snapshot(name, json.dumps(captures, ensure_ascii=False), provenance)
 
     rg_rows_1 = _parse_rg_json(captures["rg_run1"])[:_MULTITURN_RG_LIMIT]
     rg_rows_2 = _parse_rg_json(captures["rg_run2"])[:_MULTITURN_RG_LIMIT]
     df_rows_1 = _parse_df(captures["df_run1"])
     df_rows_2 = _parse_df(captures["df_run2"])
+    gitlog_rows_1 = _parse_git_log(captures["gitlog_run1"])
+    gitlog_rows_2 = _parse_git_log(captures["gitlog_run2"])
 
-    # Distinct union across all four captures (first-seen order) — the
+    # Distinct union across all six captures (first-seen order) — the
     # denominator for retention/drop scoring.
     items: list[Any] = []
     seen: set[str] = set()
-    for row in [*rg_rows_1, *rg_rows_2, *df_rows_1, *df_rows_2]:
+    for row in [
+        *rg_rows_1,
+        *rg_rows_2,
+        *df_rows_1,
+        *df_rows_2,
+        *gitlog_rows_1,
+        *gitlog_rows_2,
+    ]:
         sig = _multiturn_signature(row)
         if sig in seen:
             continue
@@ -562,6 +596,18 @@ def build_multiturn_dataset(*, refresh: bool = False) -> Dataset:
             "role": "tool",
             "content": json.dumps(df_rows_2, ensure_ascii=False),
             "tool_call_id": "multiturn_df_2",
+        },
+        {"role": "user", "content": "Show the recent commit history."},
+        {
+            "role": "tool",
+            "content": json.dumps(gitlog_rows_1, ensure_ascii=False),
+            "tool_call_id": "multiturn_gitlog_1",
+        },
+        {"role": "user", "content": "I just committed - show the history again."},
+        {
+            "role": "tool",
+            "content": json.dumps(gitlog_rows_2, ensure_ascii=False),
+            "tool_call_id": "multiturn_gitlog_2",
         },
     ]
     return Dataset(
