@@ -184,6 +184,29 @@ impl Compaction {
             Compaction::Table { .. } | Compaction::Buckets { .. } | Compaction::OpaqueRef { .. }
         )
     }
+
+    /// True if ANY cell in the tree is an [`CellValue::OpaqueRef`]
+    /// substitution (or the tree itself is a top-level
+    /// [`Compaction::OpaqueRef`]). Used by callers that only want a
+    /// compaction when every original value stays verbatim in the
+    /// rendered output (pure rearrangement, no substitution).
+    pub fn contains_opaque_ref(&self) -> bool {
+        fn row_has_opaque(row: &Row) -> bool {
+            row.0.iter().any(|c| match c {
+                CellValue::OpaqueRef { .. } => true,
+                CellValue::Nested(sub) => sub.contains_opaque_ref(),
+                CellValue::Scalar(_) | CellValue::Missing => false,
+            })
+        }
+        match self {
+            Compaction::OpaqueRef { .. } => true,
+            Compaction::Table { rows, .. } => rows.iter().any(row_has_opaque),
+            Compaction::Buckets { buckets, .. } => buckets
+                .iter()
+                .any(|b| b.rows.iter().any(row_has_opaque)),
+            Compaction::Untouched(_) => false,
+        }
+    }
 }
 
 #[cfg(test)]
