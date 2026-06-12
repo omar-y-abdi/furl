@@ -61,7 +61,6 @@ import threading
 from dataclasses import dataclass, field
 from typing import Any
 
-from .observability import get_otel_metrics
 from .pipeline import PipelineExtensionManager, PipelineStage, summarize_routing_markers
 from .utils import extract_user_query as _extract_user_query
 
@@ -327,11 +326,6 @@ def compress(
         )
 
     except Exception as e:
-        get_otel_metrics().record_compression_failure(
-            model=model,
-            operation="compress",
-            error_type=type(e).__name__,
-        )
         logger.warning("Compression failed, returning original messages: %s", e)
         return CompressResult(
             messages=messages,

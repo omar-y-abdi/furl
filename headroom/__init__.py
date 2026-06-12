@@ -1,71 +1,45 @@
 """
-Headroom - The Context Optimization Layer for LLM Applications.
+Headroom - The Context Compression Layer for LLM Applications.
 
-Cut your LLM costs by 50-90% without losing accuracy.
+Cut your LLM token usage by 50-90% without losing accuracy.
 
-Headroom wraps LLM clients to provide:
+Headroom provides:
 - Smart compression of tool outputs (keeps errors, anomalies, relevant items)
 - Cache-aligned prefix optimization for better provider cache hits
-- Rolling window token management for long conversations
-- Full streaming support with zero accuracy loss
+- BM25 / embedding relevance scoring for content selection
+- Deterministic, byte-stable transforms with zero accuracy loss
 
 Quick Start:
 
-    from headroom import HeadroomClient, OpenAIProvider
-    from openai import OpenAI
+    from headroom import compress
 
-    # Wrap your existing client
-    client = HeadroomClient(
-        original_client=OpenAI(),
-        provider=OpenAIProvider(),
-        default_mode="optimize",
-    )
+    messages = [
+        {"role": "user", "content": "Summarize these logs..."},
+        {"role": "tool", "content": "<10k lines of log output>"},
+    ]
 
-    # Use exactly like the original client
-    response = client.chat.completions.create(
-        model="gpt-4o",
-        messages=[
-            {"role": "user", "content": "Hello!"},
-        ],
-    )
+    result = compress(messages)
+    print(f"Tokens saved: {result.tokens_saved}")
+    print(f"Compression ratio: {result.compression_ratio:.2f}")
+    compressed_messages = result.messages
 
-    # Check savings
-    stats = client.get_stats()
-    print(f"Tokens saved: {stats['session']['tokens_saved_total']}")
+Configuration:
 
-Verify It's Working:
+    from headroom import compress, CompressConfig
 
-    # Validate configuration
-    result = client.validate_setup()
-    if not result["valid"]:
-        print("Issues:", result)
-
-    # Enable logging to see what's happening
-    import logging
-    logging.basicConfig(level=logging.INFO)
-    # INFO:headroom.transforms.pipeline:Pipeline complete: 45000 -> 4500 tokens
-
-Simulate Before Sending:
-
-    plan = client.chat.completions.simulate(
-        model="gpt-4o",
-        messages=large_messages,
-    )
-    print(f"Would save {plan.tokens_saved} tokens")
-    print(f"Transforms: {plan.transforms}")
+    config = CompressConfig(...)
+    result = compress(messages, config=config)
 
 Error Handling:
 
-    from headroom import HeadroomError, ConfigurationError, ProviderError
+    from headroom import HeadroomError, ConfigurationError
 
     try:
-        response = client.chat.completions.create(...)
+        result = compress(messages)
     except ConfigurationError as e:
         print(f"Config issue: {e.details}")
     except HeadroomError as e:
         print(f"Headroom error: {e}")
-
-For more examples, see https://github.com/headroom-sdk/headroom/tree/main/examples
 """
 
 from __future__ import annotations
@@ -80,13 +54,6 @@ from .compress import CompressConfig, CompressResult, compress
 # `from headroom import compress` is never shadowed by the submodule object.
 
 __all__ = [
-    # Main client
-    "HeadroomClient",
-    # Providers
-    "Provider",
-    "TokenCounter",
-    "OpenAIProvider",
-    "AnthropicProvider",
     # Exceptions
     "HeadroomError",
     "ConfigurationError",
@@ -142,27 +109,6 @@ __all__ = [
     "Tokenizer",
     "count_tokens_text",
     "count_tokens_messages",
-    "generate_report",
-    # Observability
-    "HeadroomOtelMetrics",
-    "HeadroomTracer",
-    "LangfuseTracingConfig",
-    "OTelMetricsConfig",
-    "configure_otel_metrics",
-    "configure_langfuse_tracing",
-    "get_headroom_tracer",
-    "get_langfuse_tracing_status",
-    "get_otel_metrics",
-    "get_otel_metrics_status",
-    "reset_headroom_tracing",
-    "reset_otel_metrics",
-    # Memory - optional hierarchical memory system
-    "with_memory",  # Main user-facing API
-    "Memory",
-    "ScopeLevel",
-    "HierarchicalMemory",
-    "MemoryConfig",
-    "EmbedderBackend",
     # One-function compression API
     "compress",
     "CompressConfig",
@@ -183,13 +129,6 @@ __all__ = [
 # Keep package-level imports lightweight so `import headroom` does not eagerly
 # load provider SDKs, ML stacks, or optional proxy/runtime integrations.
 _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
-    # Main client
-    "HeadroomClient": ("headroom.client", "HeadroomClient"),
-    # Providers
-    "Provider": ("headroom.providers", "Provider"),
-    "TokenCounter": ("headroom.providers", "TokenCounter"),
-    "OpenAIProvider": ("headroom.providers", "OpenAIProvider"),
-    "AnthropicProvider": ("headroom.providers", "AnthropicProvider"),
     # Exceptions
     "HeadroomError": ("headroom.exceptions", "HeadroomError"),
     "ConfigurationError": ("headroom.exceptions", "ConfigurationError"),
@@ -245,20 +184,6 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "Tokenizer": ("headroom.tokenizer", "Tokenizer"),
     "count_tokens_text": ("headroom.tokenizer", "count_tokens_text"),
     "count_tokens_messages": ("headroom.tokenizer", "count_tokens_messages"),
-    "generate_report": ("headroom.reporting", "generate_report"),
-    # Observability
-    "HeadroomOtelMetrics": ("headroom.observability", "HeadroomOtelMetrics"),
-    "HeadroomTracer": ("headroom.observability", "HeadroomTracer"),
-    "LangfuseTracingConfig": ("headroom.observability", "LangfuseTracingConfig"),
-    "OTelMetricsConfig": ("headroom.observability", "OTelMetricsConfig"),
-    "configure_otel_metrics": ("headroom.observability", "configure_otel_metrics"),
-    "configure_langfuse_tracing": ("headroom.observability", "configure_langfuse_tracing"),
-    "get_headroom_tracer": ("headroom.observability", "get_headroom_tracer"),
-    "get_langfuse_tracing_status": ("headroom.observability", "get_langfuse_tracing_status"),
-    "get_otel_metrics": ("headroom.observability", "get_otel_metrics"),
-    "get_otel_metrics_status": ("headroom.observability", "get_otel_metrics_status"),
-    "reset_headroom_tracing": ("headroom.observability", "reset_headroom_tracing"),
-    "reset_otel_metrics": ("headroom.observability", "reset_otel_metrics"),
     # One-function API
     "compress": ("headroom.compress", "compress"),
     # Hooks
@@ -274,16 +199,10 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "SharedContext": ("headroom.shared_context", "SharedContext"),
 }
 
-# Memory remains optional and preserves the long-standing behavior of exposing
-# `None` when the extra dependencies are not installed.
-_OPTIONAL_EXPORTS = {
-    "with_memory": ("headroom.memory", "with_memory"),
-    "Memory": ("headroom.memory", "Memory"),
-    "ScopeLevel": ("headroom.memory", "ScopeLevel"),
-    "HierarchicalMemory": ("headroom.memory", "HierarchicalMemory"),
-    "MemoryConfig": ("headroom.memory", "MemoryConfig"),
-    "EmbedderBackend": ("headroom.memory", "EmbedderBackend"),
-}
+# Optional exports resolve lazily and expose `None` when their extra
+# dependencies are unavailable. Currently empty after the compression-only
+# amputation, but the resolution path in `__getattr__` is retained.
+_OPTIONAL_EXPORTS: dict[str, tuple[str, str]] = {}
 
 
 def __getattr__(name: str) -> Any:
