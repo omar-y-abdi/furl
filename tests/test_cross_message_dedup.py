@@ -269,3 +269,133 @@ def test_default_pipeline_orders_dedup_before_router() -> None:
     names = [t.name for t in TransformPipeline().transforms]
     assert "cross_message_dedup" in names
     assert names.index("cross_message_dedup") < names.index("content_router")
+
+
+# --------------------------------------------------------------------------- #
+# Near-duplicate tier: shared rows elided, differing rows kept, recoverable.
+# --------------------------------------------------------------------------- #
+
+_NEAR_RE = re.compile(r"<<ccr:([0-9a-f]{24}) (\d+)_bytes_near_duplicate>>")
+
+
+def _status_rows(n: int, *, generation: int, drift_every: int = 10) -> list[dict[str, Any]]:
+    # Service-status-style rows: most are stable across polls, a few drift.
+    return [
+        {
+            "service": f"svc-{i:02d}",
+            "state": "running",
+            "restarts": i % 3,
+            "uptime_s": 86_400 + i * 17 + (generation * 1009 if i % drift_every == 0 else 0),
+        }
+        for i in range(n)
+    ]
+
+
+def test_near_duplicate_array_ships_only_differing_rows() -> None:
+    # High overlap (18/20 rows shared): the rewrite beats even the
+    # counterfactual per-message lossless rendering, so the tier fires.
+    rows_a = _status_rows(20, generation=0)
+    rows_b = _status_rows(20, generation=1)  # rows 0,10 drift; 18 identical
+    content_a = json.dumps(rows_a, ensure_ascii=False)
+    content_b = json.dumps(rows_b, ensure_ascii=False)
+    messages = [
+        {"role": "user", "content": "Check service status."},
+        {"role": "tool", "content": content_a, "tool_call_id": "s1"},
+        {"role": "user", "content": "Poll it again."},
+        {"role": "tool", "content": content_b, "tool_call_id": "s2"},
+    ]
+
+    result = _apply(messages)
+
+    assert result.transforms_applied == ["cross_message_dedup:near:1"]
+    # First occurrence verbatim.
+    assert result.messages[1]["content"] == content_a
+
+    rendered = json.loads(result.messages[3]["content"])
+    assert isinstance(rendered, list)
+    sentinel = rendered[-1]
+    assert set(sentinel) == {"_ccr_dropped"}
+    match = _NEAR_RE.search(sentinel["_ccr_dropped"])
+    assert match, "near-dup sentinel must surface the pointer"
+    assert "message 1" in sentinel["_ccr_dropped"]
+    # Pinned against any further compression pass.
+    assert "Retrieve original: hash=" in sentinel["_ccr_dropped"]
+
+    # Exactly the differing rows ship, in original order.
+    changed = [row for row in rows_b if row not in rows_a]
+    assert rendered[:-1] == changed
+    assert len(changed) == 2
+
+    # Recovery is byte-exact for the FULL original.
+    entry = get_compression_store().retrieve(match.group(1))
+    assert entry is not None
+    assert entry.original_content == content_b
+
+    # Every shared row stays visible in the untouched first occurrence.
+    shared = [row for row in rows_b if row in rows_a]
+    for row in shared:
+        assert json.dumps(row, ensure_ascii=False) in result.messages[1]["content"]
+
+
+def test_near_duplicate_low_overlap_untouched() -> None:
+    rows_a = _status_rows(9, generation=0)
+    # Only one row in common — below NEAR_DUP_MIN_SHARED_ROWS.
+    rows_b = [rows_a[0]] + _status_rows(8, generation=7)[1:]
+    for row in rows_b[1:]:
+        row["service"] = row["service"] + "-alt"
+    messages = [
+        {"role": "user", "content": "Check service status."},
+        {"role": "tool", "content": json.dumps(rows_a), "tool_call_id": "s1"},
+        {"role": "tool", "content": json.dumps(rows_b), "tool_call_id": "s2"},
+    ]
+    before = [_msg_bytes(m) for m in messages]
+
+    result = _apply(messages)
+
+    assert [_msg_bytes(m) for m in result.messages] == before
+    assert result.transforms_applied == []
+
+
+def test_near_duplicate_counterfactual_gate_refuses_moderate_overlap() -> None:
+    # 6/9 rows shared passes the overlap gates but the rewrite (3 raw JSON
+    # rows + sentinel) would cost MORE than the per-message lossless table
+    # of all 9 rows — the counterfactual gate must refuse. This is the
+    # measured real case: the drifted `df -k` pair regressed 347 -> ~430
+    # tokens before this gate existed.
+    rows_a = _status_rows(9, generation=0, drift_every=4)
+    rows_b = _status_rows(9, generation=1, drift_every=4)  # rows 0,4,8 drift
+    messages = [
+        {"role": "user", "content": "Check service status."},
+        {"role": "tool", "content": json.dumps(rows_a), "tool_call_id": "s1"},
+        {"role": "tool", "content": json.dumps(rows_b), "tool_call_id": "s2"},
+    ]
+    before = [_msg_bytes(m) for m in messages]
+
+    result = _apply(messages)
+
+    assert [_msg_bytes(m) for m in result.messages] == before
+    assert result.transforms_applied == []
+
+
+def test_near_duplicate_source_must_be_kept_verbatim() -> None:
+    # b is an exact duplicate of a (elided); c near-duplicates both. The
+    # pointer must name message 1 (kept verbatim), never message 2 (a
+    # sentinel after replacement).
+    rows_a = _status_rows(20, generation=0)
+    rows_c = _status_rows(20, generation=1)
+    content_a = json.dumps(rows_a, ensure_ascii=False)
+    messages = [
+        {"role": "user", "content": "Check service status."},
+        {"role": "tool", "content": content_a, "tool_call_id": "s1"},
+        {"role": "tool", "content": content_a, "tool_call_id": "s2"},
+        {"role": "tool", "content": json.dumps(rows_c, ensure_ascii=False), "tool_call_id": "s3"},
+    ]
+
+    result = _apply(messages)
+
+    assert sorted(result.transforms_applied) == [
+        "cross_message_dedup:exact:1",
+        "cross_message_dedup:near:1",
+    ]
+    near_sentinel = json.loads(result.messages[3]["content"])[-1]
+    assert "message 1" in near_sentinel["_ccr_dropped"]
