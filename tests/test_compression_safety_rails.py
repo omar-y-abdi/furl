@@ -23,10 +23,11 @@ from typing import Any
 
 import pytest
 
-from headroom import OpenAIProvider, Tokenizer
+from headroom import Tokenizer
 from headroom.compress import compress
 from headroom.config import HeadroomConfig, TransformResult
 from headroom.tokenizer import Tokenizer as TokenizerType
+from headroom.tokenizers import get_tokenizer
 from headroom.transforms.base import Transform
 from headroom.transforms.content_router import ContentRouter, ContentRouterConfig
 from headroom.transforms.pipeline import TransformPipeline
@@ -35,12 +36,10 @@ from headroom.transforms.pipeline import TransformPipeline
 # same name re-exported in ``headroom/__init__.py``.
 compress_module = importlib.import_module("headroom.compress")
 
-_provider = OpenAIProvider()
-
 
 @pytest.fixture
 def tokenizer() -> Tokenizer:
-    return Tokenizer(_provider.get_token_counter("gpt-4o"), "gpt-4o")
+    return Tokenizer(get_tokenizer("gpt-4o"), "gpt-4o")
 
 
 # A realistic failed-tool-call output: error indicators, > min_tokens (50),

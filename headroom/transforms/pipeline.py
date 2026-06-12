@@ -18,7 +18,7 @@ from ..config import (
     TransformResult,
     WasteSignals,
 )
-from ..observability import get_headroom_tracer, get_otel_metrics
+from ._telemetry_noop import get_headroom_tracer, get_otel_metrics
 from ..tokenizer import Tokenizer
 from ..utils import deep_copy_messages
 from .base import Transform

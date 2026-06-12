@@ -253,13 +253,11 @@ class TestSmartCrusherTextIntegration:
 
     @staticmethod
     def _get_tokenizer():
-        """Get a tokenizer for tests using OpenAI provider."""
-        from headroom.providers import OpenAIProvider
+        """Get a tokenizer for tests using the tiktoken registry."""
         from headroom.tokenizer import Tokenizer
+        from headroom.tokenizers import get_tokenizer
 
-        provider = OpenAIProvider()
-        token_counter = provider.get_token_counter("gpt-4o")
-        return Tokenizer(token_counter, "gpt-4o")
+        return Tokenizer(get_tokenizer("gpt-4o"), "gpt-4o")
 
     def test_smart_crusher_passes_through_search_results_unchanged(self):
         """SmartCrusher passes non-JSON search results through unchanged.
