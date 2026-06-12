@@ -1,11 +1,13 @@
-"""Model registry and shared ML model helpers.
+"""Shared ML model helpers retained for the compression core.
 
-Provides a centralized registry of LLM models with their capabilities,
-context limits, pricing, and provider information.
+The LLM metadata/pricing registry was removed in the compression-only
+amputation. This package now exposes only:
 
-Also exposes ML model helpers for sharing heavy model instances
-(sentence transformers, SIGLIP, spaCy) so the same model is not loaded
-multiple times across the process.
+- :data:`headroom.models.config.ML_MODEL_DEFAULTS` — shared ML defaults used by
+  config and cache modules.
+- :class:`headroom.models.ml_models.MLModelRegistry` and its accessors for
+  sharing heavy model instances (sentence transformers, SIGLIP, spaCy) so the
+  same model is not loaded multiple times across the process.
 """
 
 from __future__ import annotations
@@ -13,12 +15,6 @@ from __future__ import annotations
 from importlib import import_module
 
 __all__ = [
-    # LLM Registry
-    "ModelRegistry",
-    "ModelInfo",
-    "get_model_info",
-    "list_models",
-    "register_model",
     # ML Model Registry
     "MLModelRegistry",
     "get_sentence_transformer",
@@ -29,12 +25,6 @@ __all__ = [
 # Keep the package entrypoint lightweight so importing headroom.models does
 # not eagerly load optional ML dependencies until a specific export is used.
 _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
-    # LLM registry
-    "ModelRegistry": ("headroom.models.registry", "ModelRegistry"),
-    "ModelInfo": ("headroom.models.registry", "ModelInfo"),
-    "get_model_info": ("headroom.models.registry", "get_model_info"),
-    "list_models": ("headroom.models.registry", "list_models"),
-    "register_model": ("headroom.models.registry", "register_model"),
     # ML model registry
     "MLModelRegistry": ("headroom.models.ml_models", "MLModelRegistry"),
     "get_sentence_transformer": ("headroom.models.ml_models", "get_sentence_transformer"),
