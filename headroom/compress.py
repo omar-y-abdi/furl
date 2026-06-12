@@ -58,7 +58,7 @@ from __future__ import annotations
 
 import logging
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from .pipeline import PipelineExtensionManager, PipelineStage, summarize_routing_markers
@@ -197,12 +197,21 @@ def compress(
     if not messages or not optimize:
         return CompressResult(messages=messages)
 
-    # Build config from explicit config + kwargs
+    # Build config from explicit config + kwargs. Never mutate the
+    # caller's CompressConfig — a reused config object must not carry
+    # one call's kwarg overrides into the next call.
     cfg = config or CompressConfig()
     config_fields = {f.name for f in cfg.__dataclass_fields__.values()}
-    for key, value in kwargs.items():
-        if key in config_fields:
-            setattr(cfg, key, value)
+    overrides = {key: value for key, value in kwargs.items() if key in config_fields}
+    unknown = sorted(set(kwargs) - config_fields)
+    if unknown:
+        logger.warning(
+            "compress(): ignoring unknown option(s) %s; valid CompressConfig fields: %s",
+            ", ".join(unknown),
+            ", ".join(sorted(config_fields)),
+        )
+    if overrides:
+        cfg = replace(cfg, **overrides)
 
     pipeline = _get_pipeline()
     pipeline_extensions = PipelineExtensionManager(hooks=hooks, discover=False)
