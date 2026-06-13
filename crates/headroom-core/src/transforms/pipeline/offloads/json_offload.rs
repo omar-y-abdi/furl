@@ -339,17 +339,23 @@ mod tests {
 
     #[test]
     fn apply_propagates_query_anchors_into_smart_crusher() {
-        // Construct a tabular array where one row has an anchor that
-        // matches the query. SmartCrusher should be biased to keep
-        // that row. We don't assert exactly what survives — just that
-        // it ran with the query in scope.
+        // Construct a tabular array where one row carries a DISTINCTIVE
+        // identifier that the query names. The query embeds it as a
+        // quoted token so `extract_query_anchors` produces a real
+        // deterministic anchor (a bare lowercase word like "needle" is
+        // NOT an anchor \u2014 it yields no UUID/ID/quoted match, so it would
+        // only "survive" by the engine declining to crush at all, which
+        // is exactly the erratic no-signal skip this fix removes).
+        //
+        // Now that near-unique data crushes deterministically, the
+        // query-anchor pin is what must keep this row VISIBLE.
         let mut s = String::from("[");
         for i in 0..50 {
             if i > 0 {
                 s.push(',');
             }
             let name = if i == 17 {
-                "needle".to_string()
+                "ENTITY-9F3A".to_string()
             } else {
                 format!("hay-{i}")
             };
@@ -360,15 +366,17 @@ mod tests {
         }
         s.push(']');
         let store = InMemoryCcrStore::new();
-        let ctx = CompressionContext::with_query("needle");
+        // Quoted token \u2192 a real query anchor that exact-matches the row.
+        let ctx = CompressionContext::with_query("find the \"ENTITY-9F3A\" row");
         let r = offload()
             .apply(&s, &ctx, &store)
             .expect("crusher should run");
-        // Output should reference "needle" — SmartCrusher's anchor logic
-        // should keep that row.
+        // The query-anchored row must stay VISIBLE through the crush \u2014
+        // anchor pins are the rows the model most needs to see.
         assert!(
-            r.output.contains("needle"),
-            "anchor row should survive crush"
+            r.output.contains("ENTITY-9F3A"),
+            "query-anchored row should survive crush visibly, got: {}",
+            r.output
         );
     }
 

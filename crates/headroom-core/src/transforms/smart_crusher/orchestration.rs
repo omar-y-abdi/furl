@@ -200,10 +200,38 @@ pub fn prioritize_indices(
     let learned_indices: BTreeSet<usize> = BTreeSet::new();
 
     let mut prioritized: BTreeSet<usize> = BTreeSet::new();
+
+    // Error-keyword and TOIN-learned pins are SEMANTIC needles (an
+    // "ERROR"/"panic" token, a learned-important field value) — they are
+    // meaningful regardless of how many rows carry them, so they pin
+    // unconditionally.
     prioritized.extend(&error_indices);
-    prioritized.extend(&outlier_indices);
-    prioritized.extend(&anomaly_indices);
     prioritized.extend(&learned_indices);
+
+    // DEGENERACY GATE (rarity-class pins). Structural outliers (rare
+    // fields / rare statuses) and numeric anomalies (>variance_threshold σ)
+    // are *rarity* signals: a row is pinned because it is unusual relative
+    // to its peers. On high-entropy near-unique data that premise breaks —
+    // a uniformly-random integer column produces a seed-dependent scatter
+    // of ">2σ" rows and a bounded column (0..80) makes a variable slice of
+    // rows look "rare", so these signals fire on a large, unstable fraction
+    // of rows. Pinning them then degenerates to "keep almost everything":
+    // the survivor count swings between the budget and ~n depending only on
+    // the random draw, which flips the MinTokens router between the
+    // aggressive lossy render and the no-drop lossless render (measured:
+    // 34% vs 94% on the same shape across seeds). Since every un-pinned row
+    // stays CCR-recoverable (unconditional persist + surfaced
+    // `<<ccr:HASH>>` pointer), suppressing a non-informative rarity signal
+    // loses NO information — it just stops the noise from defeating the
+    // CCR-backed budget. Same `rarity_signal_is_informative` test the
+    // singleton pin already uses: a rarity signal that flags a majority of
+    // rows distinguishes nothing.
+    if rarity_signal_is_informative(outlier_indices.len(), n) {
+        prioritized.extend(&outlier_indices);
+    }
+    if rarity_signal_is_informative(anomaly_indices.len(), n) {
+        prioritized.extend(&anomaly_indices);
+    }
 
     // Query-relevant pinning. Rows the planner flagged as matching the
     // user's query (deterministic anchor hits + capped high-confidence
@@ -233,7 +261,7 @@ pub fn prioritize_indices(
     // skipped row remains CCR-recoverable via the unconditional persist
     // + surfaced `<<ccr:HASH>>` pointer, so nothing is lost.
     let singleton_indices = field_value_singletons(items, exclude);
-    if singleton_signal_is_informative(singleton_indices.len(), items.len()) {
+    if rarity_signal_is_informative(singleton_indices.len(), items.len()) {
         let singleton_cap = singleton_pin_cap(effective_max);
         let mut singletons_pinned = 0usize;
         for &idx in &singleton_indices {
@@ -298,16 +326,23 @@ fn singleton_pin_cap(effective_max: usize) -> usize {
     effective_max
 }
 
-/// Is the field-value-singleton signal informative for this array?
+/// Is a RARITY signal informative for this array?
 ///
-/// A singleton row is a needle only when singletons are RARE — the
-/// signal is "this row is unusual relative to its peers". When a strict
-/// majority of rows are singletons the array is simply high-entropy
-/// (all-distinct subjects/messages) and "singleton" distinguishes
-/// nothing; pinning by it degenerates to first-K-by-index positional
-/// noise. At-most-half keeps the borderline case (exactly half) pinned.
-fn singleton_signal_is_informative(singleton_count: usize, n: usize) -> bool {
-    singleton_count * 2 <= n
+/// Rarity signals — field-value singletons, structural outliers (rare
+/// fields / rare statuses), numeric anomalies (>variance_threshold σ) —
+/// all flag a row because it is unusual *relative to its peers*. That
+/// premise only holds when the flagged rows are a minority: a needle is
+/// rare by definition. When a strict majority of rows are flagged, the
+/// array is simply high-entropy (all-distinct subjects, uniformly-random
+/// numeric columns) and the signal distinguishes nothing; pinning by it
+/// degenerates to first-K-by-index positional noise and, on the
+/// CCR-backed lossy path, defeats the aggressive keep budget. At-most-half
+/// keeps the borderline case (exactly half) pinned.
+///
+/// Shared by every rarity-class pin so the gate is identical and the
+/// behavior is deterministic across signal types.
+fn rarity_signal_is_informative(flagged_count: usize, n: usize) -> bool {
+    flagged_count * 2 <= n
 }
 
 /// Indices of rows carrying a value that appears EXACTLY ONCE across some
@@ -692,12 +727,12 @@ mod tests {
     #[test]
     fn singleton_signal_majority_is_uninformative() {
         // All-distinct array: every row is a singleton -> no signal.
-        assert!(!singleton_signal_is_informative(90, 90));
-        assert!(!singleton_signal_is_informative(46, 90));
+        assert!(!rarity_signal_is_informative(90, 90));
+        assert!(!rarity_signal_is_informative(46, 90));
         // Rare singletons -> real needles -> informative.
-        assert!(singleton_signal_is_informative(1, 30));
-        assert!(singleton_signal_is_informative(45, 90)); // exactly half stays pinned
-        assert!(singleton_signal_is_informative(0, 90));
+        assert!(rarity_signal_is_informative(1, 30));
+        assert!(rarity_signal_is_informative(45, 90)); // exactly half stays pinned
+        assert!(rarity_signal_is_informative(0, 90));
     }
 
     #[test]

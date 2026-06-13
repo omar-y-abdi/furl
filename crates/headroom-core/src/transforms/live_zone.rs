@@ -531,7 +531,22 @@ const HOT_ZONE_BLOCK_TYPES: &[&str] = &[
 
 fn smart_crusher() -> &'static SmartCrusher {
     static INSTANCE: OnceLock<SmartCrusher> = OnceLock::new();
-    INSTANCE.get_or_init(|| SmartCrusher::new(SmartCrusherConfig::default()))
+    // BYTE-FAITHFUL DISPATCH. The live-zone owns CCR marker injection +
+    // backing through its own store (`maybe_inject_ccr_marker`); the
+    // crusher must not change its drop behavior based on its internal
+    // store. The entropy-floor crushability override (which crushes
+    // near-unique no-signal arrays when a store backs recovery) is a
+    // `compress()`-pipeline behavior, NOT a property of this cache-safe
+    // dispatcher \u2014 enabling it here would make the no-external-store
+    // path emit a marker keyed to the internal store, breaking the
+    // `no_marker_when_store_omitted` P0 contract. Opt out explicitly.
+    INSTANCE.get_or_init(|| {
+        let cfg = SmartCrusherConfig {
+            crush_unique_entities_when_recoverable: false,
+            ..SmartCrusherConfig::default()
+        };
+        SmartCrusher::new(cfg)
+    })
 }
 
 fn log_compressor() -> &'static LogCompressor {
