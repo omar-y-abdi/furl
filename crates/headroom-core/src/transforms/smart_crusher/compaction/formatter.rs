@@ -304,6 +304,10 @@ fn write_table(
                 // and suffix live on the `__affix:name=...` preamble line;
                 // rows below carry only the unique middle.
                 Some(ColumnEncoding::Affix { .. }) => return format!("{base}^"),
+                // Head-dict marker: `name:string@`. The distinct heads
+                // live on the `__head:name=...` preamble line; rows carry
+                // `<head_index><delim><tail>`.
+                Some(ColumnEncoding::HeadDict { .. }) => return format!("{base}@"),
                 // Dictionary columns keep a plain declaration — the
                 // `__dict:name=...` preamble line is their marker.
                 Some(ColumnEncoding::DictString { .. }) | None => {}
@@ -351,6 +355,23 @@ fn write_table(
             out.push_str(&csv_render_str(prefix));
             out.push(',');
             out.push_str(&csv_render_str(suffix));
+            out.push('\n');
+        }
+    }
+
+    // Head-dict preamble: `__head:name=<DELIM><h0>,<h1>,...`. The first
+    // char after `=` is the delimiter; the remaining comma-separated
+    // (CSV-escaped) segments are the distinct heads in first-appearance
+    // order, each already carrying its trailing delimiter. A plain data
+    // cell starting with `__head:` is CSV-quoted by `csv_render_str`.
+    for f in &schema.fields {
+        if let Some(ColumnEncoding::HeadDict { delim, heads }) = &f.encoding {
+            out.push_str("__head:");
+            out.push_str(&f.name);
+            out.push('=');
+            out.push(*delim);
+            let segs: Vec<String> = heads.iter().map(|h| csv_render_str(h)).collect();
+            out.push_str(&segs.join(","));
             out.push('\n');
         }
     }
@@ -429,6 +450,14 @@ fn write_table(
                     // from these exact cells); degrade verbatim.
                     None => format_cell(c),
                 },
+                (
+                    Some(ColumnEncoding::HeadDict { delim, heads }),
+                    CellValue::Scalar(Value::String(s)),
+                ) => match head_cell_for(s, *delim, heads) {
+                    Some(cell) => csv_render_str(&cell),
+                    // Unreachable for stamped columns; degrade verbatim.
+                    None => format_cell(c),
+                },
                 _ => format_cell(c),
             };
             rendered.push(cell);
@@ -485,10 +514,21 @@ fn const_decl_value(v: &Value) -> String {
 /// quoted (dictionary-line marker), and CSV-special chars quote as
 /// usual. Shared with the compactor's byte-gate simulation so stamping
 /// decisions measure EXACTLY what the formatter ships.
+/// Build a head-dict cell `<head_index><delim><tail>` for `value`,
+/// looking the head up in `heads`. `None` when the value lacks the
+/// delimiter or its head is not in the dictionary (only possible when
+/// rendering a row the stamping never saw) — caller degrades verbatim.
+fn head_cell_for(value: &str, delim: char, heads: &[String]) -> Option<String> {
+    let (head, tail) = encodings::split_head(value, delim)?;
+    let idx = heads.iter().position(|h| h == head)?;
+    Some(encodings::encode_head_cell(idx, delim, tail))
+}
+
 pub(super) fn csv_render_str(s: &str) -> String {
     if s == "="
         || s.starts_with("__dict:")
         || s.starts_with("__affix:")
+        || s.starts_with("__head:")
         || needs_csv_quote(s)
     {
         csv_quote(s)
@@ -1383,6 +1423,73 @@ mod tests {
             })
             .collect();
         assert_eq!(recovered, originals, "affix round-trip must be exact");
+    }
+
+    // ── Head-dict fold (CSV) ──
+
+    #[test]
+    fn csv_head_dict_marks_declaration_and_round_trips() {
+        use super::super::encodings::{decode_head_cell, decode_head_value};
+        // Paths grouped under a few directories: low-cardinality head,
+        // unique tail. The single common affix is short (only the shared
+        // root), so head-dict is the bigger fold.
+        let dirs = [
+            "src/transforms/smart_crusher/",
+            "src/cache/store/",
+            "src/pipeline/offloads/",
+            "lib/util/text/",
+        ];
+        let items: Vec<Value> = (0..40)
+            .map(|i| {
+                json!({
+                    "path": format!("{}{}.rs", dirs[i % 4], nonaffix(i)),
+                    "ln": (i * 7) as i64,
+                })
+            })
+            .collect();
+        let originals: Vec<String> = items
+            .iter()
+            .map(|v| v["path"].as_str().unwrap().to_string())
+            .collect();
+        let c = compact(&items, &cfg());
+        let out = CsvSchemaFormatter::new().format(&c);
+        let lines: Vec<&str> = out.trim_end().lines().collect();
+        assert!(lines[0].contains("path:string@"), "got decl: {}", lines[0]);
+        let head_line = lines
+            .iter()
+            .find(|l| l.starts_with("__head:path="))
+            .expect("head preamble line");
+        // Each distinct directory head appears exactly once.
+        for d in dirs {
+            assert_eq!(out.matches(d).count(), 1, "head {d} must appear once");
+        }
+        // Reconstruct every path cell from the head dictionary + cells.
+        let payload = head_line.strip_prefix("__head:path=").unwrap();
+        let delim = payload.chars().next().unwrap();
+        let heads: Vec<&str> = payload[delim.len_utf8()..].split(',').collect();
+        // `ln` is an exact arithmetic progression (0,7,14,...) so it folds
+        // into the declaration and is NOT row-visible; `path` is the only
+        // remaining cell per row. Find its position among ROW-VISIBLE
+        // columns (those without a `=` const/arith fold in the decl).
+        let decl_body = lines[0]
+            .strip_prefix("[40]{")
+            .and_then(|s| s.strip_suffix('}'))
+            .unwrap();
+        let visible_cols: Vec<&str> = decl_body.split(',').filter(|c| !c.contains('=')).collect();
+        let path_col = visible_cols
+            .iter()
+            .position(|c| c.starts_with("path:"))
+            .unwrap();
+        let recovered: Vec<String> = lines
+            .iter()
+            .filter(|l| !l.starts_with('[') && !l.starts_with("__"))
+            .map(|l| {
+                let cell = l.split(',').nth(path_col).unwrap();
+                let (idx, tail) = decode_head_cell(cell, delim).expect("decode cell");
+                decode_head_value(heads[idx], tail)
+            })
+            .collect();
+        assert_eq!(recovered, originals, "head-dict round-trip must be exact");
     }
 
     // ── Decimal scale-fold (CSV) ──

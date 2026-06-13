@@ -433,6 +433,76 @@ pub fn decode_affix_cell(middle: &str, prefix: &str, suffix: &str) -> String {
     s
 }
 
+// ─────────────────────── head dictionary fold ───────────────────────
+//
+// A string column whose values split at the LAST occurrence of a
+// delimiter (`/`, `:`, or `.`) into a low-cardinality HEAD (everything
+// up to and including the delimiter) and a unique TAIL. The distinct
+// heads are declared once on a `__head:name=<DELIM><h0>,<h1>,...` line;
+// each row cell renders as `<head_index><DELIM><tail>`. Reconstruction:
+// `head[index] + tail` (the head already carries the trailing delimiter,
+// so the in-cell delimiter after the index is dropped). Exact by
+// construction — the head is a verbatim byte string, the tail is verbatim
+// bytes, concatenation is lossless.
+//
+// This catches the structure cross-row affix folding cannot: paths/keys
+// that fall into a FEW directory/namespace groups whose per-group prefix
+// is NOT shared by the WHOLE column (so the single common affix is short)
+// but repeats across many rows.
+
+/// The delimiters head-dict considers, in priority order. A column is
+/// split at the LAST occurrence of the FIRST delimiter that yields a
+/// low-cardinality, byte-saving head set.
+pub const HEAD_DELIMS: [char; 3] = ['/', ':', '.'];
+
+/// Split `value` at the last occurrence of `delim` into
+/// `(head_including_delim, tail)`. `None` when `delim` is absent.
+pub fn split_head(value: &str, delim: char) -> Option<(&str, &str)> {
+    let idx = value.rfind(delim)?;
+    let split = idx + delim.len_utf8();
+    Some((&value[..split], &value[split..]))
+}
+
+/// Render a head-dict cell: `<head_index><delim><tail>`. The leading
+/// integer run is the head index; the single `delim` byte after it
+/// separates index from tail and is dropped on decode (the head already
+/// ends with `delim`).
+pub fn encode_head_cell(head_index: usize, delim: char, tail: &str) -> String {
+    let mut s = String::with_capacity(8 + tail.len());
+    s.push_str(&head_index.to_string());
+    s.push(delim);
+    s.push_str(tail);
+    s
+}
+
+/// Decode a head-dict cell back to `(head_index, tail)`. Reads the
+/// maximal leading ASCII-digit run as the index, requires the next byte
+/// to be exactly `delim`, and takes the rest as the tail. `None` on any
+/// deviation (no digits, missing delimiter) — never invents data.
+pub fn decode_head_cell(cell: &str, delim: char) -> Option<(usize, &str)> {
+    let bytes = cell.as_bytes();
+    let mut k = 0;
+    while k < bytes.len() && bytes[k].is_ascii_digit() {
+        k += 1;
+    }
+    if k == 0 {
+        return None; // no index
+    }
+    let idx: usize = cell[..k].parse().ok()?;
+    let rest = &cell[k..];
+    let tail = rest.strip_prefix(delim)?;
+    Some((idx, tail))
+}
+
+/// Reassemble a head-dict value: `head + tail` (head already carries its
+/// trailing delimiter). Total by construction.
+pub fn decode_head_value(head: &str, tail: &str) -> String {
+    let mut s = String::with_capacity(head.len() + tail.len());
+    s.push_str(head);
+    s.push_str(tail);
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -606,6 +676,51 @@ mod tests {
         for v in &values {
             assert_eq!(encode_affix_cell(v, p, s), Some(""));
         }
+    }
+
+    #[test]
+    fn head_split_and_cell_round_trip() {
+        let v = "src/cache/store/foo.rs";
+        let (head, tail) = split_head(v, '/').expect("split");
+        assert_eq!(head, "src/cache/store/");
+        assert_eq!(tail, "foo.rs");
+        let cell = encode_head_cell(3, '/', tail);
+        assert_eq!(cell, "3/foo.rs");
+        let (idx, dtail) = decode_head_cell(&cell, '/').expect("decode");
+        assert_eq!(idx, 3);
+        assert_eq!(dtail, "foo.rs");
+        assert_eq!(decode_head_value(head, dtail), v);
+    }
+
+    #[test]
+    fn head_cell_index_is_maximal_digit_run() {
+        // idx 12, tail begins with a digit — the delimiter ends the run.
+        let cell = encode_head_cell(12, '/', "3abc");
+        assert_eq!(cell, "12/3abc");
+        let (idx, tail) = decode_head_cell(&cell, '/').expect("decode");
+        assert_eq!((idx, tail), (12, "3abc"));
+    }
+
+    #[test]
+    fn head_decode_rejects_malformed() {
+        assert!(decode_head_cell("abc", '/').is_none()); // no index
+        assert!(decode_head_cell("5x", '/').is_none()); // wrong separator
+        assert!(decode_head_cell("/foo", '/').is_none()); // no leading digit
+    }
+
+    #[test]
+    fn head_split_absent_delim_is_none() {
+        assert!(split_head("nodelimiter", '/').is_none());
+    }
+
+    #[test]
+    fn head_split_colon_and_dot_delims() {
+        let (h, t) = split_head("app:prod:session:42", ':').expect("colon");
+        assert_eq!(h, "app:prod:session:");
+        assert_eq!(t, "42");
+        let (h, t) = split_head("com.example.module.Name", '.').expect("dot");
+        assert_eq!(h, "com.example.module.");
+        assert_eq!(t, "Name");
     }
 
     #[test]

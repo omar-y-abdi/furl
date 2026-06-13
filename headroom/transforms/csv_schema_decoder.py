@@ -47,6 +47,14 @@ Encodings understood:
   ``prefix + middle + suffix`` (pure byte concatenation — exact). A plain
   data cell starting with ``__affix:`` is CSV-quoted by the formatter, so
   the preamble lines are unambiguous.
+* **Head-dict fold** — ``name:string@`` marks a string column whose
+  values split at the last delimiter (``/`` ``:`` ``.``) into a
+  low-cardinality HEAD and a unique TAIL. A ``__head:name=<DELIM><h0>,...``
+  preamble line declares the delimiter (first char) and the distinct heads
+  (CSV-escaped, first-appearance order, each carrying its trailing
+  delimiter); each row cell is ``<head_index><delim><tail>``, reconstructed
+  as ``head[index] + tail``. A plain data cell starting with ``__head:`` is
+  CSV-quoted by the formatter, so the preamble lines are unambiguous.
 
 Lines that do not parse as rows (e.g. the lossy-survivor
 ``{"_ccr_dropped": ...}`` sentinel line) are skipped; callers treat
@@ -155,6 +163,11 @@ class ColumnSpec:
     # ``__affix:name=PREFIX,SUFFIX`` preamble line; row cells carry only
     # the unique middle, reconstructed as ``prefix + middle + suffix``.
     affix: tuple[str, str] | None = None
+    # True when the column is head-dict encoded (``name:string@``). The
+    # delimiter + distinct heads live on the ``__head:name=...`` preamble
+    # line; row cells are ``<head_index><delim><tail>``, reconstructed as
+    # ``head[index] + tail``.
+    head_dict: bool = False
 
 
 def split_unquoted(s: str) -> list[str]:
@@ -257,6 +270,17 @@ def _parse_header_segment(seg: str) -> ColumnSpec | None:
             const_value=None,
             affix=("", ""),
         )
+    if decl.endswith("@"):
+        bare = decl[:-1]
+        # Head dictionary + delimiter come from the ``__head:`` preamble.
+        return ColumnSpec(
+            name=name,
+            type_tag=bare.rstrip("?"),
+            nullable=bare.endswith("?"),
+            has_const=False,
+            const_value=None,
+            head_dict=True,
+        )
     scale_m = re.match(r"^(.+)%(\d+)$", decl)
     if scale_m:
         bare = scale_m.group(1)
@@ -325,8 +349,10 @@ def decode_csv_schema_rows(text: str) -> list[dict[str, Any]] | None:
     # other line ends the preamble and is processed as a row.
     var_names = {s.name for s in var_cols}
     affix_names = {s.name for s in var_cols if s.affix is not None}
+    head_names = {s.name for s in var_cols if s.head_dict}
     dict_values: dict[str, list[str]] = {}
     affixes: dict[str, tuple[str, str]] = {}
+    head_dicts: dict[str, tuple[str, list[str]]] = {}
     body_start = 1
 
     def _unq(seg: str) -> str:
@@ -354,6 +380,15 @@ def decode_csv_schema_rows(text: str) -> list[dict[str, Any]] | None:
             affixes[name] = (_unq(segs[0]), _unq(segs[1]))
             body_start += 1
             continue
+        if line.startswith("__head:") and "=" in line:
+            name, payload = line[len("__head:") :].split("=", 1)
+            if name not in head_names or not payload:
+                break
+            delim = payload[0]
+            heads = [_unq(seg) for seg in split_unquoted(payload[1:])]
+            head_dicts[name] = (delim, heads)
+            body_start += 1
+            continue
         break
 
     rows: list[dict[str, Any]] = []
@@ -379,7 +414,14 @@ def decode_csv_schema_rows(text: str) -> list[dict[str, Any]] | None:
             else:
                 resolved = raw
                 carry_raw[j] = raw
-            if spec.affix is not None:
+            if spec.head_dict:
+                hd = head_dicts.get(spec.name)
+                value = _decode_head_cell(resolved, hd)
+                if value is None:
+                    ok = False  # never invent data on a bad head cell
+                    break
+                row[spec.name] = value
+            elif spec.affix is not None:
                 pre, suf = affixes.get(spec.name, ("", ""))
                 row[spec.name] = pre + resolved + suf
             elif spec.iso_delta:
@@ -435,6 +477,35 @@ def _decode_decimal_scaled_cell(resolved: str, scale: int) -> float | None:
         return float(f"{sign}{padded[:split]}.{padded[split:]}")
     except ValueError:  # pragma: no cover — digits guarantee parse
         return None
+
+
+def _decode_head_cell(
+    resolved: str, hd: tuple[str, list[str]] | None
+) -> str | None:
+    """Decode one head-dict cell ``<idx><delim><tail>`` -> ``head[idx] + tail``.
+
+    Reads the maximal leading digit run as the head index, requires the
+    next char to be exactly the column's delimiter, and takes the rest as
+    the tail. Returns ``None`` on any deviation (no preamble, bad index,
+    missing delimiter) — the caller skips the row rather than inventing
+    data.
+    """
+    if hd is None:
+        return None
+    delim, heads = hd
+    k = 0
+    while k < len(resolved) and resolved[k].isdigit():
+        k += 1
+    if k == 0:
+        return None
+    idx = int(resolved[:k])
+    rest = resolved[k:]
+    if not rest.startswith(delim):
+        return None
+    tail = rest[len(delim) :]
+    if idx >= len(heads):
+        return None
+    return heads[idx] + tail
 
 
 def _decode_iso_delta_cell(
