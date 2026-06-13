@@ -531,6 +531,12 @@ impl PySmartCrusherConfig {
                 lossless_min_savings_ratio,
                 enable_ccr_marker,
                 routing_policy,
+                // Entropy-floor crushability override: on by default so
+                // the Python `compress()` pipeline crushes near-unique
+                // no-signal data recoverably (deterministic, aggressive).
+                // Not exposed as a constructor arg \u2014 keeps the Python
+                // config API + parity fixtures unchanged.
+                crush_unique_entities_when_recoverable: true,
             },
         })
     }

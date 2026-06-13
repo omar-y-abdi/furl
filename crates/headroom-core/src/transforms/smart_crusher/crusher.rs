@@ -49,7 +49,7 @@ use super::config::{RoutingPolicy, SmartCrusherConfig};
 use super::crushers::{compute_k_split, crush_number_array, crush_object, crush_string_array};
 use super::planning::SmartCrusherPlanner;
 use super::traits::{Constraint, CrushEvent, Observer};
-use super::types::{CompressionPlan, CompressionStrategy, CrushResult};
+use super::types::{ArrayAnalysis, CompressionPlan, CompressionStrategy, CrushResult};
 use crate::ccr::CcrStore;
 use crate::relevance::RelevanceScorer;
 use crate::transforms::adaptive_sizer::compute_optimal_k;
@@ -767,7 +767,28 @@ impl SmartCrusher {
         // (the analyzer's `Skip` gate) there is NO lossy alternative — the
         // outcome carries the `skip:<reason>` passthrough so the routing
         // layer can ship it when there's also no lossless render.
-        let lossy = self.crush_array_lossy(items, query_context, &item_strings, adaptive_k);
+        // Does the lossless compaction render rely on opaque-blob
+        // substitution (heavy base64/hex fields replaced by an
+        // `<<ccr:HASH,KIND,SIZE>>` pointer while EVERY row stays visible)?
+        // That path is the dedicated, better-suited treatment for blob-
+        // bearing rows: it preserves each row's light fields (id/name/…)
+        // inline instead of dropping whole rows. When it applies, the
+        // entropy-floor override must stand down so it does not hijack
+        // blob data into a row-drop render — both are recoverable, but the
+        // opaque-substitution view keeps strictly more visible per row.
+        let lossless_uses_opaque = self
+            .compaction
+            .as_ref()
+            .map(|stage| stage.run(items).0.contains_opaque_ref())
+            .unwrap_or(false);
+
+        let lossy = self.crush_array_lossy(
+            items,
+            query_context,
+            &item_strings,
+            adaptive_k,
+            !lossless_uses_opaque,
+        );
 
         // ── Route between the recoverable renders ──
         //
@@ -826,6 +847,10 @@ impl SmartCrusher {
         query_context: &str,
         item_strings: &[String],
         adaptive_k: usize,
+        // When false, the entropy-floor crushability override stands down
+        // (a better-suited lossless render — e.g. opaque-blob substitution
+        // — exists for this array, so we must not hijack it into a drop).
+        allow_skip_override: bool,
     ) -> LossyOutcome {
         // CCR-BACKED AGGRESSIVE BUDGET: when a CCR store is configured,
         // every dropped row is guaranteed recoverable (unconditional
@@ -842,7 +867,59 @@ impl SmartCrusher {
         } else {
             adaptive_k
         };
-        let analysis = self.analyzer.analyze_array(items);
+        let mut analysis = self.analyzer.analyze_array(items);
+
+        // ── CCR-backed crushability override (entropy floor) ──
+        //
+        // The analyzer's crushability gate refuses to crush near-unique,
+        // high-uniqueness arrays UNLESS a "signal" (a numeric anomaly, a
+        // change point, an error keyword) happens to be present — see
+        // `analyze_crushability` cases 2 & 4 (`unique_entities_no_signal`,
+        // `medium_uniqueness_no_signal`). That gate was written for the
+        // PERMANENT-LOSS world: with no signal telling us which distinct
+        // row matters, dropping any of them risked losing it forever, so
+        // the safe choice was to keep them all visible.
+        //
+        // Under the CCR recovery invariant that premise is gone. When a
+        // store is configured every dropped row is persisted + surfaced
+        // via a `<<ccr:HASH>>` pointer, so a smaller visible sample loses
+        // NO information — the rest is retrievable from the output alone.
+        // "We don't know which row matters" therefore no longer argues for
+        // keeping everything visible; it argues for a bounded recoverable
+        // sample. Worse, the gate is NON-DETERMINISTIC on exactly this
+        // data: whether a uniformly-random integer column produces a >2σ
+        // anomaly is a per-seed coin-flip, so the SAME near-unique shape
+        // flips between "skip → ship all rows" (~34% reduction) and
+        // "crush → drop+recover" (~94%) across seeds. That is the
+        // erratic 24-94% scatter the verifier measured.
+        //
+        // Fix: when a CCR store guarantees recovery, do NOT skip on a
+        // no-signal reason — re-derive the real pattern strategy (the one
+        // `select_strategy` would pick if `crushable` were true) and crush.
+        // This is deterministic (independent of the noise signals) and
+        // aggressive at the entropy floor. The result still flows through
+        // `MinTokens` routing below, so the lossy render only SHIPS when it
+        // is actually fewer tokens — the override just makes the
+        // recoverable candidate EXIST every time, not at the mercy of a
+        // random anomaly. STRUCTURAL skips (mixed types, too-few-items,
+        // non-dict) are NOT overridden: those arrays are genuinely
+        // un-sampleable, not merely signal-free.
+        if analysis.recommended_strategy == CompressionStrategy::Skip
+            && allow_skip_override
+            && self.config.crush_unique_entities_when_recoverable
+            && self.ccr_store.is_some()
+            && skip_reason_is_no_signal(&analysis)
+        {
+            let strategy = self.analyzer.select_strategy(
+                &analysis.field_stats,
+                &analysis.detected_pattern,
+                items.len(),
+                None, // bypass the crushability veto: recovery is CCR-backed
+            );
+            if strategy != CompressionStrategy::Skip {
+                analysis.recommended_strategy = strategy;
+            }
+        }
 
         // Crushability gate: not safe to crush → no DROP candidate. Carry
         // the `skip:<reason>` passthrough so the caller can ship it when
@@ -1342,6 +1419,31 @@ const CCR_BACKED_KEEP_FLOOR: usize = 5;
 /// a handful of rows to save a few bytes is noise, not compression.
 const LOSSY_SURVIVOR_RENDER_MIN_SAVED_BYTES: usize = 64;
 
+/// Is the analyzer's `Skip` a "no SIGNAL on distinct data" skip (as
+/// opposed to a STRUCTURAL skip)?
+///
+/// The crushability gate produces two flavors of `Skip`:
+/// - **no-signal skips** — the data IS sampleable (rows are well-formed
+///   dicts with comparable fields) but the analyzer found no anomaly /
+///   change-point / error-keyword to anchor the sample on, so under the
+///   permanent-loss assumption it refused to drop. Reasons:
+///   `unique_entities_no_signal`, `medium_uniqueness_no_signal`.
+/// - **structural skips** — the array is genuinely un-sampleable
+///   (too few items, non-dict items, mixed value types). Those carry
+///   different reasons and MUST keep skipping even with CCR backing.
+///
+/// Only the no-signal flavor is eligible for the CCR-backed override:
+/// recovery removes the loss risk that justified the veto, and the data
+/// is structurally fine to sample. Matching on the reason string keeps
+/// this decision in lockstep with `analyze_crushability`'s own labels —
+/// a new structural reason is excluded by default (fail-closed).
+fn skip_reason_is_no_signal(analysis: &ArrayAnalysis) -> bool {
+    matches!(
+        analysis.crushability.as_ref().map(|c| c.reason.as_str()),
+        Some("unique_entities_no_signal") | Some("medium_uniqueness_no_signal")
+    )
+}
+
 /// Lossy keep budget when every dropped row is CCR-recoverable.
 /// `adaptive_k / 2`, floored at [`CCR_BACKED_KEEP_FLOOR`], never above
 /// `adaptive_k` itself.
@@ -1575,22 +1677,63 @@ mod tests {
     }
 
     #[test]
-    fn crush_array_skip_path_returns_original_items() {
-        // 30 unique dict items with ID-like fields → analyzer should
-        // detect "unique_entities_no_signal" and SKIP. Use the
-        // no-compaction constructor so we exercise the lossy/skip
-        // gate; the lossless path would otherwise short-circuit
-        // because uniform-tabular input is the lossless sweet spot.
+    fn crush_array_no_signal_with_ccr_store_crushes_recoverably() {
+        // 30 unique dict items with ID-like fields → the analyzer's
+        // crushability gate labels this `unique_entities_no_signal`.
+        // Pre-fix that SKIPPED (returned all 30 rows). With a CCR store
+        // configured (the `without_compaction` constructor installs the
+        // default store) recovery is guaranteed, so the entropy-floor
+        // override re-derives a real strategy and crushes — DETERMINISTIC
+        // and aggressive, with every dropped row recoverable via the
+        // surfaced `<<ccr:HASH>>` pointer. This is the routing fix that
+        // collapses the 24-94% scatter on near-unique data.
         let c = SmartCrusher::without_compaction(SmartCrusherConfig::default());
         let items: Vec<Value> = (0..30)
             .map(|i| json!({"id": i, "name": format!("user_{}", i)}))
             .collect();
         let result = c.crush_array(&items, "", 1.0);
-        // skip path returns the original items unchanged.
+        // Aggressively crushed: far fewer survivors than the input.
+        assert!(
+            result.items.len() < items.len(),
+            "expected a crush, got {} of {} rows",
+            result.items.len(),
+            items.len()
+        );
+        // Recovery invariant: a drop happened, so a CCR pointer is
+        // surfaced and the store holds the full original (never silent).
+        assert!(
+            result.ccr_hash.is_some(),
+            "dropped rows must carry a CCR recovery pointer"
+        );
+        assert!(
+            !result.dropped_summary.is_empty(),
+            "the `<<ccr:HASH>>` sentinel must be surfaced in the output"
+        );
+        assert!(
+            !result.strategy_info.starts_with("skip:"),
+            "no-signal + CCR store must crush, not skip; got {}",
+            result.strategy_info
+        );
+    }
+
+    #[test]
+    fn crush_array_no_signal_without_ccr_store_still_skips() {
+        // Same near-unique no-signal shape, but NO CCR store: a drop here
+        // would be UNRECOVERABLE, so the override must NOT fire — the
+        // analyzer's skip stands (legacy / parity mode, zero silent loss).
+        let c = SmartCrusher::builder(SmartCrusherConfig::default())
+            .with_default_oss_setup()
+            .build(); // no `.with_default_ccr_store()`
+        assert!(c.ccr_store.is_none(), "this crusher must have no store");
+        let items: Vec<Value> = (0..30)
+            .map(|i| json!({"id": i, "name": format!("user_{}", i)}))
+            .collect();
+        let result = c.crush_array(&items, "", 1.0);
+        // Without recovery backing, the no-signal skip is preserved.
         assert_eq!(result.items.len(), 30);
         assert!(
             result.strategy_info.starts_with("skip:"),
-            "expected skip:..., got {}",
+            "expected skip:... without a store, got {}",
             result.strategy_info
         );
     }
@@ -1799,10 +1942,23 @@ mod tests {
 
     #[test]
     fn lossless_wins_when_savings_above_threshold() {
-        // 50 uniform tabular dicts → CSV+schema compaction shrinks
-        // the input dramatically (well above the 0.30 default).
-        // Default `SmartCrusher::new()` should pick lossless.
-        let c = crusher();
+        // 50 uniform tabular dicts → CSV+schema compaction shrinks the
+        // input well above the 0.30 gate, so the LOSSLESS render is a
+        // valid candidate. Under `LosslessFirst` it MUST ship (all rows
+        // visible, nothing dropped) whenever it clears the gate — that is
+        // exactly what this policy guarantees and what this test pins.
+        //
+        // (The DEFAULT `MinTokens` policy may instead ship the equally-
+        // recoverable lossy survivor render when it is fewer tokens —
+        // both views are 100% recoverable, so that is a pure size win, not
+        // information loss. The MinTokens routing race is covered by the
+        // dedicated routing tests below; here we assert the lossless
+        // render itself is built and chosen by the policy that owns it.)
+        let cfg = SmartCrusherConfig {
+            routing_policy: RoutingPolicy::LosslessFirst,
+            ..Default::default()
+        };
+        let c = SmartCrusher::new(cfg);
         let items: Vec<Value> = (0..50)
             .map(|i| json!({"id": i, "name": format!("u_{i}"), "status": "ok"}))
             .collect();
