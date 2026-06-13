@@ -209,6 +209,7 @@ fn build_homogeneous_table(
     stamp_iso_delta_columns(&mut field_specs, &rows);
     stamp_decimal_scaled_columns(&mut field_specs, &rows);
     stamp_dict_string_columns(&mut field_specs, &rows);
+    stamp_head_dict_columns(&mut field_specs, &rows);
     stamp_affix_columns(&mut field_specs, &rows);
 
     Compaction::Table {
@@ -646,6 +647,137 @@ fn stamp_dict_string_columns(specs: &mut [FieldSpec], rows: &[Row]) {
             spec.encoding = Some(ColumnEncoding::DictString {
                 values: order.into_iter().map(|v| v.to_string()).collect(),
             });
+        }
+    }
+}
+
+/// Stamp [`ColumnEncoding::HeadDict`] on a plain string column whose
+/// values split at a delimiter into a LOW-cardinality head and a unique
+/// tail (paths grouped under a few directories, namespaced keys under a
+/// few prefixes, dotted module names under a few packages). The distinct
+/// heads are declared once; each row carries `<head_index><delim><tail>`.
+///
+/// For each delimiter in [`HEAD_DELIMS`] priority order, the column is
+/// split at the LAST occurrence; the first delimiter that (a) splits
+/// EVERY cell, (b) yields 2..(rows) distinct heads, and (c) renders
+/// strictly smaller wins. The round-trip is proven at stamp time:
+/// every cell is split, indexed, re-encoded, decoded, and rejoined back
+/// to the original.
+///
+/// Runs BEFORE the affix stamp: when the leading segment is
+/// low-cardinality this is the larger fold; affix then catches any
+/// whole-column shared affix head-dict did not claim.
+fn stamp_head_dict_columns(specs: &mut [FieldSpec], rows: &[Row]) {
+    use super::encodings::{
+        decode_head_cell, decode_head_value, encode_head_cell, split_head, HEAD_DELIMS,
+    };
+    use super::formatter::csv_render_str;
+
+    // Row-count floor: a head dictionary's one-time cost only reliably
+    // amortizes — in BYTES and (crucially) in tokens — when many rows
+    // reuse the few heads. On small arrays the `<idx><delim>` cells can be
+    // byte-smaller yet tokenize LARGER (the index+delimiter fragments
+    // familiar path tokens), so the per-column byte gate is not sufficient.
+    // A 16-row floor keeps head-dict in the regime where the win is robust.
+    const MIN_HEAD_DICT_ROWS: usize = 16;
+    if rows.len() < MIN_HEAD_DICT_ROWS {
+        return;
+    }
+    for (col, spec) in specs.iter_mut().enumerate() {
+        if spec.const_value.is_some() || spec.encoding.is_some() {
+            continue;
+        }
+        let mut values: Vec<&str> = Vec::with_capacity(rows.len());
+        let mut all_strings = true;
+        for row in rows {
+            match row.0.get(col) {
+                Some(CellValue::Scalar(Value::String(s))) => values.push(s.as_str()),
+                _ => {
+                    all_strings = false;
+                    break;
+                }
+            }
+        }
+        if !all_strings {
+            continue;
+        }
+
+        let plain_cells: Vec<String> = values.iter().map(|v| csv_render_str(v)).collect();
+        let plain = ditto_rendered_cost(plain_cells.iter().map(|s| s.as_str()));
+
+        for &delim in &HEAD_DELIMS {
+            // Split every cell; bail on the first that lacks the delimiter.
+            let mut splits: Vec<(&str, &str)> = Vec::with_capacity(values.len());
+            let mut ok = true;
+            for v in &values {
+                match split_head(v, delim) {
+                    Some(pair) => splits.push(pair),
+                    None => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if !ok {
+                continue;
+            }
+            // Distinct heads, first-appearance order.
+            let mut seen: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+            let mut order: Vec<&str> = Vec::new();
+            for (head, _) in &splits {
+                if !seen.contains_key(head) {
+                    seen.insert(head, order.len());
+                    order.push(head);
+                }
+            }
+            let k = order.len();
+            if k < 2 || k >= values.len() {
+                continue; // no head sharing, or every head distinct
+            }
+            // A head containing a newline would break the single-line
+            // preamble grammar.
+            if order.iter().any(|h| h.contains('\n') || h.contains('\r')) {
+                continue;
+            }
+            // Encode every cell and PROVE the exact round-trip.
+            let mut cells: Vec<String> = Vec::with_capacity(values.len());
+            let mut round_trip_ok = true;
+            for ((head, tail), orig) in splits.iter().zip(values.iter()) {
+                let idx = seen[head];
+                let cell = encode_head_cell(idx, delim, tail);
+                match decode_head_cell(&cell, delim) {
+                    Some((didx, dtail))
+                        if didx == idx
+                            && didx < order.len()
+                            && decode_head_value(order[didx], dtail) == **orig => {}
+                    _ => {
+                        round_trip_ok = false;
+                        break;
+                    }
+                }
+                cells.push(cell);
+            }
+            if !round_trip_ok {
+                continue;
+            }
+            // Byte gate WITH ditto + the one-time `__head:` line.
+            let enc_cells: Vec<String> = cells.iter().map(|c| csv_render_str(c)).collect();
+            let enc = ditto_rendered_cost(enc_cells.iter().map(|s| s.as_str()));
+            let head_line = "__head:".len()
+                + spec.name.len()
+                + 1 // '='
+                + delim.len_utf8()
+                + order.iter().map(|h| csv_render_str(h).len()).sum::<usize>()
+                + k.saturating_sub(1) // commas
+                + 1 // newline
+                + 1; // the `@` declaration marker
+            if head_line + enc < plain {
+                spec.encoding = Some(ColumnEncoding::HeadDict {
+                    delim,
+                    heads: order.into_iter().map(|h| h.to_string()).collect(),
+                });
+                break; // first winning delimiter claims the column
+            }
         }
     }
 }

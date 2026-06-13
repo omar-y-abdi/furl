@@ -88,6 +88,15 @@ pub enum ColumnEncoding {
     /// compactor PROVES the round-trip at stamp time AND the affix line
     /// plus stripped cells render strictly smaller than the plain cells.
     Affix { prefix: String, suffix: String },
+    /// Head-dictionary fold. Values split at the last `delim` into a
+    /// low-cardinality HEAD (declared once, verbatim, first-appearance
+    /// order, each including its trailing delimiter) and a unique TAIL.
+    /// The CSV-schema formatter marks the declaration `name:string@`,
+    /// emits a `__head:name=<DELIM><h0>,<h1>,...` preamble line, and
+    /// renders each cell as `<head_index><delim><tail>`; the decoder
+    /// rebuilds `head[index] + tail`. Stamped only after a stamp-time
+    /// round-trip proof AND a strict byte-saving gate.
+    HeadDict { delim: char, heads: Vec<String> },
 }
 
 /// One column's metadata in a tabular compaction.
