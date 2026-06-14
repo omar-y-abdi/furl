@@ -154,6 +154,40 @@ class CompressResult:
     transforms_applied: list[str] = field(default_factory=list)
 
 
+def _compute_frozen_message_count(messages: list[dict[str, Any]]) -> int:
+    """Return the frozen-prefix message count for a list of Anthropic messages.
+
+    Mirrors ``compute_frozen_count`` in ``crates/headroom-core/src/cache_control.rs``:
+
+    - Walk ``messages[i].content[*]``; for each block (dict) that has a
+      top-level ``cache_control`` key, record ``i`` as the highest marker index.
+    - Return ``highest_index + 1`` (exclusive floor: the marked message is part
+      of the cached prefix and must itself be frozen), or ``0`` if no marker.
+    - String-content messages are skipped (no block list → no markers possible).
+    - The caller is responsible for the ``messages`` field only; ``system`` and
+      ``tools`` fields are never passed here and never bump the floor (parity
+      with Rust ``walk_messages``-only path).
+    - ``cache_control: null`` counts as present (key-presence, not truthiness),
+      matching ``block.get("cache_control")`` → ``Some(Null)`` in Rust.
+
+    Args:
+        messages: List of message dicts in Anthropic format.
+
+    Returns:
+        Frozen message count (0 if no cache_control markers found).
+    """
+    highest_index: int | None = None
+    for i, message in enumerate(messages):
+        content = message.get("content")
+        if not isinstance(content, list):
+            # String content: no block list, no cache_control possible.
+            continue
+        for block in content:
+            if isinstance(block, dict) and "cache_control" in block:
+                highest_index = i if highest_index is None else max(highest_index, i)
+    return (highest_index + 1) if highest_index is not None else 0
+
+
 def compress(
     messages: list[dict[str, Any]],
     model: str = "claude-sonnet-4-5-20250929",
@@ -240,6 +274,14 @@ def compress(
         # alone (position, anomaly) and may drop relevant content.
         context = _extract_user_query(messages)
 
+        # Compute the frozen-prefix count from cache_control markers.
+        # Must run AFTER pre_compress hook and INPUT_RECEIVED event may have
+        # rewritten messages, so the index aligns with what pipeline sees.
+        # Mirrors Rust compute_frozen_count (cache_control.rs:109): only
+        # messages[i].content[*].cache_control bumps the floor; system/tools
+        # are never passed here.
+        frozen = _compute_frozen_message_count(messages)
+
         result = pipeline.apply(
             messages=messages,
             model=model,
@@ -254,6 +296,7 @@ def compress(
             protect_analysis_context=cfg.protect_analysis_context,
             min_tokens_to_compress=cfg.min_tokens_to_compress,
             kompress_model=cfg.kompress_model,
+            frozen_message_count=frozen,
         )
 
         tokens_before = result.tokens_before
