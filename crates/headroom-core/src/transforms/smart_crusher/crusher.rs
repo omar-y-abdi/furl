@@ -784,39 +784,49 @@ impl SmartCrusher {
 
         // ── Lossless candidate ──
         //
-        // Run the compaction stage if present. The lossless render keeps
+        // Run the compaction stage ONCE if present. The lossless render keeps
         // every row (nothing dropped); it is a valid candidate only when
         // it actually compacted and clears the byte-savings gate — below
         // that gate the rendering is not worth shipping over either the
         // raw array or the lossy view, so it is not a real alternative.
-        let lossless_candidate: Option<CrushArrayResult> = self
-            .compaction
-            .as_ref()
-            .and_then(|stage| {
+        //
+        // The single run also supplies `lossless_uses_opaque` (computed from
+        // the same `Compaction` value below) so we do NOT call stage.run a
+        // second time — that was the redundant hot-path double-compaction
+        // eliminated by U8.
+        let (lossless_candidate, lossless_uses_opaque) =
+            if let Some(stage) = self.compaction.as_ref() {
                 let (c, rendered) = stage.run(items);
-                if !c.was_compacted() {
-                    return None;
-                }
-                let input_bytes = estimate_array_bytes(&item_strings);
-                let savings_ratio = if input_bytes > 0 {
-                    1.0 - (rendered.len() as f64 / input_bytes as f64)
+                // Read `contains_opaque_ref` before `c` is potentially moved.
+                let uses_opaque = c.contains_opaque_ref();
+                let candidate = if c.was_compacted() {
+                    let input_bytes = estimate_array_bytes(&item_strings);
+                    let savings_ratio = if input_bytes > 0 {
+                        1.0 - (rendered.len() as f64 / input_bytes as f64)
+                    } else {
+                        0.0
+                    };
+                    if savings_ratio >= self.config.lossless_min_savings_ratio {
+                        let kind = compaction_kind_str(&c);
+                        Some(CrushArrayResult {
+                            items: items.to_vec(), // nothing dropped
+                            strategy_info: format!("lossless:{kind}"),
+                            ccr_hash: None,
+                            dropped_summary: String::new(),
+                            compacted: Some(rendered),
+                            compaction_kind: Some(kind),
+                            row_index_marker: None,
+                        })
+                    } else {
+                        None
+                    }
                 } else {
-                    0.0
+                    None
                 };
-                if savings_ratio < self.config.lossless_min_savings_ratio {
-                    return None;
-                }
-                let kind = compaction_kind_str(&c);
-                Some(CrushArrayResult {
-                    items: items.to_vec(), // nothing dropped
-                    strategy_info: format!("lossless:{kind}"),
-                    ccr_hash: None,
-                    dropped_summary: String::new(),
-                    compacted: Some(rendered),
-                    compaction_kind: Some(kind),
-                    row_index_marker: None,
-                })
-            });
+                (candidate, uses_opaque)
+            } else {
+                (None, false)
+            };
 
         // ── Lossy-recoverable candidate ──
         //
@@ -837,11 +847,9 @@ impl SmartCrusher {
         // entropy-floor override must stand down so it does not hijack
         // blob data into a row-drop render — both are recoverable, but the
         // opaque-substitution view keeps strictly more visible per row.
-        let lossless_uses_opaque = self
-            .compaction
-            .as_ref()
-            .map(|stage| stage.run(items).0.contains_opaque_ref())
-            .unwrap_or(false);
+        //
+        // `lossless_uses_opaque` is derived from the SAME Compaction value
+        // produced by the single stage.run call above (U8 dedup).
 
         let lossy = self.crush_array_lossy(
             items,
@@ -2970,6 +2978,172 @@ mod tests {
             min_tokens_count <= lossless_tokens,
             "MinTokens must never ship more tokens than lossless \
              (chosen={min_tokens_count}, lossless={lossless_tokens})"
+        );
+    }
+
+    // ---------- U8: single compaction pass on large-array hot path ----------
+
+    /// A [`Formatter`] spy that counts how many times `format` is called.
+    /// Each call to `CompactionStage::run` calls `format` exactly once, so
+    /// this is a direct proxy for the number of `stage.run(items)` calls.
+    struct CountingFormatter {
+        inner: Box<dyn super::super::compaction::Formatter>,
+        count: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl super::super::compaction::Formatter for CountingFormatter {
+        fn name(&self) -> &str {
+            self.inner.name()
+        }
+        fn format(&self, c: &super::super::compaction::Compaction) -> String {
+            self.count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.inner.format(c)
+        }
+    }
+
+    /// Build a [`SmartCrusher`] wired with a [`CountingFormatter`] and
+    /// return the call-count handle alongside the crusher.
+    fn crusher_with_counting_compaction(
+        cfg: SmartCrusherConfig,
+    ) -> (SmartCrusher, Arc<std::sync::atomic::AtomicUsize>) {
+        use super::super::compaction::{CompactConfig, CompactionStage, CsvSchemaFormatter};
+        let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let stage = CompactionStage {
+            config: CompactConfig::default(),
+            formatter: Box::new(CountingFormatter {
+                inner: Box::new(CsvSchemaFormatter::new()),
+                count: Arc::clone(&counter),
+            }),
+        };
+        let crusher = SmartCrusher::builder(cfg)
+            .with_default_oss_setup()
+            .with_compaction(stage)
+            .build();
+        (crusher, counter)
+    }
+
+    /// RED test (TDD step 1): before the fix, crush_array calls stage.run
+    /// TWICE unnecessarily on a large compactable array — once for
+    /// lossless_candidate (line 796) and a second redundant time for
+    /// lossless_uses_opaque (line 843).  After the fix the second call is
+    /// eliminated and the compaction result is reused.
+    ///
+    /// Shape: unique-entity rows (no CCR store) → lossy path returns Skip
+    /// (no rows dropped → `dropped_summary` is empty → the survivor-
+    /// compaction branch inside crush_array_lossy does NOT fire).  Only the
+    /// lossless_candidate call and the now-redundant lossless_uses_opaque call
+    /// are in-scope.
+    ///
+    /// Before fix: 2 calls (lossless_candidate + lossless_uses_opaque).
+    /// After fix:  1 call  (lossless_candidate only; result reused for opaque).
+    #[test]
+    fn crush_array_large_compactable_invokes_compaction_stage_exactly_once() {
+        // 30 unique-entity rows (no CCR store → lossy skips, no drops →
+        // survivor compaction doesn't fire).  Uniform tabular shape →
+        // compacts well so lossless_candidate is not None.
+        let items: Vec<Value> = (0..30)
+            .map(|i| json!({"id": i, "user": format!("u_{i}"), "status": "ok"}))
+            .collect();
+        let cfg = SmartCrusherConfig {
+            routing_policy: RoutingPolicy::LosslessFirst,
+            lossless_min_savings_ratio: 0.0, // always accept lossless render
+            ..Default::default()
+        };
+        let (crusher, counter) = crusher_with_counting_compaction(cfg);
+
+        // Sanity: no CCR store on this crusher (survivor compaction guard).
+        assert!(crusher.ccr_store.is_none());
+
+        let result = crusher.crush_array(&items, "", 1.0);
+
+        // Lossless wins → nothing dropped → survivor compaction (line 1058)
+        // never runs.  Only the lossless_candidate + optional lossless_uses_opaque
+        // calls count.
+        assert!(
+            result.compacted.is_some(),
+            "lossless render must win in this test setup (strategy: {})",
+            result.strategy_info
+        );
+        assert_eq!(result.items.len(), 30, "lossless drops nothing");
+
+        let calls = counter.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            calls, 1,
+            "crush_array must invoke the compaction stage EXACTLY once on the \
+             large-array hot path when lossless wins (got {calls} calls — the \
+             redundant lossless_uses_opaque call must be eliminated)"
+        );
+    }
+
+    /// Behavioral parity: lossless-wins case — the chosen render must be
+    /// byte-identical before and after the fix. We capture output from the
+    /// reference (standard) crusher and the counting crusher (same stage
+    /// logic, just with the spy) to confirm the refactor does not alter the
+    /// lossless output.
+    #[test]
+    fn crush_array_lossless_output_unchanged_after_dedup() {
+        let items: Vec<Value> = (0..50)
+            .map(|i| json!({"id": i, "status": "ok", "region": "us-east-1"}))
+            .collect();
+        let cfg = SmartCrusherConfig {
+            routing_policy: RoutingPolicy::LosslessFirst,
+            ..Default::default()
+        };
+        // Reference: normal crusher.
+        let ref_crusher = SmartCrusher::new(cfg.clone());
+        let ref_result = ref_crusher.crush_array(&items, "", 1.0);
+
+        // Under test: counting spy (same compaction logic).
+        let (spy_crusher, _counter) = crusher_with_counting_compaction(cfg);
+        let spy_result = spy_crusher.crush_array(&items, "", 1.0);
+
+        assert_eq!(
+            ref_result.strategy_info, spy_result.strategy_info,
+            "strategy_info must match"
+        );
+        assert_eq!(
+            ref_result.compacted, spy_result.compacted,
+            "compacted output must be byte-identical"
+        );
+        assert_eq!(
+            ref_result.ccr_hash, spy_result.ccr_hash,
+            "ccr_hash must match"
+        );
+        assert_eq!(
+            ref_result.items.len(),
+            spy_result.items.len(),
+            "item count must match"
+        );
+    }
+
+    /// Behavioral parity: lossy-wins case — when compaction savings are
+    /// below threshold the lossy path fires; output must be unaffected.
+    #[test]
+    fn crush_array_lossy_output_unchanged_after_dedup() {
+        let items: Vec<Value> = (0..50).map(|_| json!({"status": "ok"})).collect();
+        let cfg = SmartCrusherConfig {
+            lossless_min_savings_ratio: 0.99, // force lossy path
+            ..Default::default()
+        };
+        let ref_crusher = SmartCrusher::new(cfg.clone());
+        let ref_result = ref_crusher.crush_array(&items, "", 1.0);
+
+        let (spy_crusher, _counter) = crusher_with_counting_compaction(cfg);
+        let spy_result = spy_crusher.crush_array(&items, "", 1.0);
+
+        assert_eq!(
+            ref_result.strategy_info, spy_result.strategy_info,
+            "strategy_info must match on lossy path"
+        );
+        assert_eq!(
+            ref_result.ccr_hash, spy_result.ccr_hash,
+            "ccr_hash must match on lossy path"
+        );
+        assert_eq!(
+            ref_result.items.len(),
+            spy_result.items.len(),
+            "item count must match on lossy path"
         );
     }
 }
