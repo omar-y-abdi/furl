@@ -19,11 +19,30 @@ Teammate a609285 cut ~4,967 LOC (4,395 Rust+FFI + 572 Py). Commits f8493718 + 8a
 - [x] RESTORED as live (gate-sorted): compression_feedback (CCR loop), ml_models+dynamic_detector (NER/semantic call-sites; ml_models caught by gate-blindness guard — G2 green, guard-grep red), relevance/embedding+hybrid + cache optimizer cluster (all TOP-56 public surface → G3 red).
 - TIER-3 (NOT dead-code): surface-only-live items = coordinated API deprecation candidates (drop __all__/_LAZY_EXPORTS+docs+version bump), never pure-move. Flag to user if shrinking public surface.
 
-## PHASE 3 — PROXY→HOOK+MCP REBUILD (next, user gives instructions)
+## ★ ROADMAP RE-SEQUENCED 2026-06-21 (user) — north star: codebase BEYOND-PERFECT before any MCP tool creation
+Order is now: (3) v4 audit + apply 4th-pass cuts → (4) HARDEN TESTS to best quality+coverage → (5) proxy→hook+MCP rebuild.
+The MCP/hook build WAITS until the codebase is beyond-perfect for usage. Test-hardening is promoted ABOVE the rebuild.
+
+## PHASE 3 — 4TH-PASS AUDIT + APPLY (in flight)
+- [~] v4 feature-reachability audit RUNNING (workflow wf_c7c82ad2-c7c). On report → write lazy-dev-AUDIT-v4.md.
+- [ ] If real cuts surface: apply via the proven archive+5-gate loop (same as Tier-1/2). Report-only until then.
+
+## PHASE 4 — HARDEN TESTS (NEW, user-prioritized — do AFTER Phase 3, BEFORE the rebuild)
+GOAL: iterate the test suite to best QUALITY + coverage. Quality ≠ coverage% — coverage is a FLOOR, not the goal.
+REASONING (user): better tests → find + improve the codebase → plausibly BETTER COMPRESSION RESULTS. Tests that fail when
+behavior breaks and survive refactors expose real engine weaknesses (the eval `break` pass already found silent-loss holes
+this way; harder tests find more).
+METHOD: use the installed `test-quality-tools:test-quality` skill + scorecard (mutation-resistance, anti-fragility rules,
+boundary coverage for every </<=/>/>=/==/!= in source, real-I/O fixtures over mocks, contract-named tests). Coverage held as
+a non-regression floor; iterate-to-plateau per module (scope one module/package per pass, not the whole repo at once).
+Prioritize the hard-invariant surfaces first: CCR recovery, Py↔Rust hash parity, prompt-cache ordering, the compress() route.
+
+## PHASE 5 — PROXY→HOOK+MCP REBUILD (DEFERRED until codebase beyond-perfect — was Phase 3)
 - proxy → DELETE; extract live SSE utils (proxy/helpers.py parse_sse_events/safe_decode) to ccr/sse_parser.py first.
 - Build hook (data-plane, like the Biljakten one but productized) + 2-tool fastmcp (set_compression + retrieve→CCR direct,
   un-couple mcp_server.py:472 _retrieve_via_proxy).
 - Engine gates are BLIND to transport → needs NEW functional verification (build+test the hook+MCP replacement BEFORE cutting proxy), NOT the archive loop.
+- DO NOT START until Phase 4 (test-hardening) makes the codebase beyond-perfect. User's north star.
 
 ---
 
