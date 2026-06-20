@@ -30,7 +30,6 @@ pub mod log_compressor;
 #[cfg(feature = "magika")]
 pub mod magika_detector;
 pub mod recommendations;
-pub mod safety;
 pub mod search_compressor;
 pub mod smart_crusher;
 pub mod tag_protector;
@@ -56,7 +55,6 @@ pub use log_compressor::{
 #[cfg(feature = "magika")]
 pub use magika_detector::{magika_detect, map_magika_label, MagikaDetectorError};
 pub use recommendations::{Recommendation, RecommendationStore, RECOMMENDATIONS_PATH_ENV_VAR};
-pub use safety::{tool_pair_indices, ToolPair};
 pub use search_compressor::{
     FileMatches, SearchCompressionResult, SearchCompressor, SearchCompressorConfig,
     SearchCompressorStats, SearchMatch,
