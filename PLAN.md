@@ -12,13 +12,18 @@ Sonnet teammate `tier1-cutter` (id a609285). Method: archive→5-gate→keep/res
 - [x] Total ~4,634 code LOC + ~1.2MB. HEAD=e24f7f44. ORCHESTRATOR INDEPENDENTLY RE-VERIFIED: pytest 519/31, cargo 0-failed all suites, surface 56, recovery 21, compress OK. Must-not-touch intact (proxy/telemetry/live_zone/recommendations/auth_mode.rs/compression_policy.rs/live compressors all present).
 - CAVEAT for Tier 2: safety.rs's `tool_pair_indices` (tool-pair atomicity) was dead (never called outside own tests). If the live_zone dispatcher ever needs tool-pair atomicity, re-implement or restore from archive/.
 
-## PHASE 2 — TIER 2 (user gives instructions after Phase 1)
-Includes the proxy→hook+MCP REBUILD + the untangle cuts:
+## PHASE 2 — TIER 2 CUTS ✅ COMPLETE (2026-06-21, user: "allting kapas nu")
+Teammate a609285 cut ~4,967 LOC (4,395 Rust+FFI + 572 Py). Commits f8493718 + 8a90716f. HEAD=8a90716f. Orchestrator re-verified: pytest 519/31, cargo 0-failed, surface 56, recovery 21, compress OK.
+- [x] Rust live_zone.rs (2,899) + recommendations.rs (329) + lib.rs FFI (~109) + mod.rs re-exports + 5 cargo tests = ~4,395. NO AuthMode hoist needed (canonical src/auth_mode.rs decoupled). Removed FFI had 0 callers (safer than recon's "proxy-only").
+- [x] Python ccr/batch_processor.py (562, BatchProcessor never instantiated) — cut clean.
+- [x] RESTORED as live (gate-sorted): compression_feedback (CCR loop), ml_models+dynamic_detector (NER/semantic call-sites; ml_models caught by gate-blindness guard — G2 green, guard-grep red), relevance/embedding+hybrid + cache optimizer cluster (all TOP-56 public surface → G3 red).
+- TIER-3 (NOT dead-code): surface-only-live items = coordinated API deprecation candidates (drop __all__/_LAZY_EXPORTS+docs+version bump), never pure-move. Flag to user if shrinking public surface.
+
+## PHASE 3 — PROXY→HOOK+MCP REBUILD (next, user gives instructions)
 - proxy → DELETE; extract live SSE utils (proxy/helpers.py parse_sse_events/safe_decode) to ccr/sse_parser.py first.
 - Build hook (data-plane, like the Biljakten one but productized) + 2-tool fastmcp (set_compression + retrieve→CCR direct,
   un-couple mcp_server.py:472 _retrieve_via_proxy).
-- Rust live_zone.rs (2,899, hoist private AuthMode enum first) + recommendations.rs (329) + dead lib.rs FFI.
-- Python cache-optimizer cluster (~3.8k), relevance/ (lazy BM25), ml_models, ccr/batch_processor (keep mcp_server).
+- Engine gates are BLIND to transport → needs NEW functional verification (build+test the hook+MCP replacement BEFORE cutting proxy), NOT the archive loop.
 
 ---
 
