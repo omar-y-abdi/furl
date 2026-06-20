@@ -158,7 +158,12 @@ TIER-2 RESTORED-AS-LIVE (recon was right "mostly live"): compression_feedback.py
 
 CUMULATIVE (Tier-1 + Tier-2): ~9,601 code LOC removed (Rust 8,822 + Py 779) + ~1.2MB artifacts, engine GREEN throughout, fully reversible in archive/.
 
-NEXT (step 3, user-gated): PROXY→HOOK+MCP REBUILD. proxy→DELETE; extract live SSE utils (proxy/helpers.py parse_sse_events/safe_decode → ccr/sse_parser.py) FIRST; build hook (data-plane, productized Biljakten-style) + 2-tool fastmcp (set_compression + retrieve→CCR direct, un-couple mcp_server.py:472 _retrieve_via_proxy). Engine gates BLIND to transport → needs NEW functional verification (not the archive loop).
+## ★ ROADMAP RE-SEQUENCED 2026-06-21 (user) — NORTH STAR: codebase BEYOND-PERFECT before any MCP tool creation
+New order: (3) v4 audit + apply 4th-pass cuts → (4) HARDEN TESTS to best quality+coverage → (5) proxy→hook+MCP rebuild.
+The hook+MCP build is DEFERRED; test-hardening is promoted above it. Doc-only update now (user: "enbart uppdatera docs just nu, vill bara berätta what our next steps are. MCP tool creation will have to wait until the codebase is beyond perfect for usage").
+- STEP 3 (in flight): v4 feature-reachability audit (workflow wf_c7c82ad2-c7c) → lazy-dev-AUDIT-v4.md → apply any real cuts via archive+5-gate loop.
+- STEP 4 (NEW, user-prioritized): HARDEN TESTS. Iterate suite to best QUALITY + coverage (coverage = FLOOR not goal). Use installed `test-quality-tools:test-quality` skill + scorecard: mutation-resistance, anti-fragility rules, boundary tests for every </<=/>/>=/==/!=, real-I/O fixtures over mocks, contract-named tests; iterate-to-plateau per module. REASONING (user): better tests → find+improve codebase → plausibly BETTER COMPRESSION (the eval `break` pass already surfaced silent-loss holes this way). Hit the hard-invariant surfaces first (CCR recovery, Py↔Rust parity, cache ordering, compress() route).
+- STEP 5 (DEFERRED until codebase beyond-perfect): PROXY→HOOK+MCP REBUILD. proxy→DELETE; extract live SSE utils (proxy/helpers.py parse_sse_events/safe_decode → ccr/sse_parser.py) FIRST; build hook (data-plane, productized Biljakten-style) + 2-tool fastmcp (set_compression + retrieve→CCR direct, un-couple mcp_server.py:472 _retrieve_via_proxy). Engine gates BLIND to transport → needs NEW functional verification (not the archive loop). DO NOT START until Step 4 done.
 
 (historical) Phase-2 brief sent to teammate a609285 via SendMessage.
 ★ ORCHESTRATOR RECON REFUTED v2-audit's Tier-2 Python (~6.6k "cuttable" is mostly LIVE/import-woven — v1 was right to defer):
