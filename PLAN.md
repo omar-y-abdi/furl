@@ -23,9 +23,13 @@ Teammate a609285 cut ~4,967 LOC (4,395 Rust+FFI + 572 Py). Commits f8493718 + 8a
 Order is now: (3) v4 audit + apply 4th-pass cuts → (4) HARDEN TESTS to best quality+coverage → (5) proxy→hook+MCP rebuild.
 The MCP/hook build WAITS until the codebase is beyond-perfect for usage. Test-hardening is promoted ABOVE the rebuild.
 
-## PHASE 3 — 4TH-PASS AUDIT + APPLY (in flight)
-- [~] v4 feature-reachability audit RUNNING (workflow wf_c7c82ad2-c7c). On report → write lazy-dev-AUDIT-v4.md.
-- [ ] If real cuts surface: apply via the proven archive+5-gate loop (same as Tier-1/2). Report-only until then.
+## PHASE 3 — 4TH-PASS AUDIT ✅ DONE (apply optional/small, user-gated)
+- [x] v4 feature-reachability audit (wf_c7c82ad2-c7c, 86 agents). Report `lazy-dev-AUDIT-v4.md` committed 0d111fc5.
+- HEADLINE: tree is essentially LEAN. Tier-1-safe ~3.65k (~8%), but ~1.9k is proxy-coupled CCR plane (dies at the rebuild).
+  Genuinely-free non-proxy residual ≈ 1.3-1.7k (config.py deadflags, utils.py 13 orphans, get_siglip, Rust test-only fns, dup verify/measure.py 879).
+  Tier-3 "big" numbers (cache-optimizer 2.5k, anchor_selector 770, code_compressor 2k, embedding scorers 533) = PUBLIC SURFACE → API deprecation, NOT free.
+- v4 earned its keep: 2 deptry false-positives confirmed LIVE (KompressCompressor, ComponentTracker); ★ csv_schema_decoder.py TRAP (591 LOC, 0 prod callers BUT guards the byte-exact recovery invariant via test_ccr_recovery_invariant.py:36 — MUST NOT CUT). Orchestrator spot-confirmed both.
+- [ ] APPLY (optional, small, user-gated): the non-proxy deadflags + dup measure.py via archive+5-gate loop. Proxy-coupled CCR plane rides the Phase-5 rebuild. Surface-tail = separate deprecation decision. Report-only until user says apply.
 
 ## PHASE 4 — HARDEN TESTS (NEW, user-prioritized — do AFTER Phase 3, BEFORE the rebuild)
 GOAL: iterate the test suite to best QUALITY + coverage. Quality ≠ coverage% — coverage is a FLOOR, not the goal.
