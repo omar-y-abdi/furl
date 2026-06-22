@@ -4,18 +4,9 @@ from __future__ import annotations
 
 from dataclasses import InitVar, dataclass, field
 from datetime import datetime
-from enum import Enum
 from typing import Any, Literal
 
 from headroom.models.config import ML_MODEL_DEFAULTS
-
-
-class HeadroomMode(str, Enum):
-    """Operating modes for Headroom."""
-
-    AUDIT = "audit"  # Observe only, no modifications
-    OPTIMIZE = "optimize"  # Apply deterministic transforms
-    SIMULATE = "simulate"  # Return transform plan without API call
 
 
 @dataclass
@@ -457,7 +448,6 @@ class PrefixFreezeConfig:
 class HeadroomConfig:
     """Main configuration for HeadroomClient."""
 
-    default_mode: HeadroomMode = HeadroomMode.AUDIT
     cache_aligner: CacheAlignerConfig = field(default_factory=CacheAlignerConfig)
     cache_optimizer: CacheOptimizerConfig = field(default_factory=CacheOptimizerConfig)
     ccr: CCRConfig = field(default_factory=CCRConfig)  # Compress-Cache-Retrieve
