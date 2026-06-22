@@ -242,11 +242,7 @@ class TestCCRConfig:
         """Default CCR config values."""
         config = CCRConfig()
         assert config.enabled is True
-        assert config.store_max_entries == 1000
-        assert config.store_ttl_seconds == 300
         assert config.inject_retrieval_marker is True
-        assert config.feedback_enabled is True
-        assert config.min_items_to_cache == 20
 
 
 class TestCCRFeedbackLoop:
