@@ -379,24 +379,7 @@ class CCRConfig:
     """
 
     enabled: bool = True  # Enable CCR (cache + retrieval markers)
-    store_max_entries: int = 1000  # Max entries in compression store
-    store_ttl_seconds: int = 300  # Cache TTL in seconds
     inject_retrieval_marker: bool = True  # Add retrieval hint to compressed output
-    feedback_enabled: bool = True  # Track retrieval events for learning
-    min_items_to_cache: int = 20  # Only cache if original had >= N items
-
-    # Tool injection (Phase 3)
-    inject_tool: bool = True  # Inject headroom_retrieve tool into tools array
-    inject_system_instructions: bool = False  # Add retrieval instructions to system message
-
-    # Retrieval marker format
-    # Inserted at end of compressed content to tell LLM how to get more
-    marker_template: str = (
-        "\n[{original_count} items compressed to {compressed_count}."
-        "{summary}"
-        " Retrieve more: hash={hash}."
-        " Expires in {ttl_minutes}m.]"
-    )
 
 
 @dataclass
