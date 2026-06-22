@@ -66,7 +66,6 @@ __all__ = [
     "TransformError",
     # Config
     "HeadroomConfig",
-    "HeadroomMode",
     "SmartCrusherConfig",
     "CacheAlignerConfig",
     "CacheOptimizerConfig",
@@ -137,7 +136,6 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "TransformError": ("headroom.exceptions", "TransformError"),
     # Config
     "HeadroomConfig": ("headroom.config", "HeadroomConfig"),
-    "HeadroomMode": ("headroom.config", "HeadroomMode"),
     "SmartCrusherConfig": ("headroom.config", "SmartCrusherConfig"),
     "CacheAlignerConfig": ("headroom.config", "CacheAlignerConfig"),
     "CacheOptimizerConfig": ("headroom.config", "CacheOptimizerConfig"),
