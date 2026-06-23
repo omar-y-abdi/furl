@@ -240,12 +240,12 @@ class CacheAligner(Transform):
         Detection is cheap; we run it whenever ``enabled`` is set so the
         warning log line is emitted on every relevant turn.
 
-        Phase F PR-F2.1 c4/5: when the request's
-        :class:`~headroom.transforms.compression_policy.CompressionPolicy`
-        is passed via ``kwargs["compression_policy"]`` and has
-        ``cache_aligner_enabled=False`` (Subscription auth mode under
-        the enforcement flag), this method returns ``False`` so the
-        detector is skipped for that request. The hidden state
+        Phase F PR-F2.1 c4/5: when a request supplies a compression
+        policy object via ``kwargs["compression_policy"]`` whose
+        ``cache_aligner_enabled`` is ``False`` (Subscription auth mode
+        under the enforcement flag), this method returns ``False`` so the
+        detector is skipped for that request. In the standalone build
+        nothing sets that kwarg, so ``policy`` is always ``None`` here. The hidden state
         ``self._previous_prefix_hash`` is NOT cleared on skip — the
         field is per-pipeline-instance, not per-request, so clearing
         it would race with concurrent PAYG requests on the same
