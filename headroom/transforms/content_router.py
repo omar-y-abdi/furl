@@ -41,7 +41,7 @@ import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any
 
@@ -1051,6 +1051,18 @@ class ContentRouter(Transform):
                 getattr(result.strategy_used, "value", result.strategy_used),
             )
             result.compressed = content
+            # #11: this is now a PASSTHROUGH — the output is the full original.
+            # The metrics (tokens_saved / compression_ratio / savings_percentage)
+            # are computed by summing routing_log[].compressed_tokens, so leaving
+            # the empty-output decisions in place reported phantom savings
+            # (tokens_saved=N, ratio 0.0) for content we did NOT actually shrink.
+            # Rewrite each decision to passthrough (compressed == original) so the
+            # routing_log and every derived metric honestly report saved=0,
+            # ratio=1.0.
+            result.routing_log = [
+                replace(decision, compressed_tokens=decision.original_tokens)
+                for decision in result.routing_log
+            ]
 
         # One observer call per routing decision; the observer is the
         # forcing function for catching strategy-level regressions.
