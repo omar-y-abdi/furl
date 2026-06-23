@@ -305,16 +305,15 @@ class HeadroomMCPServer:
         )
         self._stats.record_compression(input_tokens, output_tokens, strategy)
 
-        savings_pct = (
-            round((1 - result.compression_ratio) * 100, 1) if result.compression_ratio < 1.0 else 0
-        )
+        tokens_saved = max(0, input_tokens - output_tokens)
+        savings_pct = round(tokens_saved / input_tokens * 100, 1) if input_tokens > 0 else 0
 
         return {
             "compressed": compressed_content,
             "hash": hash_key,
             "original_tokens": input_tokens,
             "compressed_tokens": output_tokens,
-            "tokens_saved": max(0, input_tokens - output_tokens),
+            "tokens_saved": tokens_saved,
             "savings_percent": savings_pct,
             "transforms": result.transforms_applied,
             "note": f"Original stored with hash={hash_key}. Use mcp__headroom__{CCR_TOOL_NAME} to get full content later.",
