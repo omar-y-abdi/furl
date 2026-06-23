@@ -7,7 +7,7 @@ The simplest way to use Headroom — no proxy, no config, just compress:
     result = compress(messages, model="claude-sonnet-4-5-20250929")
     result.messages          # Compressed messages (same format, fewer tokens)
     result.tokens_saved      # Tokens saved
-    result.compression_ratio # e.g., 0.35 means 65% saved
+    result.compression_ratio # e.g., 0.65 means 65% saved
 
 Works with any LLM client, any proxy, any framework. Just compress
 the messages before sending them.
