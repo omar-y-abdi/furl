@@ -186,7 +186,3 @@ harness = false
 [[bench]]
 name = "ccr_store"
 harness = false
-
-[[bench]]
-name = "auth_mode"
-harness = false
