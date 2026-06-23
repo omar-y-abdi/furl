@@ -946,9 +946,27 @@ class ContentRouter(Transform):
             logger.debug("TOIN recording failed (non-fatal): %s", e)
 
     def _timed_compress(
-        self, content: str, context: str, bias: float
+        self,
+        content: str,
+        context: str,
+        bias: float,
+        runtime_options: dict[str, Any] | None = None,
     ) -> tuple[RouterCompressionResult, float]:
-        """Compress with wall-clock timing.  Used by parallel executor."""
+        """Compress with wall-clock timing.  Used by parallel executor.
+
+        Per-request runtime options live in ``self._tls`` (thread-local), which
+        is set on the MAIN thread. Worker threads have their own empty
+        thread-local, so they would read the DEFAULTS and silently drop the
+        per-request options (#10). The main thread snapshots the options and
+        passes them in here; we replay them into the worker's thread-local
+        before compressing so ``force_kompress`` / ``target_ratio`` /
+        ``kompress_model`` / ``compression_policy`` reach every worker.
+        """
+        if runtime_options is not None:
+            self._runtime_target_ratio = runtime_options["target_ratio"]
+            self._runtime_force_kompress = runtime_options["force_kompress"]
+            self._runtime_kompress_model = runtime_options["kompress_model"]
+            self._runtime_compression_policy = runtime_options["compression_policy"]
         t0 = time.perf_counter()
         result = self.compress(content, context=context, bias=bias)
         return result, (time.perf_counter() - t0) * 1000
@@ -2316,12 +2334,26 @@ class ContentRouter(Transform):
                     r = self.compress(task_content, context=task_ctx, bias=task_bias)
                     task_results.append((r, (time.perf_counter() - t0) * 1000))
             else:
-                # Parallel compression via thread pool
+                # Parallel compression via thread pool. Snapshot the per-request
+                # runtime options on THIS (main) thread — worker threads have an
+                # empty thread-local and would otherwise read the defaults (#10).
+                runtime_options = {
+                    "target_ratio": self._runtime_target_ratio,
+                    "force_kompress": self._runtime_force_kompress,
+                    "kompress_model": self._runtime_kompress_model,
+                    "compression_policy": self._runtime_compression_policy,
+                }
                 with ThreadPoolExecutor(max_workers=max_workers) as executor:
                     futures = []
                     for _, task_content, task_ctx, task_bias, _ in pending_tasks:
                         futures.append(
-                            executor.submit(self._timed_compress, task_content, task_ctx, task_bias)
+                            executor.submit(
+                                self._timed_compress,
+                                task_content,
+                                task_ctx,
+                                task_bias,
+                                runtime_options,
+                            )
                         )
                     task_results = [f.result() for f in futures]
 
