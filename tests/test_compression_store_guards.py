@@ -118,3 +118,37 @@ def test_stale_heap_eviction_respects_max_entries() -> None:
     # Recovery-safe: the newest entry survives and is retrievable; eviction was
     # oldest-first, not a side-door that drops live-referenced data silently.
     assert store.retrieve(c) is not None, "newest entry must survive eviction"
+
+
+def test_eviction_caps_with_many_stale_heap_refs() -> None:
+    # Harder #23 case: the heap is polluted with MANY ghost references (more than
+    # a naive fixed budget) plus the real stale-ts entries, and the counter
+    # under-reports. The eviction loop must still rebuild from the live backend
+    # and cap the store — a budget-bounded fix would exit over capacity here.
+    store = CompressionStore(max_entries=2)
+    a = store.store(json.dumps([{"id": 0}]), "<<ccr:aaaaaa>>", explicit_hash="aaaaaa")
+    b = store.store(json.dumps([{"id": 1}]), "<<ccr:bbbbbb>>", explicit_hash="bbbbbb")
+    store._eviction_heap = [(0.0, f"ghost{i:06d}") for i in range(22)] + [(0.0, a), (0.0, b)]
+    heapq.heapify(store._eviction_heap)
+    store._stale_heap_entries = 0
+
+    c = store.store(json.dumps([{"id": 2}]), "<<ccr:cccccc>>", explicit_hash="cccccc")
+
+    assert store._backend.count() <= store._max_entries, (
+        f"store over capacity with many stale refs: "
+        f"{store._backend.count()} > {store._max_entries}"
+    )
+    assert store.retrieve(c) is not None
+
+
+def test_normal_fill_evicts_oldest_first_to_capacity() -> None:
+    # Sanity: ordinary over-fill keeps exactly max_entries, oldest-first.
+    store = CompressionStore(max_entries=3)
+    keys = [
+        store.store(json.dumps([{"id": i}]), f"<<ccr:{i:012x}>>", explicit_hash=f"{i:012x}")
+        for i in range(6)
+    ]
+    assert store._backend.count() == 3
+    # The 3 newest survive; the 3 oldest were evicted.
+    assert store.retrieve(keys[-1]) is not None
+    assert store.retrieve(keys[0]) is None

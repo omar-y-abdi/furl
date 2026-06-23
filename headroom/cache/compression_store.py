@@ -949,41 +949,50 @@ class CompressionStore:
             if stale_ratio >= self._heap_rebuild_threshold:
                 self._rebuild_heap()
 
-        # If still at capacity, remove oldest entries using heap. Run this in a
-        # bounded loop: when the heap drains to stale entries while the backend
-        # is STILL over capacity (#23: the heap held only stale timestamps —
-        # ratio below the rebuild threshold so no rebuild fired — and emptied
-        # without evicting a real entry), rebuild the heap from the backend and
-        # continue oldest-first. ``_rebuild_heap`` reconstructs the heap from the
-        # live backend, so the next iteration pops a REAL entry. Capped by the
-        # number of live entries so it always terminates.
-        for _ in range(self._backend.count() + 1):
-            if self._backend.count() < self._max_entries:
-                break
+        # If still at capacity, remove oldest entries using the heap.
+        #
+        # #23: the eviction loop must GUARANTEE ``count() <= max_entries`` on
+        # exit. The old loop ran ``while heap`` and could exit over capacity if
+        # the heap held only stale references (deleted/replaced keys, or stale
+        # timestamps) — popping those evicts nothing real, so the heap could
+        # drain (or a fixed budget could be exhausted by ghost refs) while the
+        # backend was still over capacity. The ratio-guard rebuild above only
+        # fires when the stale COUNTER is accurate; a heap whose staleness is
+        # under-counted slips past it.
+        #
+        # Fix: track real progress. Each iteration that fails to evict a real
+        # entry while over capacity rebuilds the heap from the LIVE backend
+        # (correct timestamps, no ghost refs) so the next pop is guaranteed to
+        # hit a real oldest entry. Eviction stays oldest-first and still routes
+        # every delete through the ``_record_eviction_success`` / loud-miss
+        # accounting (no side-door). Bounded: each rebuild yields a heap of
+        # exactly the live entries, and every subsequent pop removes one, so the
+        # loop terminates in O(live entries).
+        rebuilt_since_progress = False
+        while self._backend.count() >= self._max_entries:
             if not self._eviction_heap:
-                # Heap exhausted but still over capacity → it was missing live
-                # entries. Rebuild from the backend and retry.
+                if rebuilt_since_progress:
+                    break  # already rebuilt with no live entries to evict — give up
                 self._rebuild_heap()
+                rebuilt_since_progress = True
                 if not self._eviction_heap:
-                    break  # backend genuinely empty (defensive; shouldn't happen)
+                    break
+                continue
 
-            # Pop oldest from heap (O(log n))
             created_at, hash_key = heapq.heappop(self._eviction_heap)
-
-            # Check if entry still exists and matches timestamp
-            # (entry might have been deleted or replaced)
             entry = self._backend.get(hash_key)
             if entry is not None and entry.created_at == created_at:
-                # HIGH FIX: Track eviction as "successful compression" if never retrieved
-                # This prevents state divergence between store and feedback loop
+                # Real oldest entry — evict it through the normal accounting.
                 if self._enable_feedback and entry.retrieval_count == 0:
-                    # Entry was never retrieved = compression was successful
-                    # Notify feedback system so it knows this strategy worked
+                    # Entry was never retrieved = compression was successful;
+                    # notify feedback so it knows this strategy worked.
                     self._record_eviction_success(entry)
                 self._backend.delete(hash_key)
+                rebuilt_since_progress = False  # made progress
             else:
-                # CRITICAL FIX: This was a stale entry, decrement counter
-                # (we already popped it, so the stale entry is now gone)
+                # Stale heap reference — decrement the counter. If the heap
+                # drains to nothing but ones (no real eviction) the `not heap`
+                # branch above rebuilds from the live backend.
                 if self._stale_heap_entries > 0:
                     self._stale_heap_entries -= 1
 
