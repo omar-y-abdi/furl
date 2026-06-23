@@ -89,6 +89,22 @@ class KompressModelNotCached(RuntimeError):
     """
 
 
+# Exceptions that mean "the model / ML runtime is unavailable in this
+# environment" — these are LEGITIMATE graceful-passthrough cases (no [ml]
+# extra installed, model not cached, weights file missing). Everything else
+# (TypeError, AttributeError, KeyError, IndexError, plain RuntimeError from
+# the inference code, …) is a BUG and must PROPAGATE so callers can tell a
+# real failure from an intentional passthrough (#4). NOTE: KompressModelNotCached
+# is listed explicitly — we must NOT catch its base ``RuntimeError``, since
+# model-inference bugs commonly raise bare RuntimeError and those must stay loud.
+_MODEL_UNAVAILABLE_ERRORS: tuple[type[BaseException], ...] = (
+    KompressModelNotCached,
+    ImportError,
+    FileNotFoundError,
+    OSError,
+)
+
+
 # Model cache: model_id -> (model, tokenizer, backend)
 # Supports multiple models loaded simultaneously.
 _kompress_cache: dict[str, tuple[Any, Any, str]] = {}
@@ -934,9 +950,13 @@ class KompressCompressor(Transform):
 
             return result
 
-        except Exception as e:
-            logger.warning("Kompress compression failed: %s", e)
+        except _MODEL_UNAVAILABLE_ERRORS as e:
+            # Model/runtime not available in this environment — legitimate
+            # graceful passthrough.
+            logger.warning("Kompress model unavailable, passthrough: %s", e)
             return self._passthrough(content, n_words)
+        # Any other exception is a bug (#4): let it propagate so callers can
+        # distinguish a real failure from an intentional passthrough.
 
     def compress_batch(
         self,
@@ -1056,12 +1076,14 @@ class KompressCompressor(Transform):
         # Load model once for the whole batch.
         try:
             model, tokenizer, backend = _load_kompress(self.config.model_id, self.config.device)
-        except Exception as e:
-            logger.warning("Kompress load failed for batch: %s — passthrough all", e)
+        except _MODEL_UNAVAILABLE_ERRORS as e:
+            # Model/runtime unavailable — legitimate passthrough of the batch.
+            logger.warning("Kompress model unavailable for batch, passthrough all: %s", e)
             for i in range(n):
                 if results[i] is None:
                     results[i] = self._passthrough(contents[i], len(word_lists[i]))
             return [r for r in results if r is not None]
+        # Other load errors are bugs (#4): propagate.
 
         is_onnx = backend == "onnx"
         device_type = _model_device_type(model, backend)
@@ -1135,9 +1157,13 @@ class KompressCompressor(Transform):
                             if score > self.config.score_threshold:
                                 kept_ids_per_text[text_idx].add(wid + chunk_start)
 
-            except Exception as e:
+            except _MODEL_UNAVAILABLE_ERRORS as e:
+                # Runtime unavailable mid-batch — legitimate passthrough of the
+                # affected texts. Other exceptions are bugs (#4) and propagate.
                 logger.warning(
-                    "Kompress batch forward pass failed: %s — passthrough affected texts", e
+                    "Kompress runtime unavailable in batch forward pass, "
+                    "passthrough affected texts: %s",
+                    e,
                 )
                 for text_idx, _, _, _ in batch:
                     if results[text_idx] is None:
