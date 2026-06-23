@@ -38,7 +38,6 @@ if TYPE_CHECKING:
         CacheStrategy,
         OptimizationContext,
     )
-    from headroom.cache.compression_cache import CompressionCache  # noqa: F401
     from headroom.cache.dynamic_detector import (  # noqa: F401
         DetectorConfig,
         DynamicCategory,
@@ -72,8 +71,6 @@ __all__ = [
     "AnthropicCacheOptimizer",
     "OpenAICacheOptimizer",
     "GoogleCacheOptimizer",
-    # Compression cache (token headroom mode)
-    "CompressionCache",
 ]
 
 _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
@@ -98,8 +95,6 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "AnthropicCacheOptimizer": ("headroom.cache.anthropic", "AnthropicCacheOptimizer"),
     "OpenAICacheOptimizer": ("headroom.cache.openai", "OpenAICacheOptimizer"),
     "GoogleCacheOptimizer": ("headroom.cache.google", "GoogleCacheOptimizer"),
-    # Compression cache
-    "CompressionCache": ("headroom.cache.compression_cache", "CompressionCache"),
 }
 
 
