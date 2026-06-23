@@ -42,13 +42,12 @@ pub use diff_compressor::{
 };
 pub use log_compressor::{
     LogCompressionResult, LogCompressor, LogCompressorConfig, LogCompressorStats, LogFormat,
-    LogLevel, LogLine,
+    LogLevel,
 };
 #[cfg(feature = "magika")]
 pub use magika_detector::{magika_detect, map_magika_label, MagikaDetectorError};
 pub use search_compressor::{
-    FileMatches, SearchCompressionResult, SearchCompressor, SearchCompressorConfig,
-    SearchCompressorStats, SearchMatch,
+    SearchCompressionResult, SearchCompressor, SearchCompressorConfig, SearchCompressorStats,
 };
-pub use tag_protector::{is_known_html_tag, protect_tags, restore_tags, ProtectStats};
+pub use tag_protector::{is_known_html_tag, protect_tags, restore_tags};
 pub use unidiff_detector::{detect_diff, is_diff};
