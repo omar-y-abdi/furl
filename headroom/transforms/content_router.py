@@ -1436,10 +1436,23 @@ class ContentRouter(Transform):
                 compressor_name = "Passthrough"
                 decision_reason = "explicit_passthrough"
 
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
+            from .kompress_compressor import _MODEL_UNAVAILABLE_ERRORS
+
+            if not isinstance(e, _MODEL_UNAVAILABLE_ERRORS):
+                # Real compressor bug: re-raise so callers see the failure.
+                # Only model-unavailable errors (KompressModelNotCached /
+                # ImportError / FileNotFoundError / OSError) are legitimate
+                # "graceful passthrough" — everything else is a bug that must
+                # propagate loud (#4-upstream).
+                raise
             error = f"{type(e).__name__}: {e}"
-            decision_reason = "compression_exception"
-            logger.warning("Compression with %s failed: %s", strategy.value, e)
+            decision_reason = "model_unavailable_passthrough"
+            logger.warning(
+                "Compression with %s: model unavailable, passthrough: %s",
+                strategy.value,
+                e,
+            )
 
         # If compression succeeded, record to TOIN
         if compressed is not None and compressed_tokens is not None:
