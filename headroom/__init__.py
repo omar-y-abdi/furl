@@ -91,14 +91,10 @@ __all__ = [
     "AnthropicCacheOptimizer",
     "OpenAICacheOptimizer",
     "GoogleCacheOptimizer",
-    # Relevance scoring - BM25 always available, embeddings require sentence-transformers
+    # Relevance scoring - BM25 keyword scorer
     "RelevanceScore",
     "RelevanceScorer",
     "BM25Scorer",
-    "EmbeddingScorer",
-    "HybridScorer",
-    "create_scorer",
-    "embedding_available",
     # Utilities
     "Tokenizer",
     "count_tokens_text",
@@ -162,10 +158,6 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "RelevanceScore": ("headroom.relevance", "RelevanceScore"),
     "RelevanceScorer": ("headroom.relevance", "RelevanceScorer"),
     "BM25Scorer": ("headroom.relevance", "BM25Scorer"),
-    "EmbeddingScorer": ("headroom.relevance", "EmbeddingScorer"),
-    "HybridScorer": ("headroom.relevance", "HybridScorer"),
-    "create_scorer": ("headroom.relevance", "create_scorer"),
-    "embedding_available": ("headroom.relevance", "embedding_available"),
     # Utilities
     "Tokenizer": ("headroom.tokenizer", "Tokenizer"),
     "count_tokens_text": ("headroom.tokenizer", "count_tokens_text"),
