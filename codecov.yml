@@ -12,8 +12,4 @@ coverage:
 
 ignore:
   - "tests/**"
-  - "scripts/tests/**"
   - ".github/**"
-  - ".claude-plugin/**"
-  - "plugins/headroom-agent-hooks/.claude-plugin/**"
-  - "plugins/headroom-agent-hooks/.github/**"

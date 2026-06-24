@@ -12,19 +12,7 @@
   "packages": {
     ".": {
       "package-name": "headroom-ai",
-      "release-type": "python",
-      "extra-files": [
-        {
-          "type": "json",
-          "path": "sdk/typescript/package.json",
-          "jsonpath": "$.version"
-        },
-        {
-          "type": "json",
-          "path": "plugins/openclaw/package.json",
-          "jsonpath": "$.version"
-        }
-      ]
+      "release-type": "python"
     }
   },
   "changelog-sections": [

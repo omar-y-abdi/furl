@@ -43,7 +43,7 @@ jobs:
 
       - name: Generate SBOM (CycloneDX)
         run: |
-          pip install -e ".[proxy]"
+          pip install -e "."
           cyclonedx-py environment \
             --output-format json \
             --outfile dist/headroom-sbom.cdx.json
