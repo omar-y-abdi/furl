@@ -65,8 +65,10 @@ import re
 # Accepted CCR hash widths (number of hex characters) — the STRICT consumer set:
 # - 12: SmartCrusher path — sha256(payload)[:6] → 12 hex chars
 #        (crusher.rs:1620, asserted at crusher.rs:2792)
-# - 24: Canonical compute_key — BLAKE3 → 24 lowercase hex chars
-#        (ccr/mod.rs:69), used by read_lifecycle, diff_compressor, etc.
+# - 24: diff/log/search compressors — md5(payload)[:24] (md5_hex_24);
+#        cross_message_dedup, kompress, read_lifecycle, and the store
+#        default key — sha256(payload)[:24]. (No central key helper; each
+#        producer owns its algorithm and threads the hash via explicit_hash.)
 # Do NOT add arbitrary lengths — the exact-width check is the spoofing guard.
 HASH_WIDTHS: frozenset[int] = frozenset({12, 24})
 
