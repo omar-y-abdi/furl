@@ -10,8 +10,8 @@
 //! change by editing this file.
 //!
 //! Hashing stays at the call sites: each producer computes its own hash
-//! (BLAKE3 row hashes, SHA-256 opaque prefixes, MD5[:24] diff/log/search
-//! keys) and hands the finished `hash` string in. This module owns the
+//! (SHA-256[:6] row hashes, SHA-256[:6] opaque prefixes, MD5[:24]
+//! diff/log/search keys) and hands the finished `hash` string in. This module owns the
 //! *grammar*, not the *hash algorithm* — the two are deliberately
 //! separate so producers keep their existing keys byte-for-byte.
 //!
