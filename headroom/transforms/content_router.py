@@ -37,12 +37,10 @@ import hashlib
 import json
 import logging
 import os
-import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
-from enum import Enum
 from typing import Any
 
 from ..config import DEFAULT_EXCLUDE_TOOLS, ReadLifecycleConfig, TransformResult
@@ -51,6 +49,33 @@ from .base import Transform
 from .content_detector import ContentType, DetectionResult
 from .content_detector import detect_content_type as _regex_detect_content_type
 from .error_detection import content_has_strong_error_indicators
+
+# Extracted seams (pure moves). Re-imported here so that:
+#   * existing ``from ...content_router import X`` imports keep resolving,
+#   * the package lazy-export in ``transforms/__init__.py`` keeps working,
+#   * in-module callers reference these as module globals (so the test
+#     suite's ``monkeypatch.setattr(content_router_module, "...", ...)`` on
+#     ``is_mixed_content`` / ``split_into_sections`` still bites), and
+#   * ``content_router_module.time`` patches still target the same ``time``
+#     module object the cache uses.
+from .router_cache import CompressionCache
+from .router_policy import (
+    CompressionStrategy,
+    adaptive_min_ratio,
+    content_type_from_strategy,
+    strategy_from_detection,
+    strategy_from_detection_type,
+)
+from .router_split import (
+    _CODE_FENCE_PATTERN,
+    _JSON_BLOCK_START,
+    _PROSE_PATTERN,
+    _SEARCH_RESULT_PATTERN,
+    ContentSection,
+    _extract_json_block,  # noqa: F401 — re-exported for backward-compatible imports/tests
+    is_mixed_content,
+    split_into_sections,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -189,137 +214,6 @@ def _create_content_signature(
         return None
 
 
-class CompressionCache:
-    """Two-tier compression cache with TTL.
-
-    Tier 1 (skip set): content hashes that won't compress — instant skip,
-    near-zero memory (just ints in a set).
-
-    Tier 2 (result cache): compressed results for content that DID compress —
-    reuse the compressed text on subsequent requests.
-
-    Entries expire after TTL (default 30min). No max-entries cap — TTL is the
-    natural bound. Memory grows proportional to compressible content × TTL,
-    which is bounded by session duration.
-
-    Uses in-process dict for ultra-fast lookups (~100ns). Could be backed
-    by memcached/Redis for multi-process deployments.
-    """
-
-    def __init__(self, ttl_seconds: int = 1800):
-        # Tier 2: compressed results {hash: (text, ratio, strategy, timestamp)}
-        self._results: dict[int, tuple[str, float, str, float]] = {}
-        # Tier 1: hashes of content that won't compress {hash: timestamp}
-        self._skip: dict[int, float] = {}
-        self._ttl_seconds = ttl_seconds
-        # Metrics
-        self._hits = 0
-        self._misses = 0
-        self._skip_hits = 0
-        self._evictions = 0
-        self._total_lookup_ns = 0
-        self._lookup_count = 0
-
-    def get(self, key: int) -> tuple[str, float, str] | None:
-        """Get cached compression result.
-
-        Returns (compressed_text, ratio, strategy) or None if not found/expired.
-        Use is_skipped() first to check if content is known non-compressible.
-        """
-        t0 = time.perf_counter_ns()
-        entry = self._results.get(key)
-        if entry is not None:
-            compressed, ratio, strategy, created_at = entry
-            if (time.time() - created_at) < self._ttl_seconds:
-                self._hits += 1
-                self._total_lookup_ns += time.perf_counter_ns() - t0
-                self._lookup_count += 1
-                return (compressed, ratio, strategy)
-            else:
-                del self._results[key]
-                self._evictions += 1
-        self._misses += 1
-        self._total_lookup_ns += time.perf_counter_ns() - t0
-        self._lookup_count += 1
-        return None
-
-    def is_skipped(self, key: int) -> bool:
-        """Check if content is known non-compressible (Tier 1)."""
-        ts = self._skip.get(key)
-        if ts is not None:
-            if (time.time() - ts) < self._ttl_seconds:
-                self._skip_hits += 1
-                return True
-            else:
-                del self._skip[key]
-                self._evictions += 1
-        return False
-
-    def put(self, key: int, compressed: str, ratio: float, strategy: str) -> None:
-        """Store a compressed result (Tier 2)."""
-        self._results[key] = (compressed, ratio, strategy, time.time())
-
-    def mark_skip(self, key: int) -> None:
-        """Mark content as non-compressible (Tier 1)."""
-        self._skip[key] = time.time()
-
-    def move_to_skip(self, key: int) -> None:
-        """Move a result to skip set (threshold tightened, no longer qualifies)."""
-        self._results.pop(key, None)
-        self._skip[key] = time.time()
-
-    def invalidate(self, key: int) -> None:
-        """Drop a result entry without marking it skipped.
-
-        Used when a cached crushed output can no longer be safely served (its
-        ``<<ccr:HASH>>`` backing is gone and cannot be re-created from the
-        cache hit alone). The caller falls through to a fresh compress(), which
-        re-creates and re-stores the CCR backing and re-populates this cache.
-        """
-        self._results.pop(key, None)
-
-    @property
-    def size(self) -> int:
-        return len(self._results)
-
-    @property
-    def skip_size(self) -> int:
-        return len(self._skip)
-
-    @property
-    def stats(self) -> dict[str, int | float]:
-        avg_ns = self._total_lookup_ns / self._lookup_count if self._lookup_count else 0
-        return {
-            "cache_hits": self._hits,
-            "cache_skip_hits": self._skip_hits,
-            "cache_misses": self._misses,
-            "cache_evictions": self._evictions,
-            "cache_size": len(self._results),
-            "cache_skip_size": len(self._skip),
-            "cache_avg_lookup_ns": avg_ns,
-        }
-
-    def clear(self) -> None:
-        """Clear all entries (e.g., on session end)."""
-        self._results.clear()
-        self._skip.clear()
-
-
-class CompressionStrategy(Enum):
-    """Available compression strategies."""
-
-    CODE_AWARE = "code_aware"
-    SMART_CRUSHER = "smart_crusher"
-    SEARCH = "search"
-    LOG = "log"
-    KOMPRESS = "kompress"
-    TEXT = "text"
-    DIFF = "diff"
-    HTML = "html"
-    MIXED = "mixed"
-    PASSTHROUGH = "passthrough"
-
-
 @dataclass
 class RoutingDecision:
     """Record of a single routing decision."""
@@ -336,18 +230,6 @@ class RoutingDecision:
         if self.original_tokens == 0:
             return 1.0
         return self.compressed_tokens / self.original_tokens
-
-
-@dataclass
-class ContentSection:
-    """A typed section of content."""
-
-    content: str
-    content_type: ContentType
-    language: str | None = None
-    start_line: int = 0
-    end_line: int = 0
-    is_code_fence: bool = False
 
 
 @dataclass
@@ -541,190 +423,6 @@ class ContentRouterConfig:
     # Per-tool compression profiles (tool_name → CompressionProfile)
     # Set to None to use DEFAULT_TOOL_PROFILES from config
     tool_profiles: dict[str, Any] | None = None
-
-
-# Patterns for detecting mixed content
-_CODE_FENCE_PATTERN = re.compile(r"^```(\w*)\s*$", re.MULTILINE)
-_JSON_BLOCK_START = re.compile(r"^\s*[\[{]", re.MULTILINE)
-_SEARCH_RESULT_PATTERN = re.compile(r"^\S+:\d+:", re.MULTILINE)
-_PROSE_PATTERN = re.compile(r"[A-Z][a-z]+\s+\w+\s+\w+")
-
-
-def is_mixed_content(content: str) -> bool:
-    """Detect if content contains multiple distinct types.
-
-    Args:
-        content: Content to analyze.
-
-    Returns:
-        True if content appears to be mixed (multiple types).
-    """
-    indicators = {
-        "has_code_fences": bool(_CODE_FENCE_PATTERN.search(content)),
-        "has_json_blocks": bool(_JSON_BLOCK_START.search(content)),
-        "has_prose": len(_PROSE_PATTERN.findall(content)) > 5,
-        "has_search_results": bool(_SEARCH_RESULT_PATTERN.search(content)),
-    }
-
-    # Mixed if 2+ indicators are true
-    return sum(indicators.values()) >= 2
-
-
-def split_into_sections(content: str) -> list[ContentSection]:
-    """Parse mixed content into typed sections.
-
-    Args:
-        content: Mixed content to split.
-
-    Returns:
-        List of ContentSection objects.
-    """
-    sections: list[ContentSection] = []
-    lines = content.split("\n")
-
-    i = 0
-    while i < len(lines):
-        line = lines[i]
-
-        # Code fence: ```language
-        if match := _CODE_FENCE_PATTERN.match(line):
-            language = match.group(1) or "unknown"
-            code_lines = []
-            start_line = i
-            i += 1
-
-            while i < len(lines) and not lines[i].startswith("```"):
-                code_lines.append(lines[i])
-                i += 1
-
-            sections.append(
-                ContentSection(
-                    content="\n".join(code_lines),
-                    content_type=ContentType.SOURCE_CODE,
-                    language=language,
-                    start_line=start_line,
-                    end_line=i,
-                    is_code_fence=True,
-                )
-            )
-            i += 1  # Skip closing ```
-            continue
-
-        # JSON block
-        if line.strip().startswith(("[", "{")):
-            json_content, end_i = _extract_json_block(lines, i)
-            if json_content:
-                sections.append(
-                    ContentSection(
-                        content=json_content,
-                        content_type=ContentType.JSON_ARRAY,
-                        start_line=i,
-                        end_line=end_i,
-                    )
-                )
-                i = end_i + 1
-                continue
-
-        # Search result lines
-        if _SEARCH_RESULT_PATTERN.match(line):
-            search_lines = []
-            start_line = i
-            while i < len(lines) and _SEARCH_RESULT_PATTERN.match(lines[i]):
-                search_lines.append(lines[i])
-                i += 1
-            sections.append(
-                ContentSection(
-                    content="\n".join(search_lines),
-                    content_type=ContentType.SEARCH_RESULTS,
-                    start_line=start_line,
-                    end_line=i - 1,
-                )
-            )
-            continue
-
-        # Collect text until next special section
-        text_lines = [line]
-        start_line = i
-        i += 1
-
-        while i < len(lines):
-            next_line = lines[i]
-            # Stop if we hit a special section
-            if (
-                _CODE_FENCE_PATTERN.match(next_line)
-                or next_line.strip().startswith(("[", "{"))
-                or _SEARCH_RESULT_PATTERN.match(next_line)
-            ):
-                break
-            text_lines.append(next_line)
-            i += 1
-
-        # Only add non-empty text sections
-        text_content = "\n".join(text_lines)
-        if text_content.strip():
-            sections.append(
-                ContentSection(
-                    content=text_content,
-                    content_type=ContentType.PLAIN_TEXT,
-                    start_line=start_line,
-                    end_line=i - 1,
-                )
-            )
-
-    return sections
-
-
-def _extract_json_block(lines: list[str], start: int) -> tuple[str | None, int]:
-    """Extract a complete JSON block from lines.
-
-    Args:
-        lines: All lines of content.
-        start: Starting line index.
-
-    Returns:
-        Tuple of (json_content, end_line_index) or (None, start) if invalid.
-    """
-    bracket_count = 0
-    brace_count = 0
-    json_lines = []
-    in_string = False
-    escaped = False
-
-    for i in range(start, len(lines)):
-        line = lines[i]
-        json_lines.append(line)
-
-        # Count brackets/braces, but ignore any that appear inside a JSON
-        # string literal — a naive line.count() treats e.g. the "]" in
-        # {"path": "a]b"} as a closing bracket and terminates the block
-        # early, splitting one array across multiple sections.
-        for ch in line:
-            if escaped:
-                escaped = False
-                continue
-            if ch == "\\":
-                if in_string:
-                    escaped = True
-                continue
-            if ch == '"':
-                in_string = not in_string
-                continue
-            if in_string:
-                continue
-            if ch == "[":
-                bracket_count += 1
-            elif ch == "]":
-                bracket_count -= 1
-            elif ch == "{":
-                brace_count += 1
-            elif ch == "}":
-                brace_count -= 1
-
-        if bracket_count <= 0 and brace_count <= 0 and json_lines:
-            return "\n".join(json_lines), i
-
-    # Didn't find complete JSON
-    return None, start
 
 
 class ContentRouter(Transform):
@@ -1152,32 +850,9 @@ class ContentRouter(Transform):
     def _strategy_from_detection(self, detection: Any) -> CompressionStrategy:
         """Get strategy from content detection result.
 
-        Args:
-            detection: Result from detect_content_type.
-
-        Returns:
-            Selected strategy.
+        Thin delegator to the pure :func:`router_policy.strategy_from_detection`.
         """
-        mapping = {
-            ContentType.SOURCE_CODE: CompressionStrategy.CODE_AWARE,
-            ContentType.JSON_ARRAY: CompressionStrategy.SMART_CRUSHER,
-            ContentType.SEARCH_RESULTS: CompressionStrategy.SEARCH,
-            ContentType.BUILD_OUTPUT: CompressionStrategy.LOG,
-            ContentType.GIT_DIFF: CompressionStrategy.DIFF,
-            ContentType.HTML: CompressionStrategy.HTML,
-            ContentType.PLAIN_TEXT: CompressionStrategy.TEXT,
-        }
-
-        strategy = mapping.get(detection.content_type, self.config.fallback_strategy)
-
-        # Override: prefer CodeAware for code if configured
-        if (
-            strategy == CompressionStrategy.CODE_AWARE
-            and not self.config.prefer_code_aware_for_code
-        ):
-            strategy = CompressionStrategy.KOMPRESS
-
-        return strategy
+        return strategy_from_detection(self.config, detection)
 
     def _compress_mixed(
         self,
@@ -1629,32 +1304,18 @@ class ContentRouter(Transform):
         return compressed, compressed_tokens or len(compressed.split())
 
     def _strategy_from_detection_type(self, content_type: ContentType) -> CompressionStrategy:
-        """Get strategy from ContentType enum."""
-        mapping = {
-            ContentType.SOURCE_CODE: CompressionStrategy.CODE_AWARE,
-            ContentType.JSON_ARRAY: CompressionStrategy.SMART_CRUSHER,
-            ContentType.SEARCH_RESULTS: CompressionStrategy.SEARCH,
-            ContentType.BUILD_OUTPUT: CompressionStrategy.LOG,
-            ContentType.GIT_DIFF: CompressionStrategy.DIFF,
-            ContentType.HTML: CompressionStrategy.HTML,
-            ContentType.PLAIN_TEXT: CompressionStrategy.TEXT,
-        }
-        return mapping.get(content_type, self.config.fallback_strategy)
+        """Get strategy from ContentType enum.
+
+        Thin delegator to :func:`router_policy.strategy_from_detection_type`.
+        """
+        return strategy_from_detection_type(self.config, content_type)
 
     def _content_type_from_strategy(self, strategy: CompressionStrategy) -> ContentType:
-        """Get ContentType from strategy."""
-        mapping = {
-            CompressionStrategy.CODE_AWARE: ContentType.SOURCE_CODE,
-            CompressionStrategy.SMART_CRUSHER: ContentType.JSON_ARRAY,
-            CompressionStrategy.SEARCH: ContentType.SEARCH_RESULTS,
-            CompressionStrategy.LOG: ContentType.BUILD_OUTPUT,
-            CompressionStrategy.DIFF: ContentType.GIT_DIFF,
-            CompressionStrategy.HTML: ContentType.HTML,
-            CompressionStrategy.TEXT: ContentType.PLAIN_TEXT,
-            CompressionStrategy.KOMPRESS: ContentType.PLAIN_TEXT,
-            CompressionStrategy.PASSTHROUGH: ContentType.PLAIN_TEXT,
-        }
-        return mapping.get(strategy, ContentType.PLAIN_TEXT)
+        """Get ContentType from strategy.
+
+        Thin delegator to :func:`router_policy.content_type_from_strategy`.
+        """
+        return content_type_from_strategy(strategy)
 
     # Lazy compressor getters
 
@@ -1956,18 +1617,9 @@ class ContentRouter(Transform):
     def _adaptive_min_ratio(self, context_pressure: float) -> float:
         """Compression-acceptance threshold scaled by context pressure.
 
-        A compression is accepted when ``ratio < min_ratio`` (lower ratio =
-        more aggressive). A HIGHER ``min_ratio`` accepts more compressions.
-        At low pressure use the relaxed (stricter, lower) threshold; at high
-        pressure use the aggressive (permissive, higher) threshold, so the
-        agent accepts marginal compressions exactly when context is tightest.
-        Monotone non-decreasing in ``context_pressure``; clamped to
-        ``[relaxed, aggressive]``.
+        Thin delegator to the pure :func:`router_policy.adaptive_min_ratio`.
         """
-        relaxed = self.config.min_ratio_relaxed
-        aggressive = self.config.min_ratio_aggressive
-        min_ratio = relaxed + (aggressive - relaxed) * context_pressure
-        return max(relaxed, min(aggressive, min_ratio))
+        return adaptive_min_ratio(self.config, context_pressure)
 
     def apply(
         self,
