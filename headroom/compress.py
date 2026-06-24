@@ -144,6 +144,10 @@ class CompressResult:
         tokens_saved: Tokens removed by compression.
         compression_ratio: Ratio of tokens saved (0.0 = no savings, 1.0 = 100% removed).
         transforms_applied: List of transforms that were applied.
+        error: Failure description when compression failed and the original
+            messages were returned unchanged (fail-open). None on success and
+            on genuine no-ops (empty input, optimize=False). Lets callers tell
+            a swallowed pipeline failure apart from a real "nothing to do".
     """
 
     messages: list[dict[str, Any]]
@@ -152,6 +156,7 @@ class CompressResult:
     tokens_saved: int = 0
     compression_ratio: float = 0.0
     transforms_applied: list[str] = field(default_factory=list)
+    error: str | None = None
 
 
 def _compute_frozen_message_count(messages: list[dict[str, Any]]) -> int:
@@ -378,13 +383,38 @@ def compress(
         )
 
     except Exception as e:
-        logger.warning("Compression failed, returning original messages: %s", e)
+        # Fail-open: a compression bug must NEVER break the host's request, so
+        # we return the ORIGINAL messages and do not re-raise. But the failure
+        # must be LOUD and HONEST — log at ERROR with a full traceback (this may
+        # be a genuine bug or a Rust panic, not a benign no-op) and report the
+        # real input token count instead of a fabricated 0, so a caller cannot
+        # mistake a swallowed failure for "nothing to compress".
+        logger.error(
+            "compress() failed; returning original messages (fail-open): %s",
+            e,
+            exc_info=True,
+        )
+        # Count the untouched input the same way the pipeline does, but never
+        # let token counting break fail-open: if even counting fails, fall back
+        # to 0 rather than crash the caller.
+        try:
+            from headroom.tokenizers import get_tokenizer
+
+            tokens_before = get_tokenizer(model).count_messages(messages)
+        except Exception:  # noqa: BLE001 - honest metrics are best-effort
+            logger.error(
+                "compress(): token counting also failed on the fail-open path; "
+                "reporting tokens_before=0",
+                exc_info=True,
+            )
+            tokens_before = 0
         return CompressResult(
             messages=messages,
-            tokens_before=0,
+            tokens_before=tokens_before,
             tokens_after=0,
             tokens_saved=0,
             compression_ratio=0.0,
+            error=str(e),
         )
 
 

@@ -17,11 +17,19 @@ def test_compress_returns_original_messages_when_pipeline_fails(monkeypatch) -> 
     messages = [{"role": "user", "content": "hello world " * 100}]
     result = compress(messages, model="gpt-4o")
 
-    # On pipeline failure the original messages pass through untouched and the
-    # token accounting collapses to zero (no observability side effects after
-    # the compression-only amputation).
+    # On pipeline failure the original messages pass through untouched
+    # (fail-open: a compression bug must never break the host's request).
     assert result.messages == messages
-    assert result.tokens_before == 0
+    # The failure is LOUD and HONEST, not silently masked as a no-op:
+    # tokens_before reflects the REAL input so a caller cannot mistake a
+    # swallowed failure for "nothing to compress", and `error` carries the
+    # underlying exception text.
+    from headroom.tokenizers import get_tokenizer
+
+    expected_tokens_before = get_tokenizer("gpt-4o").count_messages(messages)
+    assert expected_tokens_before > 0
+    assert result.tokens_before == expected_tokens_before
     assert result.tokens_after == 0
     assert result.tokens_saved == 0
     assert result.compression_ratio == 0.0
+    assert result.error == "boom"
