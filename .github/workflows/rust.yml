@@ -8,7 +8,6 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'rust-toolchain.toml'
-      - 'tests/parity/**'
       - 'Makefile'
       - '.github/workflows/rust.yml'
   pull_request:
@@ -17,12 +16,8 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'rust-toolchain.toml'
-      - 'tests/parity/**'
       - 'Makefile'
       - '.github/workflows/rust.yml'
-  schedule:
-    # Nightly parity run at 07:17 UTC (weekdays only). Phase 0 allows failure.
-    - cron: '17 7 * * 1-5'
 
 concurrency:
   group: rust-${{ github.ref }}
@@ -124,29 +119,3 @@ jobs:
       - name: cargo deny check licenses
         continue-on-error: true
         run: cargo deny check licenses
-
-  parity-nightly:
-    name: parity (nightly, allowed to fail during Phase 0)
-    if: github.event_name == 'schedule'
-    runs-on: ubuntu-latest
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.95.0
-      - uses: actions/setup-python@v6
-        with:
-          python-version: '3.11'
-      - uses: Swatinem/rust-cache@v2
-      - name: Install deps
-        run: |
-          python -m venv .venv
-          source .venv/bin/activate
-          pip install --upgrade pip
-          pip install maturin
-          pip install -e .
-      - name: Run parity harness
-        run: |
-          source .venv/bin/activate
-          make test-parity
