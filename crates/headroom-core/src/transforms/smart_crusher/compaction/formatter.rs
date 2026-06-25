@@ -39,6 +39,24 @@ use super::encodings;
 use super::ir::{CellValue, ColumnEncoding, Compaction, OpaqueKind, Row, Schema};
 use crate::ccr::marker_for_opaque;
 
+// ─────────────────── CSV-schema preamble grammar markers ───────────────────
+//
+// Line prefixes for the three preamble lines of the CSV-schema rendering.
+// Each preamble line declares a column encoding once (dictionary values /
+// shared affix / head dictionary) so the rows below stay terse. A plain
+// data cell that happens to START with one of these prefixes is CSV-quoted
+// by `csv_render_str`, keeping the preamble lines unambiguous.
+//
+// CONTRACT: these byte strings are the wire format read back by the Python
+// reference decoder `headroom/transforms/csv_schema_decoder.py` (the
+// `_DICT_PREFIX` / `_AFFIX_PREFIX` / `_HEAD_PREFIX` constants there must be
+// byte-for-byte identical). The round-trip is guarded by the 200-case fuzz
+// test `tests/test_csv_schema_decoder_roundtrip_fuzz.py`, which drives the
+// real formatter → real decoder, so any drift between the two sides fails.
+const DICT_PREFIX: &str = "__dict:";
+const AFFIX_PREFIX: &str = "__affix:";
+const HEAD_PREFIX: &str = "__head:";
+
 /// Format a `Compaction` tree into bytes.
 pub trait Formatter: Send + Sync {
     /// Stable name for telemetry (e.g. `"json"`, `"csv-schema"`).
@@ -333,7 +351,7 @@ fn write_table(
     // by `csv_render_str`, so these preamble lines stay unambiguous.
     for f in &schema.fields {
         if let Some(ColumnEncoding::DictString { values }) = &f.encoding {
-            out.push_str("__dict:");
+            out.push_str(DICT_PREFIX);
             out.push_str(&f.name);
             out.push('=');
             let segs: Vec<String> = values.iter().map(|v| csv_render_str(v)).collect();
@@ -350,7 +368,7 @@ fn write_table(
     // by `csv_render_str`, so these preamble lines stay unambiguous.
     for f in &schema.fields {
         if let Some(ColumnEncoding::Affix { prefix, suffix }) = &f.encoding {
-            out.push_str("__affix:");
+            out.push_str(AFFIX_PREFIX);
             out.push_str(&f.name);
             out.push('=');
             out.push_str(&csv_render_str(prefix));
@@ -367,7 +385,7 @@ fn write_table(
     // cell starting with `__head:` is CSV-quoted by `csv_render_str`.
     for f in &schema.fields {
         if let Some(ColumnEncoding::HeadDict { delim, heads }) = &f.encoding {
-            out.push_str("__head:");
+            out.push_str(HEAD_PREFIX);
             out.push_str(&f.name);
             out.push('=');
             out.push(*delim);
@@ -527,9 +545,9 @@ fn head_cell_for(value: &str, delim: char, heads: &[String]) -> Option<String> {
 
 pub(super) fn csv_render_str(s: &str) -> String {
     if s == "="
-        || s.starts_with("__dict:")
-        || s.starts_with("__affix:")
-        || s.starts_with("__head:")
+        || s.starts_with(DICT_PREFIX)
+        || s.starts_with(AFFIX_PREFIX)
+        || s.starts_with(HEAD_PREFIX)
         || needs_csv_quote(s)
     {
         csv_quote(s)

@@ -53,7 +53,7 @@ import json
 import logging
 import os
 import threading
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Any
 
 from ..ccr import marker_grammar
@@ -339,32 +339,32 @@ class SmartCrusher(Transform):
         # single-threaded behaviour exactly.
         self._tls = threading.local()
 
-        # Build the Rust crusher with every field from the Python
-        # config, plus the relevance_threshold default (0.3) — the
-        # Python dataclass doesn't carry that field; it lives on
-        # `RelevanceScorerConfig` instead.
+        # Build the Rust crusher. Forward EVERY field of the Python
+        # `SmartCrusherConfig` dataclass via `asdict(cfg)` so the field
+        # set is single-sourced from the dataclass definition — adding a
+        # field there flows across the FFI with no extra edit here, and
+        # no field can be silently dropped by a forgotten forwarding line.
+        # `asdict` yields a flat dict of the 17 scalar fields (all
+        # bool/int/float/str — no nesting), matching the pyo3 signature
+        # kwargs 1:1 by name.
+        #
+        # The pyo3 constructor accepts two MORE kwargs that are NOT
+        # dataclass fields and so must be passed explicitly:
+        #   * `relevance_threshold` (0.3) — lives on
+        #     `RelevanceScorerConfig`, not this dataclass; the Rust crusher
+        #     needs its own default.
+        #   * `enable_ccr_marker` — derived from the CCR config, not a
+        #     crusher-config field. Falling through to the pyo3 default
+        #     (`true`) would ignore a caller's `CCRConfig(enabled=False)` /
+        #     `inject_retrieval_marker=False`, so it MUST be passed here.
+        # Neither name collides with a dataclass field, so there is no
+        # duplicate-kwarg conflict with `**asdict(cfg)`.
         rust_cfg = _RustSmartCrusherConfig(
-            enabled=cfg.enabled,
-            min_items_to_analyze=cfg.min_items_to_analyze,
-            min_tokens_to_crush=cfg.min_tokens_to_crush,
-            variance_threshold=cfg.variance_threshold,
-            uniqueness_threshold=cfg.uniqueness_threshold,
-            similarity_threshold=cfg.similarity_threshold,
-            max_items_after_crush=cfg.max_items_after_crush,
-            preserve_change_points=cfg.preserve_change_points,
-            factor_out_constants=cfg.factor_out_constants,
-            include_summaries=cfg.include_summaries,
-            use_feedback_hints=cfg.use_feedback_hints,
-            toin_confidence_threshold=cfg.toin_confidence_threshold,
-            dedup_identical_items=cfg.dedup_identical_items,
-            first_fraction=cfg.first_fraction,
-            last_fraction=cfg.last_fraction,
-            lossless_min_savings_ratio=cfg.lossless_min_savings_ratio,
+            **asdict(cfg),
             relevance_threshold=0.3,
             enable_ccr_marker=(
                 self._ccr_config.enabled and self._ccr_config.inject_retrieval_marker
             ),
-            routing_policy=cfg.routing_policy,
         )
         # Default: lossless-first compaction. Lossless wins for
         # cleanly tabular input where it saves ≥ 30% bytes; otherwise

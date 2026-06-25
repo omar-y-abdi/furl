@@ -445,8 +445,11 @@ impl PyDiffCompressor {
 
 /// Mirror of `headroom.transforms.smart_crusher.SmartCrusherConfig`.
 /// Defaults match Python's dataclass byte-for-byte. The constructor
-/// accepts every field as a kwarg with the same name and type so the
-/// Python shim can pass `SmartCrusherConfig(**asdict(py_cfg))`.
+/// accepts every dataclass field as a kwarg with the same name and type,
+/// so the Python shim passes `SmartCrusherConfig(**asdict(py_cfg), ...)` —
+/// plus two non-dataclass kwargs it injects explicitly: `relevance_threshold`
+/// (lives on `RelevanceScorerConfig`) and `enable_ccr_marker` (derived from
+/// the CCR config).
 #[pyclass(name = "SmartCrusherConfig", module = "headroom._core")]
 #[derive(Clone)]
 struct PySmartCrusherConfig {

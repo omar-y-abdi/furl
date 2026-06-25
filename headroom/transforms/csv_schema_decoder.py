@@ -77,6 +77,24 @@ _ISO_RE = re.compile(
 _DELTA_RE = re.compile(r"^([+-]\d+)(?:/(Z|[+-]\d{2}:\d{2}))?$")
 _CCR_SENTINEL_KEY = "_ccr_dropped"
 
+# ─── CSV-schema preamble grammar markers ──────────────────────────────────
+#
+# Line prefixes for the three preamble lines (dictionary values / shared
+# affix / head dictionary) emitted directly after the ``[N]{...}``
+# declaration. A plain data cell starting with one of these is CSV-quoted by
+# the formatter, so the preamble lines stay unambiguous.
+#
+# CONTRACT: these byte strings are the wire format produced by the Rust
+# encoder ``crates/headroom-core/src/transforms/smart_crusher/compaction/
+# formatter.rs`` (the ``DICT_PREFIX`` / ``AFFIX_PREFIX`` / ``HEAD_PREFIX``
+# constants there must be byte-for-byte identical). The round-trip is guarded
+# by the 200-case fuzz test ``tests/test_csv_schema_decoder_roundtrip_fuzz.py``
+# (real Rust formatter → this decoder), so any drift between the two sides
+# fails loudly.
+_DICT_PREFIX = "__dict:"
+_AFFIX_PREFIX = "__affix:"
+_HEAD_PREFIX = "__head:"
+
 
 def _days_from_civil(y: int, m: int, d: int) -> int:
     """Days since 1970-01-01 (proleptic Gregorian, Hinnant's algorithm).
@@ -425,15 +443,15 @@ def decode_csv_schema_rows(text: str) -> list[dict[str, Any]] | None:
         )
 
     for line in lines[1:]:
-        if line.startswith("__dict:") and "=" in line:
-            name, payload = line[len("__dict:") :].split("=", 1)
+        if line.startswith(_DICT_PREFIX) and "=" in line:
+            name, payload = line[len(_DICT_PREFIX) :].split("=", 1)
             if name not in var_names:
                 break
             dict_values[name] = [_unq(seg) for seg in split_unquoted(payload)]
             body_start += 1
             continue
-        if line.startswith("__affix:") and "=" in line:
-            name, payload = line[len("__affix:") :].split("=", 1)
+        if line.startswith(_AFFIX_PREFIX) and "=" in line:
+            name, payload = line[len(_AFFIX_PREFIX) :].split("=", 1)
             if name not in affix_names:
                 break
             segs = split_unquoted(payload)
@@ -442,8 +460,8 @@ def decode_csv_schema_rows(text: str) -> list[dict[str, Any]] | None:
             affixes[name] = (_unq(segs[0]), _unq(segs[1]))
             body_start += 1
             continue
-        if line.startswith("__head:") and "=" in line:
-            name, payload = line[len("__head:") :].split("=", 1)
+        if line.startswith(_HEAD_PREFIX) and "=" in line:
+            name, payload = line[len(_HEAD_PREFIX) :].split("=", 1)
             if name not in head_names or not payload:
                 break
             delim = payload[0]
