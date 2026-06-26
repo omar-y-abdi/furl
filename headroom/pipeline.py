@@ -25,12 +25,16 @@ class PipelineStage(str, Enum):
     INPUT_COMPRESSED = "input_compressed"
 
 
-@dataclass
+@dataclass(frozen=True)
 class PipelineEvent:
-    """Event emitted at a canonical pipeline stage.
+    """Immutable event emitted at a canonical pipeline stage.
 
-    Extensions may mutate ``messages``, ``tools``, ``headers``, or ``metadata`` in
-    place, or return a replacement ``PipelineEvent`` from ``on_pipeline_event``.
+    The event is frozen: extensions MUST NOT mutate it in place. To change
+    ``messages``, ``tools``, ``headers``, or ``metadata``, return a replacement
+    ``PipelineEvent`` from ``on_pipeline_event`` (e.g. via
+    ``dataclasses.replace(event, messages=...)``); ``emit`` adopts whatever the
+    handler returns. This keeps the prompt-cache-sensitive ``messages`` list free
+    of the hidden in-place effects the project's RULES.md forbids.
     """
 
     stage: PipelineStage
