@@ -481,6 +481,58 @@ class ContentRouterConfig:
     tool_profiles: dict[str, Any] | None = None
 
 
+# Strict allow-list for ``ContentRouter.apply(**kwargs)``. A key absent here is
+# rejected with a TypeError so a typo (e.g. ``protect_recents`` for
+# ``protect_recent``) fails loudly instead of being silently dropped.
+#
+# The set is the union of TWO sources:
+#   1. Keys apply() itself READS — directly via ``kwargs.get(...)`` and
+#      indirectly via ``RouterRuntime.from_kwargs`` (``target_ratio`` /
+#      ``force_kompress`` / ``kompress_model`` / ``compression_policy``).
+#   2. Keys a real caller PASSES but apply() never reads. The pipeline
+#      broadcasts the SAME ``**kwargs`` to every transform
+#      (``pipeline.py``: ``transform.apply(..., **kwargs)``), so apply()
+#      legitimately RECEIVES keys destined for the pipeline's public surface
+#      or for sibling transforms — e.g. ``model_limit`` / ``output_buffer`` /
+#      ``tool_profiles`` / ``request_id`` (documented in
+#      ``TransformPipeline.apply``) and ``record_metrics`` /
+#      ``model`` / ``messages`` / ``tokenizer`` (positionals / dry-run marker).
+#      These are valid, just not consumed here.
+_APPLY_ALLOWED_KWARGS: frozenset[str] = frozenset(
+    {
+        # --- read by apply() directly ---
+        "compression_store",
+        "frozen_message_count",
+        "compress_user_messages",
+        "compress_system_messages",
+        "protect_recent",
+        "protect_analysis_context",
+        "compress_request",
+        "min_tokens_to_compress",
+        "compress_assistant_text_blocks",
+        "min_chars_for_block_compression",
+        "context",
+        "biases",
+        "model_limit",
+        "read_protection_window",
+        # --- read by apply() via RouterRuntime.from_kwargs ---
+        "target_ratio",
+        "force_kompress",
+        "kompress_model",
+        "compression_policy",
+        # --- received via the pipeline broadcast but not read here ---
+        # (pipeline public surface + sibling transforms + positionals) ---
+        "model",
+        "messages",
+        "tokenizer",
+        "output_buffer",
+        "tool_profiles",
+        "request_id",
+        "record_metrics",
+    }
+)
+
+
 class ContentRouter(Transform):
     """Intelligent router that selects optimal compression strategy.
 
@@ -1390,7 +1442,23 @@ class ContentRouter(Transform):
 
         Returns:
             TransformResult with routed and compressed messages.
+
+        Raises:
+            TypeError: If ``kwargs`` contains a key not in
+                ``_APPLY_ALLOWED_KWARGS``. Catches silent typos (e.g.
+                ``protect_recents``) that would otherwise be dropped by the
+                ``kwargs.get(...)`` reads below.
         """
+        # Reject unknown kwargs up front so a typo fails loudly instead of
+        # being silently ignored. See _APPLY_ALLOWED_KWARGS for the two
+        # sources of the allow-list (keys read here ∪ keys broadcast by the
+        # pipeline to every transform).
+        for k in kwargs:
+            if k not in _APPLY_ALLOWED_KWARGS:
+                raise TypeError(
+                    f"ContentRouter.apply() got an unexpected keyword argument {k!r}"
+                )
+
         # Pre-process: Read lifecycle management (stale/superseded detection)
         if self.config.read_lifecycle.enabled:
             from .read_lifecycle import ReadLifecycleManager
