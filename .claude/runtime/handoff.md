@@ -1,3 +1,30 @@
+# ⭐⭐⭐⭐⭐ GOD-OBJECT SPLIT + LIFECYCLE EXCISE — DONE (user chose "take the large refactors")
+
+User decision: take the large refactors now, subagent per PART (sequential, not all at once), verify
+regression per part, >3% → revert + discuss, <3% → keep + discuss, goal 0%. + "Radera 11-stage lifecycle".
+Protocol: characterization-test-first for the bench-blind landmine; bench measured vs a FIXED reference
+(/tmp/bench_ref.json, determinism confirmed 2× identical); recovery 23 + needle 100% = hard gate.
+
+**All 7 parts done. ZERO regression — every shipped change 0.000% bench, needle 100%, recovery 23.**
+| Part | Commit | Result |
+|------|--------|--------|
+| A lifecycle deletion | `5bf0a303` | 8 dead PipelineStage + discover path + CANONICAL tuple + README overstatement gone. 0%. |
+| B Rust cache_control | `95fd63a6` | whole orphaned module (compute_frozen_count + helpers + tests + re-export) deleted; Python mirror is live. Removed a critique-praised-but-DEAD proptest. 0%. |
+| D StrategySelector | (no-op) | already extracted to router_policy.py; ContentRouter methods are thin delegators doubling as test seams — removing = break seams for zero gain. |
+| E StrategyDispatcher | `f0b7db1d` | 260-line dispatch+fallback → router_dispatch.py leaf (no router ref, deps injected per-call). 0%. |
+| F CcrMirror | `7b47568d` | _ensure_ccr_backed cache-hit path + _extract_ccr_hashes → router_ccr_mirror.py leaf. extract byte-identical. recovery 23. 0%. |
+| C typed CompressRequest | NOT SHIPPED | NOT A CLEAN WIN — net-negative (layer trilemma + name mismatch + tri-state). Characterization test `f577d47f` KEPT (pins the bench-blind 50-vs-250 floor). |
+| G TLS→RouterRuntime | `142cde0c` | hidden mutable thread-local + replay (51 grep→0) → frozen value threaded by arg. 3 mechanism tests rewritten, BITE INDEPENDENTLY RE-VERIFIED (injected leak → isolation RED). 0%. |
+| fmt | `23084658` | cargo fmt the cycle-3 A-1/A-5 test drift; ci-precheck-rust clean. |
+
+Net: ContentRouter **2566→2344 LOC** (−222); 2 clean leaf seams (router_dispatch 343, router_ccr_mirror 154);
+orphaned Rust module + dead lifecycle excised; TLS hidden-state eliminated (type-driven RULES alignment).
+Final sanity: gate G1-G5 PASS, floor byte-exact, needle 100%, fmt-check + clippy clean.
+**Tradeoff discussion: no regressions to weigh (all 0%). Only residual = C's typo-rejection not delivered
+(low-severity internal API) + B dropped a praised-but-dead test. Both evidence-backed, surfaced to user.**
+
+---
+
 # ⭐⭐⭐⭐ CYCLE-3 RERUN (cycle-4 critique) — DONE, awaiting user macro-decision
 
 Rerun `wf_e8857221-553` (EXACT same adversarial-critique.js UNCHANGED, args.map=CODEBASE-MAP.md):
