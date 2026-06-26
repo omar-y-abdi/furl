@@ -1,4 +1,49 @@
-# ⭐⭐⭐ CYCLE 3 — IN PROGRESS (full arch ✅ → test-hardening NEXT)
+# ⭐⭐⭐⭐ CYCLE-3 RERUN (cycle-4 critique) — DONE, awaiting user macro-decision
+
+Rerun `wf_e8857221-553` (EXACT same adversarial-critique.js UNCHANGED, args.map=CODEBASE-MAP.md):
+**12 lenses · 2 rounds · 217 findings → 142 material / 21 by-design / 45 deflated / 9 nitpicks.**
+Critique re-extracted to codebase-CRITIQUE.md (untracked; agent returned text, repo read-only).
+
+**DELTA vs cycle-3 critique (snapshot /tmp/critique-cycle3-prev.md) — convergence-shaped:**
+- cycle-3 top-6 RESOLVED/GONE: item1 scrape (→ now only the by-design lossy-reachability open Q +
+  the documented 1b mirror), item3 FFI hand-sync (→ DEFLATED: critic ruled the duplication thesis
+  "factually wrong" — compute_frozen_count orphaned, CCR_HASH_WIDTHS a re-export, validator is the
+  authoritative binding), item4 memory/providers GONE, item5 diff-comment GONE, item6 unwrap GONE,
+  docs a/b GONE (content_detector + map-thinning honest). My cycle-3 work landed and left the report.
+- Test suite is now the critic's #1 EVIDENCE the code is well-written — explicitly credits the hardening
+  I wrote: test_ccr_hash_parity_vectors (A-1/A-2), ccr_roundtrip dropped_count_ties (A-5), Python-store-only
+  recovery (TE1), CompressorRegistry extraction (item2). Severity ceiling fell critical→med ⇒ med/trivial.
+- NEW thin layer (3 TRIVIAL — all FIXED this turn + 1 medium + the declined large):
+
+**Cycle-4 trivial fixes — DONE, gated (G1-G5 incl. bench floor byte-exact), committed:**
+- `02dd91d0` item3 (security): MCP `headroom_retrieve` now applies the width+charset spoofing guard;
+  extracted `marker_grammar.is_valid_ccr_hash` as single source, routed BOTH ingress points (parse +
+  retrieve) through it (dedup). +5 parametrized tests. (Critic: "not a vuln" — surface consistency.)
+- `b10dcb71` item2 (refactor): dropped 3 dead `getattr(self,"_runtime_*",default)` probes on
+  always-present properties → read directly; behaviour byte-identical (bench floor held). Comment fixed.
+- `dd07cd40` item1 (test): structural guard — parses live ContentRouter source, asserts
+  `_runtime_*` properties == snapshot keys == replay keys, so a future option added without wiring the
+  worker-TLS replay fails HERE not in prod. (Hardens the #10 surface I'd kept byte-frozen in cycle-3.)
+
+**OPEN — the two macro-decisions surfaced to user (NOT silently defaulted):**
+- **item 4 (11-stage pipeline lifecycle, only 3 stages live):** proxy-removal debt — 8 unreachable
+  `PipelineStage` values + `discover_pipeline_extensions` + README "stable 11-stage contract"
+  overstatement + orphaned Rust `compute_frozen_count` (no PyO3 binding). DELETE per standalone-excise
+  + lazy-dev, OR KEEP+document as the extension surface the upcoming MCP/hook work will consume? →
+  roadmap-dependent, user's call.
+- **god-object (items 5-6, med·large):** ContentRouter 2566 LOC + per-request state on a shared
+  singleton via TLS. Critic itself ranks it "lowest leverage, sequence last" and CREDITS the partial
+  extraction. DECLINED twice on never-regress (large hot-path refactor). Accept as honest documented
+  debt, OR take the StrategySelector/Dispatcher/CcrMirror split (effort + regression risk)? → user's
+  risk-tolerance call.
+
+Loop status: converged to "by-design/declined + a thin nitpick layer." A further rerun (~10M tokens,
+~2h) would surface the next thin layer + the same declined god-object. Whether to spend it = user macro
+decision (below). HEAD = dd07cd40.
+
+---
+
+# ⭐⭐⭐ CYCLE 3 — COMPLETE (full arch ✅ + test-hardening ✅ + close-out ✅ + rerun ✅)
 
 User chose FULL cycle 3 (items 1+2+3) + test-hardening loop + fix-bugs + validate every
 testimonial + verify critique dealt-with → delete → rerun EXACT workflow. "EVERY line to
