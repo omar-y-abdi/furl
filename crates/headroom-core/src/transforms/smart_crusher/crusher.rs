@@ -2949,6 +2949,39 @@ mod tests {
     }
 
     #[test]
+    fn hash_canonical_pinned_vectors() {
+        // Rule-2 pin (anti parallel-mutation blindness): fixed SHA-256[:12]
+        // literals over the EXACT canonical bytes `serde_json::to_string`
+        // emits. A truncation (`take(6)`→`take(5)`), a hex-format change, or
+        // a hasher swap FLIPS a literal here — unlike the sibling
+        // `persist_dropped_hash_is_byte_identical_to_inline_dict_scheme`,
+        // which RECOMPUTES `expected` and would survive every such mutation.
+        // Literals produced once in Python and pinned identically on the
+        // Python side (tests/test_ccr_hash_parity_vectors.py) — the two
+        // pins together are the Py↔Rust parity lock for the CCR recovery key:
+        //   python3 -c "import hashlib; print(hashlib.sha256(C.encode()).hexdigest()[:12])"
+        assert_eq!(hash_canonical("[]"), "4f53cda18c2b");
+        assert_eq!(hash_canonical(r#"["alpha","beta","gamma"]"#), "a3e185260009");
+        assert_eq!(hash_canonical("[1,2,3,4,5]"), "f5baf0e4336f");
+        assert_eq!(
+            hash_canonical(r#"[{"id":1},{"id":2},{"id":3}]"#),
+            "d99179347cb1"
+        );
+        // The canonical serializer must emit EXACTLY those bytes, so each
+        // literal above is the hash of what the array drop path actually
+        // hashes (closes the loop: a serializer change would flip this).
+        assert_eq!(canonical_array_json(&[]), "[]");
+        assert_eq!(
+            canonical_array_json(&[json!("alpha"), json!("beta"), json!("gamma")]),
+            r#"["alpha","beta","gamma"]"#
+        );
+        assert_eq!(
+            canonical_array_json(&[json!({"id": 1}), json!({"id": 2}), json!({"id": 3})]),
+            r#"[{"id":1},{"id":2},{"id":3}]"#
+        );
+    }
+
+    #[test]
     fn non_dict_drop_surfaces_pointer_and_persists_even_with_marker_off() {
         // Defect 1: parity with the dict path. With
         // `enable_ccr_marker=false`, the non-dict string path STILL
