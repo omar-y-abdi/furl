@@ -246,10 +246,15 @@ def compress(
     overrides = {key: value for key, value in kwargs.items() if key in config_fields}
     unknown = sorted(set(kwargs) - config_fields)
     if unknown:
-        logger.warning(
-            "compress(): ignoring unknown option(s) %s; valid CompressConfig fields: %s",
-            ", ".join(unknown),
-            ", ".join(sorted(config_fields)),
+        # Fail fast at the public boundary — a typo'd field (e.g.
+        # ``target_ration``) silently defaulting would hand back differently
+        # compressed output than the caller asked for. Matches the strict
+        # ``ContentRouter.apply()`` contract (and Python's own unexpected-kwarg
+        # behaviour) rather than warning-and-ignoring.
+        raise TypeError(
+            f"compress() got unexpected keyword argument(s) "
+            f"{', '.join(unknown)}; valid CompressConfig fields: "
+            f"{', '.join(sorted(config_fields))}"
         )
     if overrides:
         cfg = replace(cfg, **overrides)

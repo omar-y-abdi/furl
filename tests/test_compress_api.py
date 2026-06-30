@@ -2,6 +2,8 @@
 
 import json
 
+import pytest
+
 from headroom.compress import CompressConfig, CompressResult, compress
 from headroom.hooks import CompressionHooks
 
@@ -89,14 +91,12 @@ class TestCompressFunction:
         assert cfg.target_ratio is None
         assert cfg.protect_recent == 4
 
-    def test_unknown_kwargs_are_logged(self, caplog):
-        """Unknown kwargs (typos) must be surfaced, not silently ignored."""
-        import logging
-
+    def test_unknown_kwargs_raise(self):
+        """Unknown kwargs (typos) must fail loudly, not silently default —
+        matches the strict ``ContentRouter.apply()`` contract."""
         messages = [{"role": "user", "content": "hi"}]
-        with caplog.at_level(logging.WARNING, logger="headroom.compress"):
+        with pytest.raises(TypeError, match="target_ration"):
             compress(messages, target_ration=0.5)  # deliberate typo
-        assert any("target_ration" in record.message for record in caplog.records)
 
     def test_with_custom_hooks(self):
         """Hooks are called when provided."""
