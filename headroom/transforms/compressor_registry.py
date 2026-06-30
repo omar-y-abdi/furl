@@ -15,8 +15,7 @@ surface.
 This registry is INTERNAL — it is not part of ``headroom.__all__``. The
 ``ContentRouter`` holds one instance (``self._registry``) and its public
 ``_get_*`` getters delegate to the matching ``get_*`` method here, so every
-existing call site (including the fallback chain and ``eager_load_compressors``)
-stays byte-unchanged.
+existing call site (including the fallback chain) stays byte-unchanged.
 
 The ML text compressors (Kompress / ``_get_kompress``) deliberately stay on the
 router: ``_get_kompress`` takes the per-request ``model_id`` (from

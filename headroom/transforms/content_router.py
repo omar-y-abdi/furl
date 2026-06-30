@@ -1271,71 +1271,6 @@ class ContentRouter(Transform):
         """
         return self._registry.get_html_extractor()
 
-    def eager_load_compressors(self) -> dict[str, str]:
-        """Pre-load compressors at startup to avoid first-request latency.
-
-        Call this during startup to load models and parsers
-        before any requests arrive. Eliminates cold-start latency spikes.
-
-        Returns:
-            Dict of component name -> status string for logging.
-        """
-        status: dict[str, str] = {}
-
-        # 1. ML text compressor: Kompress.
-        #
-        # Eager preload is cache-only (allow_download=False): on a cold cache we
-        # must NOT trigger a network download here, because this runs on the
-        # blocking startup path. A slow download stalls startup, and a hard
-        # crash in the native download/ML stack (uncatchable SIGABRT) kills the
-        # interpreter before it finishes initializing — so the host process
-        # never becomes ready. When the model isn't cached we defer to first
-        # use instead.
-        if self.config.enable_kompress:
-            from .kompress_compressor import KompressModelNotCached
-
-            compressor = self._get_kompress()
-            if compressor:
-                if not hasattr(compressor, "preload"):
-                    status["kompress"] = "enabled"
-                    status["kompress_backend"] = "unknown"
-                else:
-                    try:
-                        backend = compressor.preload(allow_download=False)
-                    except KompressModelNotCached:
-                        logger.info(
-                            "Kompress model not cached; deferring download to "
-                            "first use to keep startup non-blocking"
-                        )
-                        status["kompress"] = "deferred"
-                    else:
-                        logger.info("Kompress model pre-loaded at startup backend=%s", backend)
-                        status["kompress"] = "enabled"
-                        status["kompress_backend"] = str(backend)
-            else:
-                status["kompress"] = "unavailable"
-
-        # 2. Magika content detector (avoids 100-200ms on first content detection)
-        try:
-            from ..compression.detector import _get_magika, _magika_available
-
-            if _magika_available():
-                _get_magika()  # Initializes the singleton
-                logger.info("Magika content detector pre-loaded at startup")
-                status["magika"] = "enabled"
-            else:
-                status["magika"] = "not installed"
-        except Exception as e:
-            logger.debug("Magika pre-load skipped: %s", e)
-            status["magika"] = "skipped"
-
-        # 3. SmartCrusher (lightweight init, but ensures import + TOIN ready)
-        smart_crusher = self._get_smart_crusher()
-        if smart_crusher:
-            status["smart_crusher"] = "ready"
-
-        return status
-
     def _get_kompress(self, model_id: str | None = None) -> Any:
         """Get KompressCompressor (lazy load). Downloads from HuggingFace on first use.
 
@@ -2376,24 +2311,3 @@ class ContentRouter(Transform):
         Always returns True - the router handles all content types.
         """
         return True
-
-
-def route_and_compress(
-    content: str,
-    context: str = "",
-) -> str:
-    """Convenience function for one-off routing and compression.
-
-    Args:
-        content: Content to compress.
-        context: Optional context for relevance-aware compression.
-
-    Returns:
-        Compressed content.
-
-    Example:
-        >>> compressed = route_and_compress(mixed_content)
-    """
-    router = ContentRouter()
-    result = router.compress(content, context=context)
-    return result.compressed
