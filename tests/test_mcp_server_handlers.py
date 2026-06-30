@@ -49,6 +49,10 @@ def _isolate_store(tmp_path, monkeypatch):
     # record_compression() never writes to ~/.headroom (keep file mods scoped
     # to the test sandbox). Stats tests override this with their own path.
     monkeypatch.setattr(mcp_server, "SHARED_STATS_FILE", tmp_path / "shared_stats.jsonl")
+    # headroom_read is jailed to $HEADROOM_WORKSPACE_DIR (default cwd). Point it
+    # at the per-test sandbox so file-read happy-path tests run inside the jail;
+    # out-of-jail rejection is covered explicitly below.
+    monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(tmp_path))
     reset_compression_store()
     yield
     reset_compression_store()
@@ -136,9 +140,10 @@ async def test_read_missing_file_path_returns_error_envelope(server) -> None:
     assert env == {"error": "file_path parameter is required"}
 
 
-async def test_read_nonexistent_path_reports_not_found(server) -> None:
-    # :647 — a path that does not resolve to anything on disk.
-    env = _envelope(await server._handle_read({"file_path": "/no/such/path/zzz.txt"}))
+async def test_read_nonexistent_path_reports_not_found(server, tmp_path: Path) -> None:
+    # A path INSIDE the workspace jail that does not resolve to anything on disk
+    # (passes the jail, reaches the existence check).
+    env = _envelope(await server._handle_read({"file_path": str(tmp_path / "zzz.txt")}))
     assert env["error"].startswith("File not found:")
     assert "zzz.txt" in env["error"]
 
@@ -158,6 +163,26 @@ async def test_read_real_file_returns_numbered_content(server, tmp_path: Path) -
     assert len(result) == 1
     text = result[0].text
     assert text == "     1\talpha\n     2\tbeta\n     3\tgamma"
+
+
+async def test_read_outside_workspace_is_rejected(server, tmp_path: Path) -> None:
+    # A path outside the workspace jail is rejected BEFORE any existence probe
+    # (works even for a path that doesn't exist — no file-existence oracle), with
+    # a generic message that never echoes the attempted path back to the model.
+    escapee = tmp_path.parent / "escapee_outside_jail.txt"
+    env = _envelope(await server._handle_read({"file_path": str(escapee)}))
+    assert env["error"] == "path outside workspace"
+    assert "escapee" not in env["error"]
+
+
+async def test_read_oversized_file_is_rejected(server, tmp_path: Path, monkeypatch) -> None:
+    # Files past the byte cap are rejected by stat() BEFORE read_bytes(), so an
+    # oversized file is never allocated into memory (OOM DoS guard).
+    monkeypatch.setattr(mcp_server, "_MAX_READ_BYTES", 16)
+    big = tmp_path / "big.txt"
+    big.write_text("x" * 64)
+    env = _envelope(await server._handle_read({"file_path": str(big)}))
+    assert env["error"].startswith("File too large to read:")
 
 
 # ─── clean compress → retrieve round-trip (real store) ──────────────────────

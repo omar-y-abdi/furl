@@ -79,6 +79,48 @@ def _safe_decode_for_logging(raw: bytes) -> str:
     return decoder.decode(bytes(raw), final=True)
 
 
+# Maximum bytes/chars a single tool call will read or ingest. Caps the
+# headroom_read file read and the headroom_compress content input so a single
+# oversized payload cannot exhaust memory (OOM DoS). 10 MiB is far above any
+# realistic source file or tool output while bounding worst-case allocation.
+_MAX_READ_BYTES = 10 * 1024 * 1024
+
+# Per-payload preview budget for --debug logging. Tool arguments and outputs can
+# contain whole file contents; logging them verbatim at INFO bloats logs and can
+# leak large payloads. Truncate to this many chars (see _truncate_for_log).
+_LOG_PREVIEW_CHARS = 200
+
+
+def _truncate_for_log(text: str) -> str:
+    """Cap a string for log display, marking truncation explicitly.
+
+    Returns ``text`` unchanged when within ``_LOG_PREVIEW_CHARS``; otherwise the
+    first ``_LOG_PREVIEW_CHARS`` chars plus an ellipsis marker so the log makes
+    clear the value was trimmed (never silently lossy).
+    """
+    if len(text) <= _LOG_PREVIEW_CHARS:
+        return text
+    return text[:_LOG_PREVIEW_CHARS] + "…[truncated]"
+
+
+def _workspace_root() -> Path:
+    """Return the resolved root that headroom_read file access is confined to.
+
+    Resolution order (mirrors ``headroom.paths._env`` trim semantics):
+
+    1. ``$HEADROOM_WORKSPACE_DIR`` (trimmed, tilde-expanded) when set to a
+       non-blank value.
+    2. The current working directory otherwise.
+
+    The result is ``resolve()``-d so the jail check compares two canonical
+    (symlink-collapsed) paths.
+    """
+    env_value = os.environ.get(_paths.HEADROOM_WORKSPACE_DIR_ENV, "").strip()
+    if env_value:
+        return Path(env_value).expanduser().resolve()
+    return Path.cwd().resolve()
+
+
 # Feature flag: enable headroom_read tool (file read caching via CCR)
 # Set HEADROOM_MCP_READ=on to enable
 _READ_ENABLED = os.environ.get("HEADROOM_MCP_READ", "off").lower().strip() in (
@@ -503,7 +545,7 @@ class HeadroomMCPServer:
             logger.info(
                 "event=mcp_tool_call_received tool=%s arguments=%s",
                 name,
-                json.dumps(arguments, ensure_ascii=False, default=str),
+                _truncate_for_log(json.dumps(arguments, ensure_ascii=False, default=str)),
             )
             try:
                 if name == COMPRESS_TOOL_NAME:
@@ -525,19 +567,24 @@ class HeadroomMCPServer:
                     "event=mcp_tool_call_completed tool=%s duration_ms=%.2f output=%s",
                     name,
                     (time.perf_counter() - started) * 1000.0,
-                    json.dumps(
-                        [getattr(item, "text", str(item)) for item in result],
-                        ensure_ascii=False,
-                        default=str,
+                    _truncate_for_log(
+                        json.dumps(
+                            [getattr(item, "text", str(item)) for item in result],
+                            ensure_ascii=False,
+                            default=str,
+                        )
                     ),
                 )
                 return result
             except Exception as e:
+                # Full exception detail (message + traceback) is logged server-side
+                # at ERROR; the model channel gets only a generic message so internal
+                # detail (paths, stack frames, dependency internals) never leaks.
                 logger.error(f"Tool {name} failed: {e}", exc_info=True)
                 return [
                     TextContent(
                         type="text",
-                        text=json.dumps({"error": str(e)}),
+                        text=json.dumps({"error": f"Internal error handling tool: {name}"}),
                     )
                 ]
 
@@ -549,6 +596,24 @@ class HeadroomMCPServer:
                 TextContent(
                     type="text",
                     text=json.dumps({"error": "content parameter is required"}),
+                )
+            ]
+
+        # Reject oversized input before compressing it (OOM DoS guard). ``content``
+        # is text, so the cap is measured in characters against the same byte-scale
+        # ceiling used by headroom_read — well above any realistic tool output.
+        if len(content) > _MAX_READ_BYTES:
+            return [
+                TextContent(
+                    type="text",
+                    text=json.dumps(
+                        {
+                            "error": (
+                                f"Content too large to compress: {len(content)} chars "
+                                f"(limit {_MAX_READ_BYTES} chars)"
+                            )
+                        }
+                    ),
                 )
             ]
 
@@ -586,14 +651,14 @@ class HeadroomMCPServer:
         logger.info(
             "event=mcp_retrieve_started hash=%s query=%s",
             hash_key,
-            json.dumps(query, ensure_ascii=False, default=str),
+            _truncate_for_log(json.dumps(query, ensure_ascii=False, default=str)),
         )
         result = await self._retrieve_content(hash_key, query)
         logger.info(
             "event=mcp_retrieve_completed hash=%s query=%s result=%s",
             hash_key,
-            json.dumps(query, ensure_ascii=False, default=str),
-            json.dumps(result, ensure_ascii=False, default=str),
+            _truncate_for_log(json.dumps(query, ensure_ascii=False, default=str)),
+            _truncate_for_log(json.dumps(result, ensure_ascii=False, default=str)),
         )
 
         return [TextContent(type="text", text=json.dumps(result, indent=2))]
@@ -654,6 +719,28 @@ class HeadroomMCPServer:
             ]
 
         path = Path(file_path).expanduser().resolve()
+
+        # Path jail: confine reads to the workspace root (resolve() above already
+        # canonicalized symlinks, so a symlink pointing outside the root resolves
+        # outside it and is rejected here). The check runs BEFORE any exists/stat
+        # probe so an out-of-jail path cannot be used as a file-existence oracle.
+        # Log the attempted path server-side; return a generic message to the
+        # model channel (never echo the rejected path back).
+        root = _workspace_root()
+        if not path.is_relative_to(root):
+            logger.warning(
+                "event=mcp_read_path_rejected reason=outside_workspace "
+                "attempted=%s root=%s",
+                path,
+                root,
+            )
+            return [
+                TextContent(
+                    type="text",
+                    text=json.dumps({"error": "path outside workspace"}),
+                )
+            ]
+
         if not path.exists():
             return [
                 TextContent(
@@ -666,6 +753,33 @@ class HeadroomMCPServer:
                 TextContent(
                     type="text",
                     text=json.dumps({"error": f"Not a file: {file_path}"}),
+                )
+            ]
+
+        # Reject oversized files before reading them into memory (OOM DoS guard).
+        # stat() reports the true on-disk byte length, so we never allocate the
+        # payload for a file past the cap.
+        try:
+            size_bytes = path.stat().st_size
+        except OSError as e:
+            return [
+                TextContent(
+                    type="text",
+                    text=json.dumps({"error": f"Cannot read file: {e}"}),
+                )
+            ]
+        if size_bytes > _MAX_READ_BYTES:
+            return [
+                TextContent(
+                    type="text",
+                    text=json.dumps(
+                        {
+                            "error": (
+                                f"File too large to read: {size_bytes} bytes "
+                                f"(limit {_MAX_READ_BYTES} bytes)"
+                            )
+                        }
+                    ),
                 )
             ]
 
