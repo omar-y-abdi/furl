@@ -878,7 +878,7 @@ impl SmartCrusher {
                         } else {
                             0.0
                         };
-                        if saved >= SMALL_ARRAY_LOSSLESS_MIN_SAVED_BYTES
+                        if clears_small_array_lossless_floor(saved)
                             && savings_ratio >= self.config.lossless_min_savings_ratio
                         {
                             let kind = compaction_kind_str(&c);
@@ -1199,9 +1199,7 @@ impl SmartCrusher {
                         &Value::Array(json_form_items),
                     );
                     let compact_len = rendered.len() + 1 + sentinel_line.len();
-                    if json_form.len().saturating_sub(compact_len)
-                        >= LOSSY_SURVIVOR_RENDER_MIN_SAVED_BYTES
-                    {
+                    if clears_lossy_survivor_floor(json_form.len().saturating_sub(compact_len)) {
                         let kind = compaction_kind_str(&c);
                         let rendered_with_sentinel =
                             format!("{}\n{sentinel_line}", rendered.trim_end_matches('\n'));
@@ -1662,6 +1660,17 @@ fn annotate_dup_counts(
 /// 3-row toy array to save a dozen bytes is churn, not compression.
 const SMALL_ARRAY_LOSSLESS_MIN_SAVED_BYTES: usize = 256;
 
+/// Whether an absolute byte saving clears the small-array lossless floor
+/// (`>= SMALL_ARRAY_LOSSLESS_MIN_SAVED_BYTES`, inclusive). Extracted from the
+/// inline gate so the boundary is unit-testable directly (255/256/257) without
+/// crafting a renderer-byte-exact fixture through the whole crush pipeline — a
+/// directional fixture (well-above / well-below) would survive a `>=`→`>`
+/// operator mutation; the boundary test kills it.
+#[inline]
+fn clears_small_array_lossless_floor(saved: usize) -> bool {
+    saved >= SMALL_ARRAY_LOSSLESS_MIN_SAVED_BYTES
+}
+
 /// Divisor applied to `adaptive_k` for the lossy keep budget when a CCR
 /// store guarantees recovery of every dropped row. 2 (halving) keeps a
 /// meaningful visible sample while the critical signals (errors /
@@ -1678,6 +1687,15 @@ const CCR_BACKED_KEEP_FLOOR: usize = 5;
 /// Same churn-protection rationale as the small-array gate: re-encoding
 /// a handful of rows to save a few bytes is noise, not compression.
 const LOSSY_SURVIVOR_RENDER_MIN_SAVED_BYTES: usize = 64;
+
+/// Whether an absolute byte saving clears the lossy-survivor render floor
+/// (`>= LOSSY_SURVIVOR_RENDER_MIN_SAVED_BYTES`, inclusive). Extracted for the
+/// same reason as the small-array floor helper: the inclusive boundary
+/// (63/64/65) is unit-testable here without a pipeline-byte-exact fixture.
+#[inline]
+fn clears_lossy_survivor_floor(saved: usize) -> bool {
+    saved >= LOSSY_SURVIVOR_RENDER_MIN_SAVED_BYTES
+}
 
 /// Is the analyzer's `Skip` a "no SIGNAL on distinct data" skip (as
 /// opposed to a STRUCTURAL skip)?
@@ -1899,6 +1917,28 @@ mod tests {
         let result = c.crush_array(&items, "", 1.0);
         assert_eq!(result.strategy_info, "none:adaptive_at_limit");
         assert!(result.compacted.is_none());
+    }
+
+    // The two tests above pin the SMALL_ARRAY_LOSSLESS floor DIRECTIONALLY
+    // (well-above ships lossless, well-below stays passthrough). The two below
+    // pin the EXACT inclusive boundary of each absolute-saved gate. Because
+    // `saved = estimate_array_bytes - rendered.len()` is a coupled function of
+    // the compaction renderer's output, a byte-exact pipeline fixture would be
+    // brittle; testing the extracted predicate isolates the `>=` boundary
+    // cleanly and kills a `>=`→`>` operator mutation a directional fixture
+    // would survive.
+    #[test]
+    fn small_array_lossless_floor_boundary_is_inclusive_256() {
+        assert!(!clears_small_array_lossless_floor(255));
+        assert!(clears_small_array_lossless_floor(256));
+        assert!(clears_small_array_lossless_floor(257));
+    }
+
+    #[test]
+    fn lossy_survivor_floor_boundary_is_inclusive_64() {
+        assert!(!clears_lossy_survivor_floor(63));
+        assert!(clears_lossy_survivor_floor(64));
+        assert!(clears_lossy_survivor_floor(65));
     }
 
     #[test]
