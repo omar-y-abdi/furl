@@ -41,6 +41,27 @@ def test_b1a_bug24_exact_literal_with_empty_middle_row() -> None:
     ]
 
 
+def test_phantom_row_not_fabricated_after_skipped_row() -> None:
+    """A trailing blank line must NOT become a phantom row when an earlier
+    row was skipped-but-counted.
+
+    Single var col ``b`` + arith col ``a``, declared count 2. The first body
+    line ``=`` is a leading carry with no prior value → bad cell, skipped but
+    counts toward ``ordinal``. ``z`` is the one real row; the trailing newline
+    is an artifact, not a third value.
+
+    Before the fix the blank-line guard bounded on ``len(rows) < declared_count``
+    (kept-count, which lagged the skipped row), so the artifact decoded as a
+    phantom row with a fabricated arith value ``a = 0 + 5*2 = 10``. The guard
+    now bounds on the CONSUMED ``ordinal``, so no data is invented.
+
+    Mutation-sensitive: reverting the guard to ``len(rows)`` → a second
+    ``{"a": 10, "b": ""}`` row reappears.
+    """
+    result = decode_csv_schema_rows("[2]{a:int=0+5,b:string}\n=\nz\n")
+    assert result == [{"b": "z", "a": 5}]
+
+
 @pytest.mark.parametrize(
     "text,expected",
     [

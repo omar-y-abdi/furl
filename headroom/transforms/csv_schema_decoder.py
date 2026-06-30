@@ -485,10 +485,15 @@ def decode_csv_schema_rows(text: str) -> list[dict[str, Any]] | None:
             # carry their `,` separators, so they are never blank).
             # A bare `if not line: continue` would drop that row AND fail to
             # advance `ordinal`, so every later arith-fold value would shift.
-            # Bound emission by the declared row count so the trailing newline
-            # artifact (an extra `""` beyond row N) is not turned into a
-            # phantom row.
-            if len(var_cols) == 1 and len(rows) < declared_count:
+            # Bound emission by the declared row count using the CONSUMED
+            # `ordinal` (every row-line counts, including malformed/bad-cell
+            # rows that were skipped), NOT `len(rows)`: a skipped-but-counted
+            # row makes `len(rows)` lag the ordinal, which would let a trailing
+            # newline artifact (an extra `""` beyond row N) slip through as a
+            # phantom row with a fabricated arith value. On clean formatter
+            # output `ordinal == len(rows)`, so this is a no-op there; it only
+            # hardens against malformed/adversarial input.
+            if len(var_cols) == 1 and ordinal < declared_count:
                 # Fall through to the normal parse path: split_unquoted("")
                 # yields [""], which parses as the empty-string cell.
                 pass
