@@ -67,6 +67,6 @@ pub const DEFAULT_TTL: Duration = Duration::from_secs(300);
 // CCR marker construction lives in `markers.rs` — the single
 // construction point every Rust producer routes through. CCR *keys* are
 // computed at each producer's call site (the algorithm is per-producer
-// by design: BLAKE3 row hashes in the crusher, SHA-256 opaque prefixes
+// by design: SHA-256[:6] row hashes in the crusher, SHA-256 opaque prefixes
 // in the walker/formatter, MD5[:24] in the diff/log/search compressors).
 // Grammar and hashing are deliberately separate concerns.

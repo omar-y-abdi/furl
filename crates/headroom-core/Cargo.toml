@@ -24,8 +24,9 @@ hf-hub = { version = "0.4", default-features = false, features = ["ureq", "rustl
 # `md5` for the CCR cache_key. Python's compression_store hashes the original
 # diff with MD5 truncated to 24 hex chars; we must match byte-for-byte.
 md-5 = "0.10"
-# `sha2` for `_hash_field_name` in smart_crusher (SHA256 truncated to 16
-# hex chars). Python uses `hashlib.sha256` so we need byte-exact parity.
+# `sha2` for `hash_field_name` (SHA256 truncated to 8 hex chars) and the
+# crusher's row hashes (sha256[:6]). Python uses `hashlib.sha256` so we
+# need byte-exact parity.
 sha2 = "0.10"
 # `dashmap` for the CCR storage backend. Concurrent HashMap with sharded
 # locking — distinct keys hashed to different shards never contend, so
@@ -59,18 +60,6 @@ unidiff = "0.4"
 # happen as a post-filter on the byte offsets the automaton returns.
 # Default features (std, perf-literal) keep the build small.
 aho-corasick = "1"
-# `rayon` powers the pipeline orchestrator's parallel reformat-vs-bloat
-# evaluation: while a worker thread runs the structural reformat passes,
-# another set of threads run the per-offload bloat estimators in parallel.
-# Reformat completion + all bloat estimates need to be ready before the
-# orchestrator can decide which offloads to actually execute, so two-phase
-# join semantics (`rayon::join` + `par_iter`) are exactly what we need.
-rayon = "1"
-# `toml` reads the default pipeline configuration shipped at
-# `config/pipeline.toml`. The defaults embed via `include_str!` so a
-# stock binary needs no external file; production deployments override
-# by loading their own TOML at startup.
-toml = "0.8"
 # `rusqlite` for the SQLite-backed CCR store (the production default).
 # `bundled` builds SQLite from source so deploys do not need a system
 # libsqlite3 — matters for Lambda / container builds where the host
@@ -78,11 +67,6 @@ toml = "0.8"
 # connection-open time (see `ccr/backends/sqlite.rs`); no extra feature
 # flags required.
 rusqlite = { version = "0.32", features = ["bundled"] }
-# `http` powers the auth-mode classifier (Phase F PR-F1). The proxy
-# crate already depends on this — pulling it into core lets the
-# classifier live with the other Phase B/F policy primitives without
-# cycling through the proxy crate. Tiny crate (no I/O, just types).
-http = "1"
 
 [features]
 # Default is ML-free: no ONNX runtime, no `ort`/`ort-sys`. Every default
