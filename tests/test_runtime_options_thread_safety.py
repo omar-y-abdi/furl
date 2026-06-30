@@ -168,11 +168,17 @@ class TestCompressConcurrentDifferentConfigs:
         # Distinct per-call runtime options. compress() routes these through
         # the SHARED module-level pipeline (one ContentRouter/SmartCrusher),
         # which is exactly where the race lived.
+        # force_kompress is a RouterRuntime knob, NOT a public compress() kwarg —
+        # public compress() rejects unknown kwargs (compress.py), and through it
+        # force_kompress was always a silent no-op. Its concurrent isolation is
+        # covered separately above via router.compress(runtime=RouterRuntime(...)).
+        # Here the distinct target_ratio per case is what exercises cross-thread
+        # option isolation through the shared module-level pipeline.
         cases = [
-            {"target_ratio": 0.2, "force_kompress": False},
-            {"target_ratio": 0.5, "force_kompress": True},
-            {"target_ratio": 0.8, "force_kompress": False},
-            {"target_ratio": 0.3, "force_kompress": True},
+            {"target_ratio": 0.2},
+            {"target_ratio": 0.5},
+            {"target_ratio": 0.8},
+            {"target_ratio": 0.3},
         ]
         # Repeat each case so threads genuinely overlap on the shared pipeline.
         work = [(i % len(cases), _make_messages(i)) for i in range(N_THREADS)]
@@ -193,7 +199,7 @@ class TestCompressConcurrentDifferentConfigs:
 
         # Each concurrent call must produce exactly what it produces serially.
         # If runtime options bled across threads, a call would be compressed
-        # under a foreign target_ratio/force_kompress and diverge.
+        # under a foreign target_ratio and diverge.
         for idx in range(len(work)):
             assert concurrent[idx] == serial[idx], (
                 f"call {idx} diverged under concurrency — runtime options leaked"

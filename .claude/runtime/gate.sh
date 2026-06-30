@@ -8,18 +8,26 @@ cd /Users/k/dev/headroom
 PY=.venv/bin/python
 fail=0
 
+# Gate checks key on the EXIT CODE, never on grepping output. cargo/pytest exit
+# nonzero on compile error, test failure, collection error, OR an unrecognized
+# arg — a previous grep-on-`tail` version silently PASSED when `--timeout` was
+# unrecognized (pytest-timeout uninstalled) because pytest bailed before running
+# a single test and the error line scrolled past `tail -3`. Exit code can't lie.
 echo "=== G1 cargo (headroom-core) ==="
-if cargo test -p headroom-core 2>&1 | grep -E 'test result:' | grep -qv ' 0 failed'; then
-  echo "G1 FAIL: a cargo suite reported failures"; fail=1
-else
+if cargo test -p headroom-core >/tmp/gate_g1.log 2>&1; then
   echo "G1 PASS"
+else
+  echo "G1 FAIL: cargo exited nonzero (compile error or test failure)"; tail -5 /tmp/gate_g1.log; fail=1
 fi
 
 echo "=== G2 pytest (full) ==="
-if $PY -m pytest tests/ -q --no-header -p no:cacheprovider --timeout=180 2>&1 | tail -3 | grep -qE '[0-9]+ failed|error'; then
-  echo "G2 FAIL: pytest failures"; fail=1
-else
+# --timeout needs pytest-timeout; add it only if importable so a stripped env
+# degrades to no-timeout instead of silently skipping the whole suite.
+G2_TIMEOUT=""; $PY -c "import pytest_timeout" 2>/dev/null && G2_TIMEOUT="--timeout=180"
+if $PY -m pytest tests/ -q --no-header -p no:cacheprovider $G2_TIMEOUT >/tmp/gate_g2.log 2>&1; then
   echo "G2 PASS"
+else
+  echo "G2 FAIL: pytest exited nonzero (failure/error/collection)"; tail -5 /tmp/gate_g2.log; fail=1
 fi
 
 echo "=== G3 surface-walk ==="
