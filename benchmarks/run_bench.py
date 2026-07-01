@@ -6,12 +6,16 @@ Produces the Phase-2 baseline:
 - Needle-recall (two regimes: search=lossless, logs=lossy) — both the
   "visible in output" recall and the "output OR CCR-recoverable" recall.
 
-Writes machine-readable ``benchmarks/baseline_results.json`` and human
-``benchmarks/BASELINE.md`` (methodology + numbers + data provenance).
+By default writes to a temporary directory so it NEVER clobbers the committed
+``benchmarks/baseline_results.json`` / ``benchmarks/BASELINE.md``.  Pass
+``--out <dir>`` to redirect output (e.g. ``--out benchmarks`` to re-baseline
+in-place, then commit).
 
 Deterministic and re-runnable::
 
-    .venv/bin/python -m benchmarks.run_bench
+    .venv/bin/python -m benchmarks.run_bench               # writes to DEFAULT_OUT_DIR
+    .venv/bin/python -m benchmarks.run_bench --out /tmp/x  # writes to /tmp/x/
+    .venv/bin/python -m benchmarks.run_bench --out benchmarks  # in-place (re-baseline)
 """
 
 from __future__ import annotations
@@ -20,6 +24,7 @@ import json
 import platform
 import subprocess
 import sys
+import tempfile
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -38,9 +43,15 @@ from benchmarks.needle_recall import (
 )
 
 HERE = Path(__file__).resolve().parent
+# Committed baseline files — these are the floor.  Default run NEVER writes here.
 RESULTS_JSON = HERE / "baseline_results.json"
 BASELINE_MD = HERE / "BASELINE.md"
 DATA_DIR = HERE / "data"
+
+# Default out-dir for normal (non-re-baselining) runs.
+# floor_check.py uses the same constant so the two ends stay in sync.
+# Must be outside benchmarks/ so default runs leave `git status benchmarks/` clean.
+DEFAULT_OUT_DIR: Path = Path(tempfile.gettempdir()) / "headroom_bench"
 
 
 # ---------------------------------------------------------------------------
@@ -302,20 +313,41 @@ def render_baseline_md(payload: dict[str, object]) -> str:
 def main(argv: list[str] | None = None) -> int:
     """Run the full suite, print the table, write JSON + BASELINE.md.
 
-    By default measures off the COMMITTED snapshots under benchmarks/data/
-    (fully deterministic). Pass ``--refresh`` to re-capture live from the
-    local sources (git/rg/files) and overwrite the snapshots — only do this
-    when intentionally re-baselining, then re-commit the snapshots.
+    Measures off the COMMITTED snapshots under benchmarks/data/ (deterministic).
+    Pass ``--refresh`` to re-capture live from local sources and overwrite the
+    snapshots — only do this when intentionally re-baselining, then commit them.
+
+    ``--out <dir>`` redirects where baseline_results.json and BASELINE.md are
+    written.  Defaults to DEFAULT_OUT_DIR (a temp dir) so a plain invocation
+    NEVER dirties the committed baseline files.
     """
-    args = sys.argv[1:] if argv is None else argv
+    args = list(sys.argv[1:] if argv is None else argv)
     refresh = "--refresh" in args
 
-    # Capture once if no snapshot exists yet, or when explicitly refreshing.
-    snapshots_exist = all(
-        (DATA_DIR / f"{name}.raw.json").exists()
+    # Parse --out <dir>
+    out_dir = DEFAULT_OUT_DIR
+    if "--out" in args:
+        idx = args.index("--out")
+        if idx + 1 >= len(args):
+            print("ERROR: --out requires a directory argument", file=sys.stderr)
+            return 1
+        out_dir = Path(args[idx + 1])
+
+    # Fail loudly if any snapshot is missing — never silently re-capture.
+    missing = [
+        name
         for name in ("code", "logs", "search")
-    )
-    if refresh or not snapshots_exist:
+        if not (DATA_DIR / f"{name}.raw.json").exists()
+    ]
+    if missing and not refresh:
+        print(
+            f"ERROR: committed snapshots missing: {missing}\n"
+            f"  Re-run with --refresh to capture them, then commit benchmarks/data/.",
+            file=sys.stderr,
+        )
+        return 1
+
+    if refresh:
         ds_mod.all_datasets(refresh=True)
 
     cases = run_datasets()
@@ -324,11 +356,14 @@ def main(argv: list[str] | None = None) -> int:
     print_table(cases, needles)
 
     payload = build_results_payload(cases, needles)
-    RESULTS_JSON.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-    BASELINE_MD.write_text(render_baseline_md(payload), encoding="utf-8")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    results_json = out_dir / "baseline_results.json"
+    baseline_md = out_dir / "BASELINE.md"
+    results_json.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    baseline_md.write_text(render_baseline_md(payload), encoding="utf-8")
 
-    print(f"\nWrote {RESULTS_JSON.relative_to(HERE.parent)}")
-    print(f"Wrote {BASELINE_MD.relative_to(HERE.parent)}")
+    print(f"\nWrote {results_json}")
+    print(f"Wrote {baseline_md}")
     return 0
 
 

@@ -1,24 +1,41 @@
 #!/usr/bin/env python3
-"""Compare freshly-written benchmarks/baseline_results.json against the committed
-floor (git HEAD). PASS iff every dataset's lossless_reduction + information_retention
-is >= floor (within epsilon) and needle-recall (output OR CCR) == 100%.
+"""Compare a freshly-written benchmark capture against the committed floor (git HEAD).
 
-Run AFTER `python -m benchmarks.run_bench` (which overwrites baseline_results.json),
-then restore the baseline files. Exit 0 = PASS (no regression), 1 = FAIL.
+PASS iff every dataset's lossless_reduction + information_retention is >= floor
+(within epsilon) and needle-recall (output OR CCR) == 100%.
+
+Run AFTER `python -m benchmarks.run_bench` (which writes to DEFAULT_OUT_DIR by
+default, NOT to benchmarks/).  The committed baseline_results.json is the floor;
+the fresh capture is read from DEFAULT_OUT_DIR (or --cur <path>).
+
+Exit 0 = PASS (no regression), 1 = FAIL.
+
+Usage:
+    python .claude/runtime/floor_check.py
+    python .claude/runtime/floor_check.py --cur /tmp/my_out/baseline_results.json
 """
 from __future__ import annotations
 
 import json
 import subprocess
 import sys
+import tempfile
+from pathlib import Path
 
 EPS = 1e-6
-CUR_PATH = "benchmarks/baseline_results.json"
+
+# The committed baseline in the repo — used as the floor via `git show`.
+# This path is relative to the repo root (for `git show HEAD:<path>`).
+FLOOR_COMMITTED = "benchmarks/baseline_results.json"
+
+# Default location where run_bench writes its fresh capture (must match
+# DEFAULT_OUT_DIR in benchmarks/run_bench.py).
+_DEFAULT_CUR: Path = Path(tempfile.gettempdir()) / "headroom_bench" / "baseline_results.json"
 
 
 def _load_committed() -> dict:
     raw = subprocess.run(
-        ["git", "show", f"HEAD:{CUR_PATH}"],
+        ["git", "show", f"HEAD:{FLOOR_COMMITTED}"],
         capture_output=True, text=True, check=True,
     ).stdout
     return json.loads(raw)
@@ -29,8 +46,24 @@ def _by_name(doc: dict) -> dict[str, dict]:
 
 
 def main() -> int:
+    # Parse optional --cur <path>
+    cur_path = _DEFAULT_CUR
+    args = sys.argv[1:]
+    if "--cur" in args:
+        idx = args.index("--cur")
+        if idx + 1 >= len(args):
+            print("ERROR: --cur requires a path argument", file=sys.stderr)
+            return 1
+        cur_path = Path(args[idx + 1])
+
+    if not cur_path.exists():
+        print("FLOOR CHECK: FAIL")
+        print(f"  - current capture not found: {cur_path}")
+        print(f"    Run `python -m benchmarks.run_bench` first.")
+        return 1
+
     floor = _load_committed()
-    cur = json.load(open(CUR_PATH))
+    cur = json.load(open(cur_path))
 
     # Reject stale captures: if the timestamp hasn't changed, run_bench didn't
     # actually write a fresh measurement (e.g. it crashed before writing output).
