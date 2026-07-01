@@ -25,7 +25,7 @@ from pathlib import Path
 
 from benchmarks import datasets as ds_mod
 from benchmarks.imp2_ab import Imp2AB, measure_imp2_ab
-from benchmarks.metrics import BENCH_MODEL, CaseMetrics, measure_case
+from benchmarks.metrics import BENCH_MODEL, CaseMetrics, measure_case, measure_conversation_case
 from benchmarks.needle_recall import NeedleResult, recall_rate, run_needle_recall
 from benchmarks.run_bench import git_commit, print_table, snapshot_provenance
 
@@ -38,12 +38,17 @@ _REQUIRED_SNAPSHOTS = ("code", "logs", "search", "repeated_logs")
 
 
 def run_datasets() -> list[CaseMetrics]:
-    """Measure every real dataset (incl. repeated_logs) at default cardinality."""
+    """Measure every real dataset (incl. repeated_logs) at default cardinality.
+
+    Single-tool datasets use ``measure_case``; multi-turn conversation datasets
+    use ``measure_conversation_case`` (mirrors run_bench.run_datasets).
+    """
     results: list[CaseMetrics] = []
     for dataset in ds_mod.all_datasets():
         name = f"{dataset.name}@{len(dataset.items)}"
+        measure = measure_conversation_case if dataset.conversation else measure_case
         results.append(
-            measure_case(name, dataset.query, dataset.items, dataset.messages)
+            measure(name, dataset.query, dataset.items, dataset.messages)
         )
     return results
 
@@ -103,13 +108,24 @@ def build_payload(
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = sys.argv[1:] if argv is None else argv
+    args = list(sys.argv[1:] if argv is None else argv)
     refresh = "--refresh" in args
 
-    snapshots_exist = all(
-        (DATA_DIR / f"{name}.raw.json").exists() for name in _REQUIRED_SNAPSHOTS
-    )
-    if refresh or not snapshots_exist:
+    # Fail loudly if any required snapshot is missing — never silently re-capture.
+    missing = [
+        name
+        for name in _REQUIRED_SNAPSHOTS
+        if not (DATA_DIR / f"{name}.raw.json").exists()
+    ]
+    if missing and not refresh:
+        print(
+            f"ERROR: committed snapshots missing: {missing}\n"
+            f"  Re-run with --refresh to capture them, then commit benchmarks/data/.",
+            file=sys.stderr,
+        )
+        return 1
+
+    if refresh:
         ds_mod.all_datasets(refresh=True)
 
     cases = run_datasets()
