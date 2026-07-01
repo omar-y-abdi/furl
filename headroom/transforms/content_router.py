@@ -1755,6 +1755,11 @@ class ContentRouter(Transform):
                 case Recompute():
                     # Defer to the parallel compression pass (Pass 2/3).
                     pending_tasks.append((i, content, context, msg_bias, content_key))
+                case other:
+                    raise RuntimeError(
+                        f"_lookup_cached_disposition returned unexpected "
+                        f"CacheDisposition {other!r}"
+                    )
 
         # --- Pass 2: Parallel compression of all cache-miss messages ---
         if pending_tasks:
@@ -2039,6 +2044,11 @@ class ContentRouter(Transform):
                 return {**block, block_key: served}, True
             case Recompute():
                 pass  # fall through to full compression below
+            case other:
+                raise RuntimeError(
+                    f"_lookup_cached_disposition returned unexpected "
+                    f"CacheDisposition {other!r}"
+                )
 
         # Recompute (cache miss or evicted stale sentinel). All cache bookkeeping
         # — skip/stale/miss counters and any eviction — already happened inside
