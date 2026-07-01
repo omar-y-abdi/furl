@@ -21,11 +21,10 @@ Two test families:
 
 Note on "colons-in-keys": the Rust formatter CSV-quotes column names
 containing special characters into the ``[N]{...}`` declaration, but
-``_HEADER_RE`` has no DOTALL so the current decoder cannot reconstruct
-a key whose name contains a literal colon (since the header grammar
-``name:type`` splits on the FIRST colon).  This is a pre-existing
-limitation — not the defect this unit fixes — so the fuzz generator
-uses colon in VALUES instead.
+the current decoder cannot reconstruct a key whose name contains a
+literal colon (the header grammar ``name:type`` splits on the FIRST
+colon).  This is a pre-existing limitation — not the defect this unit
+fixes — so the fuzz generator uses colon in VALUES instead.
 
 Acceptance criteria:
   - Every embedded-newline/comma-in-cell row reconstructs to deep equality.
@@ -149,6 +148,10 @@ def _make_adversarial_rows(rng: random.Random, n_rows: int) -> list[dict]:
       - Absent keys (the ``__missing__`` sentinel path)
       - Unicode (emoji, CJK, RTL)
       - Multi-line stack-trace style values (the primary Cluster-A shape)
+      - An all-rows-identical multiline-string column that constant-folds
+        into a CSV-quoted declaration containing a newline (COR-1 shape)
+      - A head-dict path column whose unique tails carry a comma and a
+        double-quote, so every encoded row cell is CSV-quoted (COR-2 shape)
 
     JSON ``null``, an absent key, and the empty string ``""`` are now
     encoded distinctly by the Rust formatter (the reserved ``__null__`` /
@@ -167,6 +170,12 @@ def _make_adversarial_rows(rng: random.Random, n_rows: int) -> list[dict]:
         "中文",
         "한국어",
     ]
+    # All-rows-identical multiline value: ``stamp_constant_columns`` folds it
+    # and ``const_decl_value`` CSV-quotes it INTO the ``[N]{...}`` declaration,
+    # so the header logical line carries an embedded newline (COR-1 shape).
+    BANNER = "fuzz banner line one\nfuzz banner line two"
+    # Low-cardinality path roots for the head-dict column (COR-2 shape).
+    HEAD_ROOTS = ["svc/api", "svc/worker", "lib/core"]
     rows = []
     for i in range(n_rows):
         choice = rng.randint(0, 8)
@@ -236,7 +245,18 @@ def _make_adversarial_rows(rng: random.Random, n_rows: int) -> list[dict]:
                 ),
                 "tag": f"tag-{i % 5}",
             }
-        rows.append(row)
+        # The two decoder-regression shapes ride along on EVERY row (see the
+        # focused COR-1 / COR-2 tests above the fuzz section):
+        #   - ``banner``: identical multiline text in all rows — the header
+        #     declaration itself carries a CSV-quoted newline.
+        #   - ``path``: head-dict column (few ``<root>/`` heads, unique tails)
+        #     whose tails carry a comma AND a double-quote, so every encoded
+        #     ``<idx><delim><tail>`` row cell ships CSV-quoted.
+        rows.append({
+            **row,
+            "banner": BANNER,
+            "path": f'{HEAD_ROOTS[i % len(HEAD_ROOTS)]}/job {i}, "part {i % 4}".log',
+        })
     return rows
 
 
@@ -496,6 +516,80 @@ def test_literal_sentinel_string_value_round_trips_as_string() -> None:
     assert rows[1]["a"] == "__missing__", (
         f"literal '__missing__' became {rows[1].get('a')!r} (key present={'a' in rows[1]})"
     )
+
+
+# ────────────── Test #1c — COR-1 / COR-2 decoder regressions ──────────────────
+
+
+def test_multiline_string_constant_column_round_trips_lossless() -> None:
+    """COR-1: a constant column whose value contains a newline must decode.
+
+    ``stamp_constant_columns`` folds ANY all-rows-identical scalar except
+    null / the empty string — multiline strings included — and
+    ``const_decl_value`` CSV-quotes the value INTO the ``[N]{...}``
+    declaration, so the header LOGICAL line legally carries an embedded
+    newline.  Before the fix ``_HEADER_RE`` lacked ``re.DOTALL``: ``(.+)``
+    could not span that newline, the header failed to match, and
+    ``decode_csv_schema_rows`` returned ``None`` — 100% silent,
+    unrecoverable loss with no CCR sentinel.
+    """
+    items = [
+        {"id": i, "msg": f"event {i} ok", "note": "line1\nline2"}
+        for i in range(60)
+    ]
+
+    text = _compress_to_text(items)
+    # The trigger shape: the declaration itself carries the quoted newline
+    # (the first PHYSICAL line ends mid-constant).
+    header_physical = text.split("\n", 1)[0]
+    assert 'note:string="line1' in header_physical, (
+        f"expected the multiline constant folded into the declaration; "
+        f"got header {header_physical!r}"
+    )
+
+    rows = decode_csv_schema_rows(text)
+    assert rows is not None, (
+        "decode_csv_schema_rows returned None: the [N]{...} header regex "
+        "did not match a declaration containing a CSV-quoted newline.\n"
+        f"First physical line: {header_physical!r}"
+    )
+    assert len(rows) == len(items), (
+        f"{len(items) - len(rows)}/{len(items)} row(s) lost"
+    )
+    assert rows == items, "reconstructed rows are not byte-exact"
+
+
+def test_head_dict_cell_with_csv_quoted_tail_round_trips_lossless() -> None:
+    """COR-2: a CSV-quoted head-dict cell must be unquoted before decoding.
+
+    The formatter renders a head-dict row cell as ``<idx><delim><tail>``
+    passed through ``csv_render_str`` — a tail containing a comma or a
+    double-quote ships CSV-quoted (e.g. ``"0/file 0, part.rs"``).  Before
+    the fix the decoder passed the still-quoted cell straight to
+    ``_decode_head_cell``, whose leading-digit scan fails on ``"`` — every
+    such row was skipped: 0 rows recovered, silently, with no CCR sentinel.
+    """
+    items = [
+        {"id": i, "path": f"{'src' if i % 2 == 0 else 'lib'}/file {i}, part.rs"}
+        for i in range(20)
+    ]
+
+    text = _compress_to_text(items)
+    # The trigger shape: a head-dict declaration and CSV-quoted row cells.
+    assert "path:string@" in text.split("\n", 1)[0], (
+        f"expected a head-dict declaration; got:\n{text[:200]}"
+    )
+    assert '"0/file 0, part.rs"' in text, (
+        f"expected a CSV-quoted head-dict cell; got:\n{text[:300]}"
+    )
+
+    rows = decode_csv_schema_rows(text)
+    assert rows is not None
+    assert len(rows) == len(items), (
+        f"{len(items) - len(rows)}/{len(items)} head-dict rows skipped "
+        f"(quoted cell not unquoted before the head-index digit scan)"
+    )
+    assert rows == items, "reconstructed rows are not byte-exact"
 
 
 # ───────────────────────── Test #2 — Property / fuzz ──────────────────────────

@@ -69,7 +69,10 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-_HEADER_RE = re.compile(r"^\[(\d+)\]\{(.+)\}$")
+# DOTALL: a folded string constant may legally carry a newline inside its
+# CSV-quoted declaration value (the formatter's ``const_decl_value``), so
+# ``(.+)`` must span newlines within the header LOGICAL line.
+_HEADER_RE = re.compile(r"^\[(\d+)\]\{(.+)\}$", re.DOTALL)
 _ARITH_RE = re.compile(r"^(-?\d+)\+(-?\d+)$")
 _ISO_RE = re.compile(
     r"^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(Z|[+-]\d{2}:\d{2})$"
@@ -542,7 +545,12 @@ def decode_csv_schema_rows(text: str) -> list[dict[str, Any]] | None:
                 continue
             if spec.head_dict:
                 hd = head_dicts.get(spec.name)
-                value = _decode_head_cell(resolved, hd)
+                # ``resolved`` is the raw CSV cell — still wrapped in quotes
+                # if the tail contained a comma/quote/newline. Unquote BEFORE
+                # the head-index digit scan (a leading ``"`` fails it and the
+                # row is silently skipped), exactly like the affix branch
+                # below; ``_unq`` is the identity for unquoted cells.
+                value = _decode_head_cell(_unq(resolved), hd)
                 if value is None:
                     ok = False  # never invent data on a bad head cell
                     break
