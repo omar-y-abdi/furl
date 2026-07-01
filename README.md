@@ -8,7 +8,7 @@
                   The context compression layer for AI agents
 </pre></div>
 
-<p align="center"><strong>60–95% fewer tokens · library · MCP · 6 algorithms · local-first · reversible</strong></p>
+<p align="center"><strong>60–95% fewer tokens on redundant workloads · library · MCP · local-first · reversible</strong></p>
 
 <p align="center">
   <a href="https://pypi.org/project/headroom-ai/"><img src="https://img.shields.io/pypi/v/headroom-ai.svg" alt="PyPI"></a>
@@ -55,7 +55,7 @@ Headroom compresses everything your AI agent reads — tool outputs, logs, RAG c
     │  CacheAligner  →  ContentRouter  →  CCR            │
     │                    ├─ SmartCrusher   (JSON)        │
     │                    ├─ CodeCompressor (AST)         │
-    │                    └─ Kompress-base  (text, HF)    │
+    │                    └─ Kompress-v2-base  (text, HF) │
     │                                                    │
     │  Reversible CCR store  ·  MCP server               │
     └────────────────────────────────────────────────────┘
@@ -65,7 +65,7 @@ Headroom compresses everything your AI agent reads — tool outputs, logs, RAG c
 ```
 
 - **ContentRouter** — detects content type, selects the right compressor
-- **SmartCrusher / CodeCompressor / Kompress-base** — compress JSON, AST, or prose
+- **SmartCrusher / CodeCompressor / Kompress-v2-base** — compress JSON, AST, or prose
 - **CacheAligner** — stabilizes prefixes so provider KV caches actually hit
 - **CCR** — stores originals locally; LLM calls `headroom_retrieve` if it needs them
 
@@ -92,7 +92,7 @@ result = compress(messages, model="claude-sonnet-4")
 python -m headroom.ccr.mcp_server       # exposes headroom_compress / _retrieve / _stats
 ```
 
-Granular extras: `[mcp]`, `[ml]` (Kompress-base), `[html]`, `[dev]`. Requires **Python 3.10+**.
+Granular extras: `[mcp]`, `[ml]` (Kompress-v2-base), `[html]`, `[dev]`. Requires **Python 3.10+**.
 
 ## Proof
 
@@ -134,7 +134,7 @@ The table above is a single conservative capture (lossless structural folding, m
 
 - **SmartCrusher** — universal JSON: arrays of dicts, nested objects, mixed types.
 - **CodeCompressor** — AST-aware for Python, JS, Go, Rust, Java, C++.
-- **Kompress-base** — our HuggingFace model, trained on agentic traces.
+- **Kompress-v2-base** — our HuggingFace model, trained on agentic traces.
 - **CacheAligner** — stabilizes prefixes so Anthropic/OpenAI KV caches actually hit.
 - **IntelligentContext** — score-based context fitting with learned importance.
 - **CCR** — reversible compression; LLM retrieves originals on demand.
@@ -148,7 +148,7 @@ The table above is a single conservative capture (lossless structural folding, m
 
 `Input Received` → `Input Routed` → `Input Compressed`
 
-- **Transforms** do the work: CacheAligner, ContentRouter, SmartCrusher, CodeCompressor, Kompress-base, IntelligentContext / RollingWindow.
+- **Transforms** do the work: CacheAligner, ContentRouter, SmartCrusher, CodeCompressor, Kompress-v2-base, IntelligentContext / RollingWindow.
 - **Pipeline extensions** observe or customize these stages via `on_pipeline_event(...)`; `compress()` passes your `hooks` object as the extension.
 - **Compression hooks** sit alongside the lifecycle as an additional extension seam.
 
@@ -160,7 +160,7 @@ The table above is a single conservative capture (lossless structural folding, m
 pip install "headroom-ai[all]"          # everything
 ```
 
-Granular extras: `[mcp]` (MCP server), `[ml]` (Kompress-base), `[html]` (HTML extraction), `[dev]`. Requires **Python 3.10+**.
+Granular extras: `[mcp]` (MCP server), `[ml]` (Kompress-v2-base), `[html]` (HTML extraction), `[dev]`. Requires **Python 3.10+**.
 
 Using `pipx`? Choose a supported interpreter explicitly:
 
@@ -190,7 +190,7 @@ Two runtime assets are fetched over TLS; if they are blocked, trust your corpora
 
 - **`cdn.pyke.io`** — the ONNX Runtime for the Rust core. Alternatively pre-provide it with
   `ORT_STRATEGY=system` and `ORT_LIB_LOCATION=/path/to/onnxruntime`.
-- **`huggingface.co`** — the `kompress-base` compression model. Pre-download it and run with
+- **`huggingface.co`** — the `chopratejas/kompress-v2-base` compression model. Pre-download it and run with
   `HF_HUB_OFFLINE=1`, or set `HF_ENDPOINT` to a trusted mirror.
 
 Running with compression disabled requires neither asset.

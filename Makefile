@@ -24,7 +24,7 @@ help:
 	@echo "  make ci-precheck-rust   - cargo fmt --check + clippy + test"
 	@echo "  make ci-precheck-python - build the extension + run the python suite"
 	@echo "  make ci-precheck-commitlint - lint commits since origin/main"
-	@echo "  make install-git-hooks  - install a pre-push hook that runs ci-precheck"
+	@echo "  make install-git-hooks  - install pre-commit hooks (ruff/format/mypy on every commit)"
 
 test:
 	$(CARGO) test --workspace
@@ -64,7 +64,8 @@ clean:
 # These targets run the same checks GitHub Actions runs, locally. The intent
 # is: if `make ci-precheck` is green, `git push` will not turn red.
 #
-# Run before EVERY `git push`. Install the git hook (one-time) with:
+# Run `make ci-precheck` before EVERY `git push`. Install the pre-commit hooks
+# (ruff/format/mypy on every commit) one-time with:
 #   make install-git-hooks
 
 ci-precheck: ci-precheck-rust ci-precheck-python ci-precheck-commitlint
@@ -104,4 +105,4 @@ ci-precheck-commitlint:
 		commitlint --from origin/main --to HEAD --config .commitlintrc.json
 
 install-git-hooks:
-	@scripts/install-git-hooks.sh
+	@pre-commit install
