@@ -75,6 +75,30 @@ Exec steps (advisor-refined) — extraction DONE `92088258`:
 ## Current position
 HEAD = `1d8a69e9` (ML→Kompress rename); site-3 extraction `92088258` + format guards `0844692f`.
 Gated-GREEN (G1-G5 incl. bench, 750 passed, recovery 23, floor needle 100%), zero uncommitted code.
-Cycle-6 code work COMPLETE (extraction + rename both landed). Remaining = VERIFY-phase:
-- [ ] **Round-3 re-recon** — IN PROGRESS. Diff-weighted `a341bf4f..HEAD` → confirm zero MATERIAL (by-design/nitpick don't count). Loop if material.
+Cycle-6 CODE work COMPLETE (extraction + rename). Round-3 re-recon DONE → found MATERIAL (doc-integrity, not code).
+
+## Round-3 re-recon — findings (3 opus agents, diff-weighted a341bf4f..HEAD)
+CODE verdict: **zero material** — extraction behavior-equivalent (all 5 outcomes' counters preserved, CCR guard intact, match totality holds), rename zero code stragglers, Rust 0 warnings, public API honest (39 exports resolve), CacheDisposition ADT exemplary+correctly-private. The material is ALL in the doc/packaging surface:
+
+| id | sev | class | file | fix |
+|---|---|---|---|---|
+| M1 | P1 | MATERIAL | `.pre-commit-config.yaml` + RUST_DEV.md:148 | live hook runs ABSENT `scripts/sync-plugin-versions.py` → fails every commit; doc claims it works. DELETE dead hook + doc bullet. |
+| M2 | P1 | MATERIAL (my batch) | CODEBASE-MAP.md | content_router.py line refs stale ~+36 (extraction `92088258` shifted lines, map never re-anchored) + compress.py:191→197. RE-ANCHOR all. |
+| M3 | P1 | MATERIAL | README.md:109-117 | accuracy table (GSM8K/TruthfulQA/SQuAD/BFCL) UNBACKED — verified: numbers exist only in README/llms/archive, BENCHMARKS.md has zero accuracy content. |
+| M4 | P1 | MATERIAL | README.md:219 | RTK "ships with binary / first-class part of our stack" FALSE — no rtk anywhere; was excised. Rewrite → comparison peer. |
+| M5 | P1 | MATERIAL | README.md:100-107 | headline "Proof" savings table UNBACKED — 17,765→1,408 etc. match nothing. Real backed data = BASELINE.md (code@7 0%, logs@90 84.5% deletion-inflated/CCR-recoverable, search@90 40%). |
+| M6 | P2 | MATERIAL | llms.txt:41 | telemetry "enabled by default" over-claims (beacon removed, local-only on-disk now) + phantom `--no-telemetry` flag (only `HEADROOM_TELEMETRY=off` real). |
+| M7 | P2 | MATERIAL | pyproject.toml:74-77 (+README:96,172) | `[progress]` extra inert — pulls `rich` for `headroom.binaries` which DOESN'T EXIST. Remove extra + mentions. |
+| M8 | P2 | MATERIAL | README.md:24 | `ENTERPRISE.md` nav = dead 404 (only archive/ has it). Remove nav entry. |
+| N1 | P3 | NIT (my batch) | content_router.py:~1277 | `_ensure_ccr_backed` docstring "three result-cache HIT sites" → now ONE (extraction collapsed). |
+| N2 | P3 | NIT | content_router.py:10-11 | module docstring lists KompressCompressor twice. Collapse. |
+| N3 | P3 | NIT | compress.py:202 | `hooks: Any=None` → `CompressionHooks\|None=None` (public type, per RULES no-lie-signatures). |
+
+BY-DESIGN (no fix): bump() widening (no-op); StorageError+5 exceptions exported-never-raised (public API design call); pyproject version 0.25 vs runtime 0.26 (git-computed, correct).
+
+Batch-fix plan: mechanical/clear-cut (M1,M2,M6,M7,M8,N1,N2,N3) fix autonomously. README Proof/accuracy tables (M3,M4,M5) = outward-facing headline → surfaced to user for shape (delete vs replace-with-honest-BASELINE). Then re-recon round-4 (confirm zero material) → confirmation workflow.
+
+## Remaining
+- [ ] Batch-fix round-3 material (mechanical + README-per-user-choice) → gate → commit.
+- [ ] **Round-4 re-recon** — confirm zero MATERIAL after doc batch.
 - [ ] **200-agent confirmation workflow** — ONLY after re-recon confirms beyond-perfect. Confirmation, never discovery.
