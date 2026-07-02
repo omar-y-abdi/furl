@@ -662,9 +662,15 @@ fn new_file_regex() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r"^\+\+\+ (b/(.+)|/dev/null)$").expect("static regex compiles"))
 }
 
+/// Matches both git's `Binary files a/x and b/x differ` and the
+/// compressor's own bare `Binary files differ` output form
+/// (fixed_in_cor27: the old `.+`-form required ≥1 char between
+/// "files " and " differ", so recompressing compressor output silently
+/// dropped the marker). Tolerates a trailing `\r` left behind when CRLF
+/// input is split on `\n`.
 fn binary_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"^Binary files .+ differ$").expect("static regex compiles"))
+    RE.get_or_init(|| Regex::new(r"^Binary files (.+ )?differ\r?$").expect("static regex compiles"))
 }
 
 /// Parser output: pre-diff content (commit headers, email headers from
@@ -1385,6 +1391,48 @@ mod tests {
         assert_eq!(
             stats.binary_files_simplified[0],
             "Binary files a/img.png and b/img.png differ"
+        );
+    }
+
+    #[test]
+    fn fixed_in_cor27_bare_binary_marker_survives_recompression() {
+        // The emitter's own output form (`Binary files differ`, no
+        // filenames) failed the old `^Binary files .+ differ$` regex
+        // (which required ≥1 char between "files " and " differ"), so
+        // recompressing compressor output silently dropped the marker
+        // line and the `!= "Binary files differ"` stats guard was dead.
+        let input = "diff --git a/img.png b/img.png\n\
+                     Binary files a/img.png and b/img.png differ\n";
+        let cfg = DiffCompressorConfig {
+            min_lines_for_ccr: 1,
+            ..Default::default()
+        };
+        let first = DiffCompressor::new(cfg.clone()).compress(input, "");
+        assert!(first.compressed.contains("Binary files differ"));
+        let second = DiffCompressor::new(cfg).compress(&first.compressed, "");
+        assert!(
+            second.compressed.contains("Binary files differ"),
+            "bare binary marker must survive recompression:\n{}",
+            second.compressed
+        );
+    }
+
+    #[test]
+    fn fixed_in_cor27_crlf_binary_marker_detected() {
+        // CRLF input leaves a trailing `\r` on each line after the
+        // `.split('\n')` pass; the old `differ$` anchor rejected it and
+        // the binary marker was lost entirely on emit.
+        let input = "diff --git a/img.png b/img.png\r\n\
+                     Binary files a/img.png and b/img.png differ\r\n";
+        let cfg = DiffCompressorConfig {
+            min_lines_for_ccr: 1,
+            ..Default::default()
+        };
+        let r = DiffCompressor::new(cfg).compress(input, "");
+        assert!(
+            r.compressed.contains("Binary files differ"),
+            "CRLF binary marker must be detected:\n{}",
+            r.compressed
         );
     }
 

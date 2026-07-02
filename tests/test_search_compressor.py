@@ -364,6 +364,22 @@ src/file (1).py:40:content
 
         assert ":0:" in result.compressed
 
+    def test_digit_run_between_dashes_in_filename(self):
+        """fixed_in_cor26: a `-<digits>-` run inside the filename must not
+        be mistaken for the line-number marker.
+
+        `utils-2-final.py:42:content` used to parse as file `utils`,
+        line 2, content `final.py:42:content` — the real `:N:` marker
+        always wins for grep/ripgrep match lines.
+        """
+        content = "\n".join(f"utils-2-final.py:{i}:match {i}" for i in range(1, 13))
+
+        compressor = SearchCompressor(config=SearchCompressorConfig(enable_ccr=False))
+        result = compressor.compress(content)
+
+        assert "utils-2-final.py:1:match 1" in result.compressed
+        assert "utils:2:" not in result.compressed
+
 
 class TestContextIntegration:
     """Tests for context-aware compression."""
