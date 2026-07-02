@@ -41,8 +41,8 @@ use super::analyzer::SmartAnalyzer;
 use super::builder::SmartCrusherBuilder;
 use super::classifier::{classify_array, ArrayType};
 use super::compaction::{
-    classify_cell, emit_opaque_ccr_marker, try_parse_json_container, CellClass, ClassifyConfig,
-    Compaction, CompactionStage,
+    classify_cell, emit_opaque_ccr_marker, has_serde_private_marker, try_parse_json_container,
+    CellClass, ClassifyConfig, Compaction, CompactionStage,
 };
 use super::config::{RoutingPolicy, SmartCrusherConfig};
 use super::crushers::{compute_k_split, crush_number_array, crush_object, crush_string_array};
@@ -484,6 +484,13 @@ impl SmartCrusher {
         query_context: &str,
         bias: f64,
     ) -> (String, bool, String, Vec<DroppedRef>) {
+        // COR-44: decline magic-key payloads before calling from_str so
+        // serde_json's arbitrary_precision / raw_value promotions never fire.
+        // Passthrough identical to the non-JSON branch: original bytes,
+        // was_modified=false, no info, no dropped refs.
+        if has_serde_private_marker(content) {
+            return (content.to_string(), false, String::new(), Vec::new());
+        }
         // Parse — non-JSON content passes through unchanged.
         let Ok(parsed) = serde_json::from_str::<Value>(content) else {
             return (content.to_string(), false, String::new(), Vec::new());
@@ -4118,6 +4125,28 @@ mod tests {
                  (parity with the scrape)"
             );
         }
+    }
+
+    // ── COR-44: magic-key guard in smart_crush_content_collecting ──
+
+    #[test]
+    fn smart_crush_content_passthrough_on_serde_private_marker() {
+        // COR-44: with arbitrary_precision + raw_value enabled, feeding
+        // {"$serde_json::private::Number":"123"} to serde_json::from_str
+        // would silently return the number literal 123 — mutating the input.
+        // The guard must decline parsing and return the original bytes
+        // unchanged (was_modified=false, no info, no dropped refs).
+        let c = crusher();
+        let magic = r#"{"$serde_json::private::Number":"123"}"#;
+        let (result, was_modified, info, dropped) =
+            c.smart_crush_content_collecting(magic, "", 1.0);
+        assert_eq!(
+            result, magic,
+            "magic-key input must be returned byte-identical"
+        );
+        assert!(!was_modified, "magic-key input must not be marked modified");
+        assert!(info.is_empty(), "no strategy info for declined input");
+        assert!(dropped.is_empty(), "no dropped refs for declined input");
     }
 
     #[test]
