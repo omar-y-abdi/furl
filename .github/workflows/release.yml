@@ -12,7 +12,11 @@ env:
   # Set to 'true' to skip the publish target (e.g., when tokens are not configured).
   # In GitHub: repo Settings → Variables → Actions Variables → New repository variable.
   # Locally via act: pass -e event.yml or set in .actrc.local (see .actrc.example).
-  PYPI_SKIP: "false"
+  # SKIPPED: the `headroom-ai` PyPI project is owned by the upstream author; this
+  # fork has no PyPI trusted publisher configured, so the publish exchange fails
+  # (`invalid-publisher`). Flip to "false" after configuring a trusted publisher
+  # under your own PyPI package name.
+  PYPI_SKIP: "true"
 
 on:
   # Triggered when release-please's release PR is merged: the bot
