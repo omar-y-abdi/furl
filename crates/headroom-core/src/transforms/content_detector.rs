@@ -9,7 +9,6 @@
 //! - **SearchResults**: grep / ripgrep output (`file:line:content`)
 //! - **BuildOutput**: Compiler / test / lint logs
 //! - **GitDiff**: Unified diff format → `DiffCompressor`
-//! - **Html**: Web pages (needs extraction, not compression)
 //! - **PlainText**: Generic fallback
 //!
 //! Detection is **regex-based** — no ML, no model loading, no I/O.
@@ -37,7 +36,6 @@ pub enum ContentType {
     SearchResults,
     BuildOutput,
     GitDiff,
-    Html,
     PlainText,
 }
 
@@ -50,7 +48,6 @@ impl ContentType {
             ContentType::SearchResults => "search",
             ContentType::BuildOutput => "build",
             ContentType::GitDiff => "diff",
-            ContentType::Html => "html",
             ContentType::PlainText => "text",
         }
     }
@@ -189,22 +186,6 @@ static LOG_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
     ]
 });
 
-// ─── HTML patterns ─────────────────────────────────────────────────────
-
-static HTML_DOCTYPE_PATTERN: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)^\s*<!doctype\s+html").unwrap());
-static HTML_TAG_PATTERN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)<html[\s>]").unwrap());
-static HTML_HEAD_PATTERN: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)<head[\s>]").unwrap());
-static HTML_BODY_PATTERN: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)<body[\s>]").unwrap());
-static HTML_STRUCTURAL_TAGS: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r"(?i)<(div|span|script|style|link|meta|nav|header|footer|aside|article|section|main)[\s>]",
-    )
-    .unwrap()
-});
-
 // ─── Public entry point ────────────────────────────────────────────────
 
 /// Detect the type of `content` for routing. Mirrors Python's
@@ -214,11 +195,10 @@ static HTML_STRUCTURAL_TAGS: LazyLock<Regex> = LazyLock::new(|| {
 /// 1. Empty / whitespace-only → `PlainText` confidence 0.0
 /// 2. JSON array (highest priority for `SmartCrusher`)
 /// 3. Git diff (≥ 0.7 confidence required)
-/// 4. HTML (≥ 0.7 confidence required)
-/// 5. Search results (≥ 0.6 confidence required)
-/// 6. Build / log output (≥ 0.5 confidence required)
-/// 7. Source code (≥ 0.5 confidence required)
-/// 8. Fallback to `PlainText` confidence 0.5
+/// 4. Search results (≥ 0.6 confidence required)
+/// 5. Build / log output (≥ 0.5 confidence required)
+/// 6. Source code (≥ 0.5 confidence required)
+/// 7. Fallback to `PlainText` confidence 0.5
 pub fn detect_content_type(content: &str) -> DetectionResult {
     if content.is_empty() || content.trim().is_empty() {
         return DetectionResult::plain_text(0.0);
@@ -228,11 +208,6 @@ pub fn detect_content_type(content: &str) -> DetectionResult {
         return r;
     }
     if let Some(r) = try_detect_diff(content) {
-        if r.confidence >= 0.7 {
-            return r;
-        }
-    }
-    if let Some(r) = try_detect_html(content) {
         if r.confidence >= 0.7 {
             return r;
         }
@@ -319,63 +294,6 @@ fn try_detect_diff(content: &str) -> Option<DetectionResult> {
         json!({
             "header_matches": header_matches,
             "change_lines": change_matches,
-        })
-        .as_object()
-        .cloned()
-        .unwrap(),
-    ))
-}
-
-fn try_detect_html(content: &str) -> Option<DetectionResult> {
-    // Sample first 3000 chars (byte-indexed; matches Python's str slice
-    // for ASCII inputs which is the common HTML case).
-    let sample: &str = if content.len() > 3000 {
-        // Find the last char-boundary <= 3000 so we don't slice mid-codepoint.
-        let mut cutoff = 3000;
-        while !content.is_char_boundary(cutoff) {
-            cutoff -= 1;
-        }
-        &content[..cutoff]
-    } else {
-        content
-    };
-
-    let has_doctype = HTML_DOCTYPE_PATTERN.is_match(sample);
-    let has_html_tag = HTML_TAG_PATTERN.is_match(sample);
-    let has_head = HTML_HEAD_PATTERN.is_match(sample);
-    let has_body = HTML_BODY_PATTERN.is_match(sample);
-    let structural_matches = HTML_STRUCTURAL_TAGS.find_iter(sample).count() as u32;
-
-    if !has_doctype && !has_html_tag && structural_matches < 3 {
-        return None;
-    }
-
-    let mut confidence = 0.0_f64;
-    if has_doctype {
-        confidence += 0.5;
-    }
-    if has_html_tag {
-        confidence += 0.3;
-    }
-    if has_head {
-        confidence += 0.1;
-    }
-    if has_body {
-        confidence += 0.1;
-    }
-    confidence += (structural_matches as f64 * 0.03).min(0.3);
-    confidence = confidence.min(1.0);
-
-    if confidence < 0.5 {
-        return None;
-    }
-    Some(DetectionResult::new(
-        ContentType::Html,
-        confidence,
-        json!({
-            "has_doctype": has_doctype,
-            "has_html_tag": has_html_tag,
-            "structural_tags": structural_matches,
         })
         .as_object()
         .cloned()
@@ -613,19 +531,6 @@ diff --git a/foo.py b/foo.py
     }
 
     #[test]
-    fn html_doctype_detected() {
-        let content = "\
-<!DOCTYPE html>
-<html>
-<head><title>X</title></head>
-<body><div>hi</div></body>
-</html>";
-        let r = detect_content_type(content);
-        assert_eq!(r.content_type, ContentType::Html);
-        assert!(r.confidence >= 0.7);
-    }
-
-    #[test]
     fn build_output_detected() {
         let content = "\
 [INFO] Starting build
@@ -751,20 +656,12 @@ func helper() {}
     }
 
     #[test]
-    fn html_below_threshold_falls_through() {
-        // Just one structural tag — not enough.
-        let r = detect_content_type("<div>hello</div>");
-        assert_ne!(r.content_type, ContentType::Html);
-    }
-
-    #[test]
     fn content_type_string_tags_match_python() {
         assert_eq!(ContentType::JsonArray.as_str(), "json_array");
         assert_eq!(ContentType::SourceCode.as_str(), "source_code");
         assert_eq!(ContentType::SearchResults.as_str(), "search");
         assert_eq!(ContentType::BuildOutput.as_str(), "build");
         assert_eq!(ContentType::GitDiff.as_str(), "diff");
-        assert_eq!(ContentType::Html.as_str(), "html");
         assert_eq!(ContentType::PlainText.as_str(), "text");
     }
 }

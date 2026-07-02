@@ -137,7 +137,6 @@ These are a single deterministic capture at HEAD (`benchmarks/BASELINE.md`). Acr
 - **SmartCrusher** — universal JSON: arrays of dicts, nested objects, mixed types.
 - **Kompress-v2-base** — our HuggingFace model, trained on agentic traces; also handles source code.
 - **SearchCompressor / LogCompressor / DiffCompressor** — search results, build logs, and diffs.
-- **HTMLExtractor** — strips boilerplate from fetched HTML (optional, needs `trafilatura`).
 - **CacheAligner** — stabilizes prefixes so Anthropic/OpenAI KV caches actually hit.
 - **CCR** — reversible compression; LLM retrieves originals on demand.
 

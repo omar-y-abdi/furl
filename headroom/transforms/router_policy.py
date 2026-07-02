@@ -32,7 +32,6 @@ class CompressionStrategy(Enum):
     LOG = "log"
     TEXT = "text"
     DIFF = "diff"
-    HTML = "html"
     MIXED = "mixed"
     PASSTHROUGH = "passthrough"
     # Reversible last-resort offload to the CCR store (ContentRouter fallback).
@@ -56,7 +55,6 @@ def strategy_from_detection(config: Any, detection: Any) -> CompressionStrategy:
         ContentType.SEARCH_RESULTS: CompressionStrategy.SEARCH,
         ContentType.BUILD_OUTPUT: CompressionStrategy.LOG,
         ContentType.GIT_DIFF: CompressionStrategy.DIFF,
-        ContentType.HTML: CompressionStrategy.HTML,
         ContentType.PLAIN_TEXT: CompressionStrategy.TEXT,
     }
 
@@ -79,7 +77,6 @@ def strategy_from_detection_type(config: Any, content_type: ContentType) -> Comp
         ContentType.SEARCH_RESULTS: CompressionStrategy.SEARCH,
         ContentType.BUILD_OUTPUT: CompressionStrategy.LOG,
         ContentType.GIT_DIFF: CompressionStrategy.DIFF,
-        ContentType.HTML: CompressionStrategy.HTML,
         ContentType.PLAIN_TEXT: CompressionStrategy.TEXT,
     }
     return mapping.get(content_type, config.fallback_strategy)
@@ -93,7 +90,6 @@ def content_type_from_strategy(strategy: CompressionStrategy) -> ContentType:
         CompressionStrategy.SEARCH: ContentType.SEARCH_RESULTS,
         CompressionStrategy.LOG: ContentType.BUILD_OUTPUT,
         CompressionStrategy.DIFF: ContentType.GIT_DIFF,
-        CompressionStrategy.HTML: ContentType.HTML,
         CompressionStrategy.TEXT: ContentType.PLAIN_TEXT,
         CompressionStrategy.PASSTHROUGH: ContentType.PLAIN_TEXT,
         CompressionStrategy.CCR_OFFLOAD: ContentType.PLAIN_TEXT,

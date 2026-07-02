@@ -12,8 +12,8 @@
 //! [`restore_tags`] on the output to splice the originals back in.
 //!
 //! Standard HTML5 elements (`<div>`, `<p>`, `<span>`, …) are *not*
-//! protected — those go through the HTMLExtractor / trafilatura path
-//! at a different layer. Anything else is treated as a custom tag.
+//! protected — they are ordinary content to the compressors. Anything
+//! else is treated as a custom tag.
 //!
 //! # Algorithm
 //!

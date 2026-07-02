@@ -1,7 +1,7 @@
 """Per-strategy dispatch + fallback chain for the content router.
 
 Owns the body of :meth:`ContentRouter._apply_strategy_to_content`: the
-per-strategy compressor dispatch (SMART_CRUSHER / SEARCH / LOG / DIFF / HTML /
+per-strategy compressor dispatch (SMART_CRUSHER / SEARCH / LOG / DIFF /
 TEXT / PASSTHROUGH) and the no-savings fallback chain (SMART_CRUSHER -> LOG,
 then passthrough). Strategies with no compressor (CODE_AWARE — the AST
 compressor was retired; TEXT — the ML text compressor was excised) resolve to
@@ -80,7 +80,6 @@ class StrategyDispatcher:
         get_search_compressor: _GetCompressor,
         get_log_compressor: _GetCompressor,
         get_diff_compressor: _GetCompressor,
-        get_html_extractor: _GetCompressor,
         record_to_toin: _RecordToToin,
         token_counter: Callable[[str], int] | None = None,
     ) -> tuple[str, int, list[str]]:
@@ -97,7 +96,6 @@ class StrategyDispatcher:
             get_search_compressor: Router getter for the SearchCompressor.
             get_log_compressor: Router getter for the LogCompressor.
             get_diff_compressor: Router getter for the DiffCompressor.
-            get_html_extractor: Router getter for the HTMLExtractor.
             record_to_toin: Router-bound TOIN recording callable.
             token_counter: Optional real token counter (COR-17). When set,
                 every token count in this dispatch — original, per-strategy
@@ -187,17 +185,6 @@ class StrategyDispatcher:
                     count(result.compressed),
                 )
                 decision_reason = "diff_compressor"
-
-        elif strategy == CompressionStrategy.HTML:
-            if self.config.enable_html_extractor:
-                extractor = get_html_extractor()
-                if extractor:
-                    compressor_name = type(extractor).__name__
-                    result = extractor.extract(content)
-                    compressed = result.extracted
-                    # Count extracted text in the caller's unit
-                    compressed_tokens = count(compressed) if compressed else 0
-                    decision_reason = "html_extractor"
 
         elif strategy == CompressionStrategy.TEXT:
             # Plain text has no compressor (the ML text compressor was

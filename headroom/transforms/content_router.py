@@ -486,7 +486,6 @@ class ContentRouterConfig:
     enable_smart_crusher: bool = True
     enable_search_compressor: bool = True
     enable_log_compressor: bool = True
-    enable_html_extractor: bool = True  # HTML content extraction
 
     # Routing preferences
     prefer_code_aware_for_code: bool = False  # Disabled: let code pass through unmangled
@@ -686,8 +685,8 @@ class ContentRouter(Transform):
 
         # Lazy-loaded compressors.
         #
-        # The five SELF-CONTAINED factories (SmartCrusher, Search, Log, Diff,
-        # HTML) read only ``self.config`` and cache their instance — they live
+        # The four SELF-CONTAINED factories (SmartCrusher, Search, Log, Diff)
+        # read only ``self.config`` and cache their instance — they live
         # in ``CompressorRegistry``. The ``_get_*`` methods below delegate
         # to it.
         self._registry = CompressorRegistry(self.config)
@@ -1337,7 +1336,6 @@ class ContentRouter(Transform):
             get_search_compressor=self._get_search_compressor,
             get_log_compressor=self._get_log_compressor,
             get_diff_compressor=self._get_diff_compressor,
-            get_html_extractor=self._get_html_extractor,
             record_to_toin=record_to_toin,
             token_counter=token_counter,
         )
@@ -1412,13 +1410,6 @@ class ContentRouter(Transform):
         Thin delegator to :meth:`CompressorRegistry.get_diff_compressor`.
         """
         return self._registry.get_diff_compressor()
-
-    def _get_html_extractor(self) -> Any:
-        """Get HTMLExtractor (lazy load).
-
-        Thin delegator to :meth:`CompressorRegistry.get_html_extractor`.
-        """
-        return self._registry.get_html_extractor()
 
     # Transform interface
 
