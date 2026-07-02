@@ -75,6 +75,18 @@ logger = logging.getLogger(__name__)
 _pipeline = None
 _pipeline_lock = threading.Lock()
 
+# Warn when the frozen prefix swallows (nearly) the whole conversation:
+# cache_control on the LAST message — the multi-turn idiom Anthropic's docs
+# teach — freezes everything, every transform skips, and compression reports
+# 0 saved with no error. > 0.9 also catches the "all but the newest turn"
+# shape, where the same surprise applies.
+_FROZEN_WARN_FRACTION = 0.9
+
+# Roles whose string content is a tool output the replacement transforms
+# rewrite (mirrors cross_message_dedup._TOOL_ROLES; ReadLifecycleManager
+# handles the "tool" subset). Used by the frozen-prefix conflict detector.
+_TOOL_OUTPUT_ROLES = frozenset({"tool", "function"})
+
 
 @dataclass
 class CompressConfig:
@@ -152,6 +164,12 @@ class CompressResult:
             messages were returned unchanged (fail-open). None on success and
             on genuine no-ops (empty input, optimize=False). Lets callers tell
             a swallowed pipeline failure apart from a real "nothing to do".
+        warnings: Non-fatal problems detected while compressing (each is also
+            logged at WARNING). Aggregates transform-level warnings with
+            compress()-level diagnostics — e.g. a ``cache_control`` breakpoint
+            freezing the whole conversation (0 tokens can be saved), or a
+            frozen message whose bytes Headroom previously shipped compressed
+            (a guaranteed provider prefix-cache miss). Empty on clean runs.
     """
 
     messages: list[dict[str, Any]]
@@ -161,6 +179,7 @@ class CompressResult:
     compression_ratio: float = 0.0
     transforms_applied: list[str] = field(default_factory=list)
     error: str | None = None
+    warnings: list[str] = field(default_factory=list)
 
 
 def _compute_frozen_message_count(messages: list[dict[str, Any]]) -> int:
@@ -197,6 +216,147 @@ def _compute_frozen_message_count(messages: list[dict[str, Any]]) -> int:
     return (highest_index + 1) if highest_index is not None else 0
 
 
+def _frozen_prefix_warning(total_messages: int, frozen: int) -> str | None:
+    """Warning when the cache_control floor freezes (nearly) every message.
+
+    With ``cache_control`` on the LAST message — the multi-turn idiom
+    Anthropic's docs teach — ``frozen == len(messages)``: every transform
+    skips everything, 0 tokens are saved, ``error`` stays None, and without
+    this warning there is no way to notice. Pure and total: returns the
+    warning string, or None when the frozen fraction is unremarkable.
+
+    Args:
+        total_messages: Number of messages in the request.
+        frozen: Frozen-prefix message count (see
+            :func:`_compute_frozen_message_count`).
+
+    Returns:
+        Warning text when ``frozen == total_messages`` or the frozen fraction
+        exceeds ``_FROZEN_WARN_FRACTION``; None otherwise.
+    """
+    if total_messages <= 0 or frozen <= 0:
+        return None
+    if frozen >= total_messages:
+        return (
+            f"cache_control on the last message freezes all {total_messages} "
+            "messages: every transform skips the frozen prefix, so 0 tokens "
+            "can be saved. Mark the cache breakpoint BEFORE the live zone you "
+            "want compressed, or compress before marking."
+        )
+    fraction = frozen / total_messages
+    if fraction > _FROZEN_WARN_FRACTION:
+        return (
+            f"cache_control freezes {frozen} of {total_messages} messages "
+            f"({fraction:.0%}): nearly the whole conversation is skipped by "
+            "every transform. Mark the cache breakpoint BEFORE the live zone "
+            "you want compressed, or compress before marking."
+        )
+    return None
+
+
+def _frozen_tool_output_units(message: dict[str, Any]) -> list[str]:
+    """Tool-output strings in *message* that replacement transforms rewrite.
+
+    OpenAI-style tool/function messages with string content, and
+    Anthropic-style ``tool_result`` blocks with string content — the two
+    shapes ``CrossMessageDeduper`` / ``ReadLifecycleManager`` replace. Pure
+    and total: any other shape yields an empty list.
+    """
+    role = message.get("role", "")
+    content = message.get("content", "")
+    if role in _TOOL_OUTPUT_ROLES and isinstance(content, str):
+        return [content]
+    if not isinstance(content, list):
+        return []
+    return [
+        block["content"]
+        for block in content
+        if isinstance(block, dict)
+        and block.get("type") == "tool_result"
+        and isinstance(block.get("content"), str)
+    ]
+
+
+def _frozen_transformed_content_warning(messages: list[dict[str, Any]], frozen: int) -> str | None:
+    """Detect a cache breakpoint moved PAST previously-compressed turns.
+
+    The frozen prefix freezes the INPUT bytes, but what the provider cached
+    last turn is whatever Headroom SHIPPED last turn. A caller who re-sends
+    the original (uncompressed) history each turn and moves the cache_control
+    marker forward across a message that previously shipped transformed
+    (dedup sentinel, read-lifecycle marker) gets (a) a guaranteed prefix-cache
+    miss at the very message asserted cached, then (b) a permanent token
+    regression — the message is frozen, so it ships uncompressed forever —
+    with no signal. There is no exact stateless test for this, so this is a
+    cheap best-effort detector over the CCR registry:
+
+    * a frozen tool output that is a byte-identical LATER duplicate of an
+      earlier frozen unit, with a CCR entry for those bytes → it previously
+      shipped as a ``cross_message_dedup`` sentinel (dedup only ever rewrites
+      later copies, and the earlier copy is in the frozen prefix too);
+    * a frozen tool output whose CCR entry stored ``compressed_content == ""``
+      → it previously shipped as a read-lifecycle marker (the only writer of
+      empty compressed content).
+
+    Best-effort on purpose: CCR entries expire with the store TTL, the store
+    is process-global (a hit can come from a sibling conversation), and
+    router-side lossy compressions are not covered — a None here is not proof
+    of safety. The contract itself is documented on :func:`compress`.
+
+    Returns:
+        Warning text naming the suspect message indexes, or None. Never
+        raises — diagnostics must not break the request.
+    """
+    if frozen <= 0 or not messages:
+        return None
+    try:
+        from .cache.compression_store import get_compression_store
+        from .transforms.cross_message_dedup import MIN_DEDUP_CHARS, _content_hash
+
+        store = get_compression_store()
+        seen_frozen_hashes: set[str] = set()
+        suspect_indexes: list[int] = []
+
+        for index in range(min(frozen, len(messages))):
+            for unit in _frozen_tool_output_units(messages[index]):
+                if len(unit) < MIN_DEDUP_CHARS:
+                    # Below the smallest unit any replacement transform
+                    # rewrites — and well-behaved callers' frozen sentinels
+                    # land here, so the common path does zero store lookups.
+                    continue
+                unit_hash = _content_hash(unit)
+                duplicate_of_frozen = unit_hash in seen_frozen_hashes
+                seen_frozen_hashes.add(unit_hash)
+                metadata = store.get_metadata(unit_hash)
+                if metadata is None:
+                    continue
+                previously_dedup_sentinel = duplicate_of_frozen
+                previously_lifecycle_marker = metadata.get("compressed_content") == ""
+                if previously_dedup_sentinel or previously_lifecycle_marker:
+                    suspect_indexes.append(index)
+                    break  # One suspect unit per message is enough.
+
+        if not suspect_indexes:
+            return None
+        indexes = ", ".join(str(i) for i in suspect_indexes)
+        return (
+            f"frozen prefix message(s) [{indexes}] contain tool output that "
+            "Headroom previously shipped in compressed form (CCR registry "
+            "hit): the provider cached the TRANSFORMED bytes, so re-sending "
+            "the original history with the cache breakpoint moved past that "
+            "turn guarantees a prefix-cache miss there and pins the message "
+            "uncompressed forever. Pass the previously returned "
+            "result.messages back in, or do not move the cache_control "
+            "marker past turns that already shipped compressed."
+        )
+    except Exception:  # noqa: BLE001 - best-effort diagnostics only
+        logger.debug(
+            "frozen-prefix transformed-content detection failed (non-fatal)",
+            exc_info=True,
+        )
+        return None
+
+
 def compress(
     messages: list[dict[str, Any]],
     model: str = "claude-sonnet-4-5-20250929",
@@ -222,6 +382,27 @@ def compress(
             compress_user_messages, compress_system_messages, target_ratio,
             protect_recent, protect_analysis_context, min_tokens_to_compress,
             kompress_model.
+
+    Prompt caching (``cache_control``):
+        Messages up to and including the HIGHEST message carrying an
+        Anthropic ``cache_control`` marker form the frozen prefix — Headroom
+        never modifies them, so the provider's prompt cache keeps hitting.
+        Two consequences follow:
+
+        * Marking the LAST message freezes the entire conversation: every
+          transform skips everything and 0 tokens are saved (``error`` stays
+          None). Mark the breakpoint BEFORE the live zone you want
+          compressed, or compress before marking. Detected and surfaced via
+          ``result.warnings``.
+        * The frozen prefix freezes the bytes you PASS IN, while the provider
+          cached the bytes Headroom SHIPPED last turn. On multi-turn
+          conversations, pass the previously returned ``result.messages``
+          (the compressed history) back in — or do not move the marker
+          forward past turns that already shipped compressed. Re-sending
+          original history with a forward-moved marker guarantees a
+          prefix-cache miss at the previously compressed message and pins it
+          uncompressed forever (it is frozen). Best-effort detected via
+          ``result.warnings``.
 
     Returns:
         CompressResult with compressed messages and metrics.
@@ -297,6 +478,23 @@ def compress(
         # are never passed here.
         frozen = _compute_frozen_message_count(messages)
 
+        # cache_control interactions must be LOUD but non-fatal. A breakpoint
+        # on (nearly) the last message freezes everything — every transform
+        # skips, 0 tokens saved, error=None — and a breakpoint moved forward
+        # past a turn that previously shipped compressed guarantees a
+        # prefix-cache miss at the very message the caller asserts is cached.
+        # Neither is a failure (fail-open stays for real failures); both
+        # surface in CompressResult.warnings and the log.
+        compress_warnings: list[str] = []
+        frozen_floor_warning = _frozen_prefix_warning(len(messages), frozen)
+        if frozen_floor_warning is not None:
+            compress_warnings.append(frozen_floor_warning)
+        frozen_content_warning = _frozen_transformed_content_warning(messages, frozen)
+        if frozen_content_warning is not None:
+            compress_warnings.append(frozen_content_warning)
+        for warning in compress_warnings:
+            logger.warning("%s", warning)
+
         result = pipeline.apply(
             messages=messages,
             model=model,
@@ -334,6 +532,7 @@ def compress(
                 tokens_saved=0,
                 compression_ratio=0.0,
                 transforms_applied=["inflation_guard:reverted"],
+                warnings=[*compress_warnings, *result.warnings],
             )
 
         routing_markers = summarize_routing_markers(result.transforms_applied)
@@ -390,6 +589,10 @@ def compress(
             tokens_saved=tokens_saved,
             compression_ratio=ratio,
             transforms_applied=result.transforms_applied,
+            # Transform warnings (TransformResult.warnings) were previously
+            # dropped here; plumb them through alongside the compress()-level
+            # frozen-prefix diagnostics so callers can actually see them.
+            warnings=[*compress_warnings, *result.warnings],
         )
 
     except (KeyboardInterrupt, SystemExit):

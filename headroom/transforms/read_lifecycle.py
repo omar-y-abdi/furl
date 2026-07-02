@@ -169,8 +169,12 @@ class ReadLifecycleManager:
             if msg.get("role") != "assistant":
                 continue
 
-            # OpenAI format: tool_calls array
-            for tc in msg.get("tool_calls", []):
+            # OpenAI format: tool_calls array. `or []` (not a .get default):
+            # openai-python's ChatCompletionMessage.model_dump() serializes
+            # tool_calls as present-but-None, which .get(..., []) passes
+            # through — iterating None would TypeError and fail-open the
+            # whole request (same idiom as smart_crusher's tool-call index).
+            for tc in msg.get("tool_calls") or []:
                 if not isinstance(tc, dict):
                     continue
                 tc_id = tc.get("id", "")
@@ -264,8 +268,9 @@ class ReadLifecycleManager:
             if msg.get("role") != "assistant":
                 continue
 
-            # OpenAI format
-            for tc in msg.get("tool_calls", []):
+            # OpenAI format. `or []`: the key is present-but-None in
+            # openai-python model_dump() output.
+            for tc in msg.get("tool_calls") or []:
                 if isinstance(tc, dict) and tc.get("id") == tool_call_id:
                     return i
 

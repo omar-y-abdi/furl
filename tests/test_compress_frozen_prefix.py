@@ -19,10 +19,17 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
+import uuid
 from typing import Any
 from unittest.mock import patch
 
-from headroom.compress import _compute_frozen_message_count, compress
+from headroom.compress import (
+    _compute_frozen_message_count,
+    _frozen_prefix_warning,
+    _frozen_transformed_content_warning,
+    compress,
+)
 
 # ---------------------------------------------------------------------------
 # Helper
@@ -622,3 +629,354 @@ class TestCompressFrozenPrefixByteIdentity:
             f"Original content: {msg0_snapshot['content']!r}, "
             f"result[0] content: {result.messages[0].get('content', '')!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# COR-49 — a fully (or nearly fully) frozen conversation must WARN, not
+# silently no-op; TransformResult.warnings must reach CompressResult.warnings
+# ---------------------------------------------------------------------------
+
+
+def _marker_message(text: str) -> dict[str, Any]:
+    """A user message carrying the Anthropic cache_control breakpoint."""
+    return {
+        "role": "user",
+        "content": [
+            {"type": "text", "text": text, "cache_control": {"type": "ephemeral"}},
+        ],
+    }
+
+
+class TestFullyFrozenConversationWarns:
+    """cache_control on the LAST message — the multi-turn idiom Anthropic's
+    docs teach — freezes every message: all transforms skip, 0 tokens saved,
+    error=None. That silence is the bug: it must surface in
+    ``result.warnings`` and the log."""
+
+    def test_marker_on_last_message_warns_and_saves_nothing(self, caplog) -> None:
+        messages = [
+            {"role": "user", "content": _big_json_content()},
+            {"role": "assistant", "content": "ok"},
+            _marker_message("latest turn (cached)"),
+        ]
+        snapshots = copy.deepcopy(messages)
+
+        with caplog.at_level(logging.WARNING):
+            result = compress(
+                messages,
+                model="gpt-4o",
+                min_tokens_to_compress=1,
+                compress_user_messages=True,
+            )
+
+        # The frozen-prefix contract holds: nothing was compressed…
+        assert result.error is None
+        assert result.tokens_saved == 0
+        assert result.messages == snapshots
+        # …and the silence is broken by an explicit warning, both on the
+        # result and in the log.
+        assert result.warnings, "fully frozen conversation must surface a warning"
+        assert any("freezes all" in w and "cache breakpoint" in w for w in result.warnings)
+        assert any(
+            "freezes all" in record.getMessage()
+            for record in caplog.records
+            if record.levelno == logging.WARNING
+        ), "the frozen-conversation warning must also be logged at WARNING"
+
+    def test_frozen_fraction_above_threshold_warns(self) -> None:
+        """10 of 11 frozen (0.909 > 0.9) — nearly-total freeze also warns."""
+        messages: list[dict[str, Any]] = [
+            {"role": "user" if i % 2 == 0 else "assistant", "content": f"turn {i}"}
+            for i in range(9)
+        ]
+        messages.append(_marker_message("cached up to here"))  # index 9 → frozen=10
+        messages.append({"role": "user", "content": "live turn"})
+
+        result = compress(messages, model="gpt-4o")
+
+        assert result.error is None
+        assert any("nearly the whole conversation" in w for w in result.warnings)
+
+    def test_no_cache_control_yields_no_warnings(self) -> None:
+        messages = [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi there"},
+        ]
+        result = compress(messages, model="gpt-4o")
+        assert result.error is None
+        assert result.warnings == []
+
+
+class TestFrozenPrefixWarningHelper:
+    """Unit tests for the pure _frozen_prefix_warning helper."""
+
+    def test_full_freeze_warns(self) -> None:
+        warning = _frozen_prefix_warning(5, 5)
+        assert warning is not None
+        assert "freezes all 5 messages" in warning
+
+    def test_fraction_above_threshold_warns(self) -> None:
+        warning = _frozen_prefix_warning(11, 10)
+        assert warning is not None
+        assert "10 of 11" in warning
+
+    def test_fraction_at_threshold_is_silent(self) -> None:
+        # 9/10 == 0.9 is NOT > 0.9 — the boundary stays quiet.
+        assert _frozen_prefix_warning(10, 9) is None
+
+    def test_ordinary_fraction_is_silent(self) -> None:
+        assert _frozen_prefix_warning(10, 4) is None
+
+    def test_zero_frozen_is_silent(self) -> None:
+        assert _frozen_prefix_warning(10, 0) is None
+
+    def test_empty_conversation_is_silent(self) -> None:
+        assert _frozen_prefix_warning(0, 0) is None
+
+
+class TestTransformWarningsPlumbed:
+    """TransformResult.warnings must reach CompressResult.warnings — before
+    this fix they were aggregated by the pipeline and then dropped on the
+    floor by compress()."""
+
+    def _fake_apply(self, tokens_before: int, tokens_after: int):
+        from headroom.config import TransformResult
+
+        def fake_apply(**kwargs: Any) -> TransformResult:
+            return TransformResult(
+                messages=kwargs["messages"],
+                tokens_before=tokens_before,
+                tokens_after=tokens_after,
+                transforms_applied=["fake:transform"],
+                warnings=["transform-level warning"],
+            )
+
+        return fake_apply
+
+    def test_transform_warnings_reach_compress_result(self) -> None:
+        from headroom.compress import _get_pipeline
+
+        pipeline = _get_pipeline()
+        with patch.object(pipeline, "apply", side_effect=self._fake_apply(100, 90)):
+            result = compress([{"role": "user", "content": "hello"}], model="gpt-4o")
+
+        assert result.error is None
+        assert "transform-level warning" in result.warnings
+
+    def test_warnings_survive_the_inflation_guard_revert(self) -> None:
+        """Even when inflated output is reverted, warnings must not be lost."""
+        from headroom.compress import _get_pipeline
+
+        pipeline = _get_pipeline()
+        with patch.object(pipeline, "apply", side_effect=self._fake_apply(100, 200)):
+            result = compress([{"role": "user", "content": "hello"}], model="gpt-4o")
+
+        assert result.transforms_applied == ["inflation_guard:reverted"]
+        assert "transform-level warning" in result.warnings
+
+
+# ---------------------------------------------------------------------------
+# COR-50 — moving the cache breakpoint forward across a previously-transformed
+# message: characterization of the behavior + the best-effort detector
+# ---------------------------------------------------------------------------
+
+
+def _unique_tool_rows() -> str:
+    """A dedup-eligible JSON tool output, salted so the process-global CCR
+    store cannot leak hits between tests."""
+    salt = uuid.uuid4().hex
+    return json.dumps([{"row": i, "salt": salt, "data": "d" * 40} for i in range(40)])
+
+
+class TestMovingBreakpointOverTransformedTurn:
+    """The frozen prefix freezes INPUT bytes, but the provider cached what
+    Headroom SHIPPED last turn. Re-sending original history with the marker
+    moved forward past a deduped turn re-ships the ORIGINAL bytes — frozen,
+    so uncompressed forever — a guaranteed prefix-cache miss. compress()
+    cannot fix this statelessly; it must WARN (COR-50 characterization)."""
+
+    def test_previously_deduped_message_refrozen_warns(self) -> None:
+        big = _unique_tool_rows()
+        turn1 = [
+            {"role": "user", "content": "run the disk check"},
+            {"role": "tool", "tool_call_id": "c1", "content": big},
+            {"role": "assistant", "content": "ran it; running again to confirm"},
+            {"role": "tool", "tool_call_id": "c2", "content": big},  # exact duplicate
+        ]
+
+        r1 = compress(turn1, model="gpt-4o", protect_recent=0, min_tokens_to_compress=1)
+        assert r1.error is None
+        # Dedup replaced the LATER copy with a recoverable sentinel — these
+        # are the bytes the provider's prefix cache saw for message 3.
+        assert "_ccr_dropped" in r1.messages[3]["content"], (
+            "precondition: cross-message dedup must have replaced the duplicate"
+        )
+
+        # Turn 2 — documented-example usage: the caller re-sends the ORIGINAL
+        # history and moves the cache breakpoint forward past the deduped turn.
+        turn2 = [
+            *turn1,
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "confirmed",
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ],
+            },
+            {"role": "user", "content": "and what changed since?"},
+        ]
+        r2 = compress(turn2, model="gpt-4o", protect_recent=0, min_tokens_to_compress=1)
+
+        assert r2.error is None
+        # Characterization of the COR-50 behavior itself: the previously
+        # deduped message is now inside the frozen prefix, so it ships as the
+        # ORIGINAL bytes — NOT the sentinel the provider cached last turn.
+        assert r2.messages[3]["content"] == big
+        # The regression is invisible in the token metrics; the signal is the
+        # warning naming the suspect frozen message.
+        assert any(
+            "previously shipped in compressed form" in w and "[3]" in w for w in r2.warnings
+        ), f"expected the moving-breakpoint warning, got: {r2.warnings!r}"
+
+    def test_frozen_first_occurrence_with_live_duplicate_stays_quiet(self) -> None:
+        """False-positive guard: a first occurrence inside the frozen prefix
+        whose duplicate lives in the live zone is CORRECT usage — the frozen
+        copy always shipped verbatim; dedup keeps replacing the live copy.
+        The detector must not warn."""
+        big = _unique_tool_rows()
+        messages = [
+            {"role": "user", "content": "check disk"},
+            {"role": "tool", "tool_call_id": "c1", "content": big},
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "cached up to here",
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ],
+            },
+            {"role": "assistant", "content": "running again"},
+            {"role": "tool", "tool_call_id": "c2", "content": big},
+            {"role": "user", "content": "any difference?"},
+        ]
+
+        # First call populates the CCR registry (the live copy is deduped);
+        # the second, identical call is where a naive detector would
+        # misfire on the frozen first occurrence.
+        r1 = compress(messages, model="gpt-4o", protect_recent=0, min_tokens_to_compress=1)
+        assert r1.error is None
+        r2 = compress(messages, model="gpt-4o", protect_recent=0, min_tokens_to_compress=1)
+
+        assert r2.error is None
+        assert not any("previously shipped in compressed form" in w for w in r2.warnings), (
+            f"first-occurrence-in-frozen-prefix must not warn, got: {r2.warnings!r}"
+        )
+
+
+class TestFrozenTransformedContentDetector:
+    """Unit tests for the best-effort _frozen_transformed_content_warning
+    helper, exercised directly against the process-global CCR store."""
+
+    @staticmethod
+    def _unique_content() -> str:
+        return f"output {uuid.uuid4().hex}\n" + "metric,value\n" * 40  # ≥ 256 chars
+
+    def test_read_lifecycle_style_entry_warns_without_a_duplicate(self) -> None:
+        """read_lifecycle stores ``compressed=""`` — the only writer of empty
+        compressed content — so a frozen hit warns even with no frozen twin."""
+        from headroom.cache.compression_store import get_compression_store
+
+        content = self._unique_content()
+        get_compression_store().store(
+            original=content,
+            compressed="",
+            tool_name="Read",
+            tool_call_id="call_read_1",
+            compression_strategy="read_lifecycle:stale",
+        )
+
+        messages = [{"role": "tool", "tool_call_id": "c1", "content": content}]
+        warning = _frozen_transformed_content_warning(messages, frozen=1)
+
+        assert warning is not None
+        assert "[0]" in warning
+
+    def test_dedup_style_entry_needs_a_frozen_duplicate(self) -> None:
+        """A dedup-registry hit warns only for a LATER byte-identical copy
+        inside the frozen prefix — dedup only ever rewrote later copies, so a
+        lone frozen occurrence is the always-verbatim first occurrence."""
+        from headroom.cache.compression_store import get_compression_store
+        from headroom.transforms.cross_message_dedup import _content_hash
+
+        content = self._unique_content()
+        get_compression_store().store(
+            original=content,
+            compressed='{"_ccr_dropped": "duplicate tool output elided"}',
+            compression_strategy="cross_message_dedup",
+            explicit_hash=_content_hash(content),
+        )
+
+        lone = [{"role": "tool", "tool_call_id": "c1", "content": content}]
+        assert _frozen_transformed_content_warning(lone, frozen=1) is None
+
+        pair = [
+            {"role": "tool", "tool_call_id": "c1", "content": content},
+            {"role": "assistant", "content": "again"},
+            {"role": "tool", "tool_call_id": "c2", "content": content},
+        ]
+        warning = _frozen_transformed_content_warning(pair, frozen=3)
+        assert warning is not None
+        assert "[2]" in warning
+
+    def test_anthropic_tool_result_blocks_are_scanned(self) -> None:
+        from headroom.cache.compression_store import get_compression_store
+
+        content = self._unique_content()
+        get_compression_store().store(
+            original=content,
+            compressed="",
+            tool_name="Read",
+            tool_call_id="call_read_2",
+            compression_strategy="read_lifecycle:stale",
+        )
+
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "content": content},
+                ],
+            }
+        ]
+        warning = _frozen_transformed_content_warning(messages, frozen=1)
+        assert warning is not None
+        assert "[0]" in warning
+
+    def test_unknown_content_never_warns(self) -> None:
+        messages = [{"role": "tool", "tool_call_id": "c1", "content": self._unique_content()}]
+        assert _frozen_transformed_content_warning(messages, frozen=1) is None
+
+    def test_zero_frozen_never_warns(self) -> None:
+        messages = [{"role": "tool", "tool_call_id": "c1", "content": self._unique_content()}]
+        assert _frozen_transformed_content_warning(messages, frozen=0) is None
+
+    def test_small_units_are_skipped(self) -> None:
+        """Units below MIN_DEDUP_CHARS (where well-behaved callers' sentinels
+        live) never trigger store lookups or warnings."""
+        from headroom.cache.compression_store import get_compression_store
+
+        content = f"tiny {uuid.uuid4().hex}"  # well under 256 chars
+        get_compression_store().store(
+            original=content,
+            compressed="",
+            tool_name="Read",
+            tool_call_id="call_read_3",
+            compression_strategy="read_lifecycle:stale",
+        )
+        messages = [{"role": "tool", "tool_call_id": "c1", "content": content}]
+        assert _frozen_transformed_content_warning(messages, frozen=1) is None
