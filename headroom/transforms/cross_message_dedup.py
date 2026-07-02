@@ -36,9 +36,13 @@ Prompt-cache safety contract (P0 — pinned by tests/test_cross_message_dedup.py
 
 Eligibility is deliberately narrow: OpenAI-style ``role in {tool, function}``
 messages with string content, and Anthropic-style ``tool_result`` blocks
-with string content. User / system / developer prompts and assistant text
-(echoed into provider auto-prefix caches) are never touched. Error-flagged
-tool results (``is_error``) are never touched.
+with string content — or with the canonical Anthropic/MCP nested parts list
+``[{"type": "text", "text": …}]`` when EVERY part is a text part (the dedup
+unit is then the concatenated text; a block with any non-text part is left
+untouched, since eliding it would lose the non-text payload). User / system /
+developer prompts and assistant text (echoed into provider auto-prefix
+caches) are never touched. Error-flagged tool results (``is_error``) are
+never touched.
 
 Two tiers, both pointer-backed:
 
@@ -351,25 +355,85 @@ class CrossMessageDeduper(Transform):
                 or block.get("type") != "tool_result"
                 or "cache_control" in block
                 or block.get("is_error") is True
-                or not isinstance(block.get("content"), str)
             ):
                 new_blocks.append(block)
                 continue
-            new_content = self._dedup_unit(
-                block["content"],
-                message_index=index,
-                replaceable=replaceable,
-                state=state,
-                tool_name=None,
-            )
-            if new_content is None:
-                new_blocks.append(block)
+            block_content = block.get("content")
+            if isinstance(block_content, str):
+                new_content = self._dedup_unit(
+                    block_content,
+                    message_index=index,
+                    replaceable=replaceable,
+                    state=state,
+                    tool_name=None,
+                )
+                if new_content is None:
+                    new_blocks.append(block)
+                    continue
+                new_blocks.append({**block, "content": new_content})
+                replaced += 1
                 continue
-            new_blocks.append({**block, "content": new_content})
-            replaced += 1
+            if isinstance(block_content, list):
+                # Canonical Anthropic/MCP nested shape (COR-47 mirror): the
+                # dedup unit is the concatenated text of the inner text parts.
+                nested = self._dedup_nested_parts(
+                    block_content,
+                    message_index=index,
+                    replaceable=replaceable,
+                    state=state,
+                )
+                if nested is None:
+                    new_blocks.append(block)
+                    continue
+                new_blocks.append({**block, "content": nested})
+                replaced += 1
+                continue
+            new_blocks.append(block)
         if replaced == 0:
             return message
         return {**message, "content": new_blocks}
+
+    def _dedup_nested_parts(
+        self,
+        parts: list[Any],
+        *,
+        message_index: int,
+        replaceable: bool,
+        state: _DedupState,
+    ) -> list[dict[str, Any]] | None:
+        """Dedup a nested ``tool_result.content`` parts list; ``None`` keeps it.
+
+        Eligible only when EVERY part is a ``{"type": "text"}`` dict with
+        string text and no ``cache_control`` — eliding a block containing a
+        non-text part (image, …) would silently lose that payload. The dedup
+        unit is the newline-joined text (byte-exact for the canonical
+        single-part MCP shape); on replacement the list shape is preserved as
+        a single text part carrying the sentinel, so strict clients keep
+        seeing the parts-list they sent.
+        """
+        texts: list[str] = []
+        for part in parts:
+            if (
+                not isinstance(part, dict)
+                or part.get("type") != "text"
+                or "cache_control" in part
+                or not isinstance(part.get("text"), str)
+            ):
+                return None
+            texts.append(part["text"])
+        if not texts:
+            return None
+        unit = "\n".join(texts)
+        replacement = self._dedup_unit(
+            unit,
+            message_index=message_index,
+            replaceable=replaceable,
+            state=state,
+            tool_name=None,
+        )
+        if replacement is None:
+            return None
+        return [{"type": "text", "text": replacement}]
 
     # ------------------------------------------------------------------ #
     # The dedup unit: register first occurrence / replace later ones.

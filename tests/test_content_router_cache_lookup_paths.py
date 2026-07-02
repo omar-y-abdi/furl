@@ -3,9 +3,9 @@
 The string-message path in ``ContentRouter.apply()`` runs a two-tier cache
 lookup before deciding what to do with each message:
 
-    hash(content) ─▶ Tier-1 is_skipped?  ─▶ skip (serve unchanged)
-                  ─▶ Tier-2 get()        ─▶ ratio >= min_ratio? ─▶ move_to_skip (serve unchanged)
-                                          ─▶ ratio <  min_ratio? ─▶ ccr-backed? ─▶ serve cached
+    key(content,  ─▶ Tier-1 is_skipped?  ─▶ skip (serve unchanged)
+    runtime,      ─▶ Tier-2 get()        ─▶ ratio >= min_ratio? ─▶ move_to_skip (serve unchanged)
+    bias)                                 ─▶ ratio <  min_ratio? ─▶ ccr-backed? ─▶ serve cached
                                                                                  ─▶ evict + recompute
                   ─▶ miss                ─▶ recompute (deferred to the parallel pass)
 
@@ -23,11 +23,14 @@ This file closes the remaining two, which had no coverage:
     original content is served unchanged.
 
 Both are driven through the public ``apply()`` surface with the cache pre-seeded
-via its public API (``mark_skip`` / ``put``). ``content`` is hashed verbatim by
-``apply()``, so ``hash(content)`` here is the exact key the lookup uses
-(``hash`` is stable within a process). No compression actually runs in either
-test — the lookup short-circuits before ``compress()`` — so these pins are fast
-and deterministic with no domain mocking.
+via its public API (``mark_skip`` / ``put``). Keys are built with the router's
+own ``_result_cache_key(content, runtime, bias)`` (COR-18: the key carries the
+per-request options and a content-length guard, not ``hash(content)`` alone);
+a no-kwargs ``apply()`` resolves to ``_DEFAULT_RUNTIME`` and bias ``1.0``, so
+``_seed_key(content)`` below is the exact key the lookup uses (stable within a
+process). No compression actually runs in either test — the lookup
+short-circuits before ``compress()`` — so these pins are fast and deterministic
+with no domain mocking.
 """
 
 from __future__ import annotations
@@ -35,12 +38,20 @@ from __future__ import annotations
 from headroom.tokenizer import Tokenizer
 from headroom.tokenizers import EstimatingTokenCounter
 from headroom.transforms.content_router import (
+    _DEFAULT_RUNTIME,
     ContentRouter,
     ContentRouterConfig,
     Recompute,
     ServeCached,
     ServeOriginal,
+    _result_cache_key,
 )
+
+
+def _seed_key(content: str):
+    """The exact key a no-kwargs ``apply()`` builds for *content*: default
+    runtime (no target_ratio/force/model overrides) and neutral bias 1.0."""
+    return _result_cache_key(content, _DEFAULT_RUNTIME, 1.0)
 
 
 def _make_tokenizer() -> Tokenizer:
@@ -54,7 +65,7 @@ def _routable_tool_content() -> str:
     error indicators (not error-protected), no ``<<ccr:`` marker (not
     already-compressed pinning), and well over the 50-token raw-``apply()``
     floor — so execution reaches the Tier-1/Tier-2 cache lookup at
-    ``content_key = hash(content)``.
+    ``content_key = _result_cache_key(content, runtime, bias)``.
     """
     return " ".join(
         f"Line {i}: the quarterly summary recorded steady throughput and "
@@ -75,7 +86,7 @@ def _routable_block_content() -> str:
     Over the 500-char ``min_chars_for_block_compression`` floor, no error
     indicators, no ``<<ccr:`` marker — so a ``tool_result`` block carrying it
     reaches ``_compress_content_block`` (the content-block copy of the lookup
-    tree), where ``text`` is hashed verbatim.
+    tree), where ``text`` is keyed verbatim via ``_result_cache_key``.
     """
     return " ".join(
         f"Record {i}: throughput {1000 + i} rps, latency {10 + i % 7} ms, "
@@ -106,7 +117,7 @@ class TestStringPathCacheLookup:
         router = ContentRouter(ContentRouterConfig())
 
         # Pre-seed Tier 1: this content is known non-compressible.
-        router._cache.mark_skip(hash(content))
+        router._cache.mark_skip(_seed_key(content))
         before = dict(router._cache.stats)
 
         result = router.apply([_tool_message(content)], _make_tokenizer())
@@ -142,7 +153,7 @@ class TestStringPathCacheLookup:
 
         stale_payload = "STALE-COMPRESSION-MUST-NOT-BE-SERVED"
         # Pre-seed Tier 2 with a ratio at/above any default min_ratio in [0, 1].
-        router._cache.put(hash(content), stale_payload, 0.99, "log")
+        router._cache.put(_seed_key(content), stale_payload, 0.99, "log")
         assert router._cache.size == 1
         assert router._cache.skip_size == 0
         before = dict(router._cache.stats)
@@ -172,8 +183,9 @@ class TestContentBlockPathCacheLookup:
     duplication is only drift-safe if BOTH copies are pinned — the string copy
     is covered by ``TestStringPathCacheLookup`` above; these pin the block copy.
 
-    ``text`` is the ``tool_result`` block's ``content``, hashed verbatim by
-    ``_compress_content_block``, so ``hash(text)`` is the exact lookup key.
+    ``text`` is the ``tool_result`` block's ``content``, keyed verbatim by
+    ``_compress_content_block`` via ``_result_cache_key``, so ``_seed_key(text)``
+    is the exact lookup key.
     """
 
     def _served_block_text(self, result) -> str:
@@ -184,7 +196,7 @@ class TestContentBlockPathCacheLookup:
         text = _routable_block_content()
         router = ContentRouter(ContentRouterConfig())
 
-        router._cache.mark_skip(hash(text))
+        router._cache.mark_skip(_seed_key(text))
         before = dict(router._cache.stats)
 
         result = router.apply([_tool_result_message(text)], _make_tokenizer())
@@ -205,7 +217,7 @@ class TestContentBlockPathCacheLookup:
         router = ContentRouter(ContentRouterConfig())
 
         stale_payload = "STALE-BLOCK-COMPRESSION-MUST-NOT-BE-SERVED"
-        router._cache.put(hash(text), stale_payload, 0.99, "log")
+        router._cache.put(_seed_key(text), stale_payload, 0.99, "log")
         assert router._cache.size == 1
         assert router._cache.skip_size == 0
         before = dict(router._cache.stats)
@@ -270,7 +282,7 @@ class TestCacheLookupRouteCounts:
         content = _routable_tool_content()
         obs = _CapturingObserver()
         router = ContentRouter(ContentRouterConfig(), observer=obs)
-        router._cache.mark_skip(hash(content))
+        router._cache.mark_skip(_seed_key(content))
 
         router.apply([_tool_message(content)], _make_tokenizer())
 
@@ -285,7 +297,7 @@ class TestCacheLookupRouteCounts:
         content = _routable_tool_content()
         obs = _CapturingObserver()
         router = ContentRouter(ContentRouterConfig(), observer=obs)
-        router._cache.put(hash(content), "STALE", 0.99, "log")
+        router._cache.put(_seed_key(content), "STALE", 0.99, "log")
 
         router.apply([_tool_message(content)], _make_tokenizer())
 
@@ -305,7 +317,7 @@ class TestCacheLookupRouteCounts:
         obs = _CapturingObserver()
         router = ContentRouter(ContentRouterConfig(), observer=obs)
         payload = "PRECOMPRESSED-PAYLOAD-NO-CCR-MARKERS"
-        router._cache.put(hash(content), payload, 0.3, "log")
+        router._cache.put(_seed_key(content), payload, 0.3, "log")
 
         result = router.apply([_tool_message(content)], _make_tokenizer())
 
@@ -331,7 +343,7 @@ class TestCacheLookupRouteCounts:
         text = _routable_block_content()
         obs = _CapturingObserver()
         router = ContentRouter(ContentRouterConfig(), observer=obs)
-        router._cache.mark_skip(hash(text))
+        router._cache.mark_skip(_seed_key(text))
 
         router.apply([_tool_result_message(text)], _make_tokenizer())
 
@@ -346,7 +358,7 @@ class TestCacheLookupRouteCounts:
         text = _routable_block_content()
         obs = _CapturingObserver()
         router = ContentRouter(ContentRouterConfig(), observer=obs)
-        router._cache.put(hash(text), "STALE", 0.99, "log")
+        router._cache.put(_seed_key(text), "STALE", 0.99, "log")
 
         router.apply([_tool_result_message(text)], _make_tokenizer())
 
@@ -362,7 +374,7 @@ class TestCacheLookupRouteCounts:
         obs = _CapturingObserver()
         router = ContentRouter(ContentRouterConfig(), observer=obs)
         payload = "PRECOMPRESSED-BLOCK-PAYLOAD-NO-CCR-MARKERS"
-        router._cache.put(hash(text), payload, 0.3, "log")
+        router._cache.put(_seed_key(text), payload, 0.3, "log")
 
         result = router.apply([_tool_result_message(text)], _make_tokenizer())
 

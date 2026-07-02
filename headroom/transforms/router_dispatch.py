@@ -41,6 +41,12 @@ _TryKompress = Callable[[str, str, str | None], tuple[str, int]]
 _RecordToToin = Callable[..., None]
 
 
+def _word_count(text: str) -> int:
+    """Whitespace word count — the historical token proxy, used whenever the
+    caller threads no real ``token_counter`` (COR-17)."""
+    return len(text.split())
+
+
 class StrategyDispatcher:
     """Applies a compression strategy and runs the no-savings fallback chain.
 
@@ -79,6 +85,7 @@ class StrategyDispatcher:
         get_html_extractor: _GetCompressor,
         try_kompress: _TryKompress,
         record_to_toin: _RecordToToin,
+        token_counter: Callable[[str], int] | None = None,
     ) -> tuple[str, int, list[str]]:
         """Apply a compression strategy to content.
 
@@ -96,6 +103,14 @@ class StrategyDispatcher:
             get_html_extractor: Router getter for the HTMLExtractor.
             try_kompress: Router-bound ML (Kompress) compression callable.
             record_to_toin: Router-bound TOIN recording callable.
+            token_counter: Optional real token counter (COR-17). When set,
+                every token count in this dispatch — original, per-strategy
+                compressed, and the fallback-chain comparisons — is measured
+                with it, so the ratio the router's ``min_ratio`` gate reads is
+                in tokenizer units, not whitespace words (word-ratios
+                systematically overstate savings on low-whitespace compaction
+                outputs). ``None`` keeps the historical word counts,
+                byte-identical to prior behavior.
 
         Returns:
             Tuple of (compressed_content, compressed_token_count,
@@ -107,8 +122,9 @@ class StrategyDispatcher:
             final compressor without parsing decision_reason strings.
         """
         logger = self._logger
+        count = token_counter or _word_count
         # Track original tokens for TOIN recording
-        original_tokens = len(content.split())
+        original_tokens = count(content)
         compressed: str | None = None
         compressed_tokens: int | None = None
         requested_strategy = strategy
@@ -125,6 +141,10 @@ class StrategyDispatcher:
                 if compressed is None:
                     # Fallback to Kompress
                     compressed, compressed_tokens = try_kompress(content, context, question)
+                    if token_counter is not None:
+                        # Recount in gate units: try_kompress reports its own
+                        # (word/ML) count, a third unit the ratio must not mix.
+                        compressed_tokens = token_counter(compressed)
                     strategy = CompressionStrategy.KOMPRESS  # Update for TOIN
                     actual_strategy = strategy
                     compressor_name = "KompressCompressor"
@@ -145,7 +165,7 @@ class StrategyDispatcher:
                         result = crusher.crush(content, query=context, bias=bias)
                         compressed, compressed_tokens = (
                             result.compressed,
-                            len(result.compressed.split()),
+                            count(result.compressed),
                         )
                         decision_reason = "smart_crusher"
 
@@ -157,7 +177,7 @@ class StrategyDispatcher:
                         result = compressor.compress(content, context=context, bias=bias)
                         compressed, compressed_tokens = (
                             result.compressed,
-                            len(result.compressed.split()),
+                            count(result.compressed),
                         )
                         decision_reason = "search_compressor"
 
@@ -167,13 +187,13 @@ class StrategyDispatcher:
                     if compressor:
                         compressor_name = type(compressor).__name__
                         result = compressor.compress(content, bias=bias)
-                        # Use the same word-count metric the rest of the
+                        # Use the same count metric the rest of the
                         # router uses; `compressed_line_count` is in
                         # lines, not tokens — recording it here made
                         # ratios meaningless against `original_tokens`.
                         compressed, compressed_tokens = (
                             result.compressed,
-                            len(result.compressed.split()),
+                            count(result.compressed),
                         )
                         decision_reason = "log_compressor"
 
@@ -184,7 +204,7 @@ class StrategyDispatcher:
                     result = compressor.compress(content, context=context)
                     compressed, compressed_tokens = (
                         result.compressed,
-                        len(result.compressed.split()),
+                        count(result.compressed),
                     )
                     decision_reason = "diff_compressor"
 
@@ -195,12 +215,14 @@ class StrategyDispatcher:
                         compressor_name = type(extractor).__name__
                         result = extractor.extract(content)
                         compressed = result.extracted
-                        # Estimate tokens from extracted text (simple word count)
-                        compressed_tokens = len(compressed.split()) if compressed else 0
+                        # Count extracted text in the caller's unit
+                        compressed_tokens = count(compressed) if compressed else 0
                         decision_reason = "html_extractor"
 
             elif strategy == CompressionStrategy.KOMPRESS:
                 compressed, compressed_tokens = try_kompress(content, context, question)
+                if token_counter is not None:
+                    compressed_tokens = token_counter(compressed)
                 compressor_name = "KompressCompressor"
                 decision_reason = "kompress"
 
@@ -208,6 +230,8 @@ class StrategyDispatcher:
                 # Prefer Kompress ML compressor for text
                 # Passes through unchanged if Kompress not available
                 compressed, compressed_tokens = try_kompress(content, context, question)
+                if token_counter is not None:
+                    compressed_tokens = token_counter(compressed)
                 compressor_name = "KompressCompressor"
                 decision_reason = "text_uses_kompress"
 
@@ -245,6 +269,8 @@ class StrategyDispatcher:
             if fallback_eligible_strategy and fallback_no_savings:
                 strategy_chain.append(CompressionStrategy.KOMPRESS.value)
                 fallback_compressed, fallback_tokens = try_kompress(content, context, question)
+                if token_counter is not None:
+                    fallback_tokens = token_counter(fallback_compressed)
                 if fallback_tokens < compressed_tokens:
                     compressed = fallback_compressed
                     compressed_tokens = fallback_tokens
@@ -269,7 +295,7 @@ class StrategyDispatcher:
                             except Exception as exc:  # noqa: BLE001
                                 logger.debug("Log fallback failed for SMART_CRUSHER: %s", exc)
                             else:
-                                log_compressed_tokens = len(log_result.compressed.split())
+                                log_compressed_tokens = count(log_result.compressed)
                                 if log_compressed_tokens < compressed_tokens:
                                     compressed = log_result.compressed
                                     compressed_tokens = log_compressed_tokens

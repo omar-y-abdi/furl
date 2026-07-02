@@ -1251,13 +1251,39 @@ class SmartCrusher(Transform):
                             self._notify_observer(tokens, tokenizer.count_text(crushed))
 
             # Anthropic-style: content is a list of blocks; each tool_result
-            # block has a string content field of its own.
+            # block has a string content field of its own — or, in the
+            # canonical Anthropic/MCP shape, a nested parts list
+            # ``[{"type": "text", "text": …}]`` whose text parts crush
+            # individually (COR-47 mirror; previously skipped entirely).
             content = msg.get("content")
             if isinstance(content, list):
                 for i, block in enumerate(content):
                     if not isinstance(block, dict) or block.get("type") != "tool_result":
                         continue
                     tool_content = block.get("content", "")
+                    if isinstance(tool_content, list):
+                        for j, part in enumerate(tool_content):
+                            if not isinstance(part, dict) or part.get("type") != "text":
+                                continue
+                            part_text = part.get("text", "")
+                            if not isinstance(part_text, str):
+                                continue
+                            part_tokens = tokenizer.count_text(part_text)
+                            if part_tokens <= self.config.min_tokens_to_crush:
+                                continue
+                            crushed, was_modified, info = self._smart_crush_content(
+                                part_text, query_context
+                            )
+                            if was_modified:
+                                marker = create_tool_digest_marker(compute_short_hash(part_text))
+                                tool_content[j]["text"] = crushed + "\n" + marker
+                                crushed_count += 1
+                                _record(block.get("tool_use_id"))
+                                markers_inserted.append(marker)
+                                if info:
+                                    transforms_applied.append(f"smart:{info}")
+                                self._notify_observer(part_tokens, tokenizer.count_text(crushed))
+                        continue
                     if not isinstance(tool_content, str):
                         continue
                     tokens = tokenizer.count_text(tool_content)
