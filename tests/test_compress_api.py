@@ -137,3 +137,70 @@ class TestCompressResultFields:
         assert result.tokens_after >= 0
         assert result.tokens_saved >= 0
         assert 0.0 <= result.compression_ratio <= 1.0
+
+
+class TestNoneToolCallsRegression:
+    """COR-46: ``tool_calls`` present with value ``None`` must never fail-open.
+
+    openai-python's ``ChatCompletionMessage.model_dump()`` serializes plain
+    assistant text turns as ``{"content": ..., "tool_calls": None}`` — the key
+    is PRESENT with value None, so ``msg.get("tool_calls", [])`` returns None
+    and iterating it raises TypeError. Because the message stays in history,
+    that failed EVERY subsequent request (fail-open, breaker cycling, 0%
+    compression forever). The walkers must use the ``or []`` idiom instead.
+    """
+
+    def test_none_content_and_none_tool_calls_does_not_fail_open(self):
+        """The exact openai-python model_dump() shape must compress cleanly."""
+        messages = [
+            {"role": "user", "content": "read the config file"},
+            # The killer shape: key present, value None (BEFORE the real tool
+            # call, so the tool_call_id lookup walker must also survive it).
+            {"role": "assistant", "content": None, "tool_calls": None},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_read_1",
+                        "type": "function",
+                        "function": {
+                            "name": "Read",
+                            "arguments": json.dumps({"file_path": "/tmp/config.json"}),
+                        },
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_read_1", "content": "key=value\n" * 120},
+            {"role": "assistant", "content": None, "tool_calls": None},
+            {"role": "user", "content": "now summarize it"},
+        ]
+
+        result = compress(messages, model="gpt-4o")
+
+        assert result.error is None, (
+            f"tool_calls=None must not trip the fail-open path: {result.error!r}"
+        )
+        assert len(result.messages) == len(messages)
+
+    def test_minimal_none_shape_error_is_none(self):
+        """Minimal regression fixture from the finding: content+tool_calls None."""
+        messages = [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": None, "tool_calls": None},
+        ]
+        result = compress(messages, model="gpt-4o")
+        assert result.error is None
+
+    def test_walkers_tolerate_none_tool_calls_directly(self):
+        """All three tool_calls walkers survive the present-but-None shape."""
+        from headroom.config import ReadLifecycleConfig
+        from headroom.transforms.content_router import ContentRouter
+        from headroom.transforms.read_lifecycle import ReadLifecycleManager
+
+        assistant_none = {"role": "assistant", "content": None, "tool_calls": None}
+
+        manager = ReadLifecycleManager(ReadLifecycleConfig())
+        assert manager._build_tool_metadata([assistant_none]) == {}
+        assert manager._find_tool_call_msg_index([assistant_none], "call_x") is None
+        assert ContentRouter()._build_tool_name_map([assistant_none]) == {}

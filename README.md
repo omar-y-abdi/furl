@@ -156,6 +156,29 @@ These are a single deterministic capture at HEAD (`benchmarks/BASELINE.md`). Acr
 
 </details>
 
+<details>
+<summary><b>Prompt caching (<code>cache_control</code>) — the frozen-prefix contract</b></summary>
+
+Headroom never modifies messages up to and including the highest Anthropic
+`cache_control` marker (the **frozen prefix**), so provider prompt caches keep
+hitting. Two rules keep caching and compression compatible:
+
+- **Mark the breakpoint before the live zone.** `cache_control` on the *last*
+  message freezes the whole conversation — every transform skips everything and
+  0 tokens are saved (`error` stays `None`). `compress()` flags this in
+  `result.warnings` and logs at WARNING. Either mark the breakpoint before the
+  turns you want compressed, or compress before marking.
+- **Pass back what Headroom shipped.** The provider cached the bytes Headroom
+  *returned* last turn, not your originals. On multi-turn conversations, feed
+  the previous `result.messages` back in — or don't move the marker forward
+  past turns that already shipped compressed. Re-sending original history with
+  a forward-moved marker guarantees a prefix-cache miss at the previously
+  compressed message and pins it uncompressed forever (it is frozen). A
+  best-effort detector (CCR registry hit inside the frozen prefix) surfaces
+  this in `result.warnings`.
+
+</details>
+
 ## Install
 
 ```bash

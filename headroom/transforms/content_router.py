@@ -1550,8 +1550,10 @@ class ContentRouter(Transform):
             if msg.get("role") != "assistant":
                 continue
 
-            # OpenAI format: tool_calls array
-            for tc in msg.get("tool_calls", []):
+            # OpenAI format: tool_calls array. `or []`: the key is
+            # present-but-None in openai-python model_dump() output —
+            # iterating None would TypeError and fail-open every request.
+            for tc in msg.get("tool_calls") or []:
                 if isinstance(tc, dict):
                     tc_id = tc.get("id", "")
                     name = tc.get("function", {}).get("name", "")
