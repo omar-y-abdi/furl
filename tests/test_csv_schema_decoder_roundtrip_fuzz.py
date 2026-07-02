@@ -1,6 +1,6 @@
 """RFC-4180 quote-aware round-trip fuzz tests for csv_schema_decoder.
 
-Two test families:
+Three test families:
 
 1. **Cluster-A regression** (targeted): a row containing a cell with an
    embedded newline must survive the full Rust-compact → Python-decode
@@ -18,6 +18,14 @@ Two test families:
    sentinel is present and the item is covered by a recoverable hash).
    ``null`` / absent-key / ``""`` are kept distinct via the reserved
    ``__null__`` / ``__missing__`` cell sentinels.
+
+3. **COR-13 decoder-coverage honesty** (heterogeneous + nested-object
+   shapes): the reference decoder proves flat-scalar tables only, so
+   ``Compaction::Buckets`` renders and ``CellValue::Nested`` cells must
+   be DECLINED from the lossless tier (fail-closed), while object/array
+   cells in ``json``-tagged columns of a flat table must round-trip via
+   ``json.loads``.  Contract: decode byte-exact OR decline — never ship
+   unverifiable bytes under the lossless claim.
 
 Note on "colons-in-keys": the CSV-schema formatter never quotes COLUMN
 NAMES — only cells (the ``kv_field_name`` quoting belongs to the
@@ -625,6 +633,261 @@ def test_grammar_breaking_column_key_declines_compaction() -> None:
             f"declined array for key {key!r} must ship verbatim "
             f"(byte-exact round-trip).\nRendered (first 300): {text[:300]}"
         )
+
+
+# ────────────── Test #1e — COR-13 decoder-coverage honesty ────────────────────
+#
+# The engine's lossless claim is "exact reconstruction through
+# ``decode_csv_schema_rows``" (module docstring of csv_schema_decoder).
+# Today that decoder proves flat-scalar TABLES only: ``Compaction::Buckets``
+# renders (``__buckets:``) decode to ``None`` and ``CellValue::Nested``
+# cells (CSV-quoted IR JSON) decode to plain strings.  COR-13's contract:
+# every shape either decodes byte-exact OR is DECLINED from the lossless
+# tier (falling back to verbatim passthrough or the CCR-recoverable lossy
+# path) — never shipped as "lossless" while being unverifiable.
+
+
+def _assert_decoded_exact_or_declined(items: list) -> str:
+    """COR-13 contract assertion.  Returns the route taken.
+
+    A CSV-schema render with NO drop sentinel is a lossless-tier claim:
+    it must reconstruct byte-exact through the reference decoder
+    (route ``"lossless"``).  Any other output means the shape was
+    declined from the lossless tier (route ``"declined"``); every input
+    row must then still be provable from the output alone — kept inline
+    verbatim or recoverable from the CCR store via a sentinel hash —
+    never silently lossy.
+    """
+    text = _compress_to_text(items)
+    expected = {_repr(it) for it in items}
+    rows = decode_csv_schema_rows(text)
+    if rows is not None and not _has_ccr_sentinel(text):
+        recovered = {_repr(row) for row in rows}
+        assert recovered == expected, (
+            f"lossless-tier render is NOT byte-exact: "
+            f"{len(expected - recovered)}/{len(items)} row(s) unprovable from the "
+            f"output alone (COR-13).\n"
+            f"First unprovable: {sorted(expected - recovered)[:1]}\n"
+            f"First decoded-but-wrong: {sorted(recovered - expected)[:1]}\n"
+            f"Rendered (first 300):\n{text[:300]}"
+        )
+        return "lossless"
+    # Declined from the lossless tier: rows kept inline (passthrough /
+    # lossy survivors) + rows recoverable from the CCR store must cover
+    # the whole corpus.
+    try:
+        parsed = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        parsed = None
+    inline: set[str] = set()
+    if isinstance(parsed, list):
+        inline = {
+            _repr(row) for row in parsed if not _has_json_ccr_sentinel(row)
+        }
+    recovered = inline | _ccr_recover_from_output(
+        items, ccr_enabled=True, ccr_inject_marker=True
+    )
+    missing = expected - recovered
+    assert not missing, (
+        f"shape was declined from the lossless tier but "
+        f"{len(missing)}/{len(items)} row(s) are NOT recoverable from the "
+        f"output alone — silent loss (COR-13).\n"
+        f"First missing: {sorted(missing)[:1]}\n"
+        f"Rendered (first 300):\n{text[:300]}"
+    )
+    return "declined"
+
+
+def _make_heterogeneous_rows(n_rows: int) -> list[dict]:
+    """Bucket-shaped corpus: two disjoint field sets sharing only a clean
+    string discriminator (``kind``) — the Rust compactor's heterogeneous
+    branch partitions this into ``Compaction::Buckets`` (core-field ratio
+    1/7 < 0.6; ``kind`` is present in every row, all-string, 2 buckets).
+    """
+    rows: list[dict] = []
+    for i in range(n_rows):
+        if i % 2 == 0:
+            rows.append(
+                {
+                    "kind": "user",
+                    "name": f"user-{i:03d}",
+                    "email": f"user{i}@example.com",
+                    "role": "admin" if i % 4 == 0 else "member",
+                }
+            )
+        else:
+            rows.append(
+                {
+                    "kind": "metric",
+                    "ts": 1700000000 + i,
+                    "value": i * 3,
+                    "unit": "ms",
+                }
+            )
+    return rows
+
+
+def _make_nested_array_rows(n_rows: int) -> list[dict]:
+    """Flat homogeneous keys, but ``children`` holds an array of ≥2
+    objects in every row — the compactor promotes those cells to
+    ``CellValue::Nested`` (CSV-quoted IR JSON on the wire, which the
+    reference decoder cannot invert).  The four long constant columns
+    fold into the declaration and dwarf the IR-JSON envelope overhead of
+    the tiny ``children`` cells, so the render clears the 30%
+    ``lossless_min_savings_ratio`` byte gate — only the COR-13
+    decoder-coverage gate can keep this shape off the lossless tier.
+    """
+    return [
+        {
+            "id": i,
+            "service": "auth-service-primary-eu-central-1.internal.example.com",
+            "status": "ok-and-healthy-and-ready",
+            "region": "eu-central-1-availability-zone-a",
+            "deployment": "blue-green-rollout-2026-06-15T00:00:00Z-primary",
+            "children": [{"k": i}, {"k": i + 1}],
+        }
+        for i in range(n_rows)
+    ]
+
+
+def _make_json_mixed_rows(n_rows: int) -> list[dict]:
+    """Flat table whose ``cfg`` column mixes object / array-of-scalars /
+    string cells.  The varying shapes keep the dotted-flatten pass out of
+    the picture (COR-14 — never uniform objects) and no cell is an
+    array-of-objects (never ``Nested``), so the table stays flat with a
+    ``json``-tagged column: object/array cells ship as CSV-quoted compact
+    JSON (the formatter's ``json_scalar_to_csv`` fallback).  The two
+    string variants pin the decode boundary: a quoted string cell must
+    stay a string even when it contains commas or looks like a JSON
+    string literal.
+    """
+    rows: list[dict] = []
+    for i in range(n_rows):
+        r = i % 4
+        cfg: object
+        if r == 0:
+            cfg = {"retries": i, "backoff": [i, i + 1]}
+        elif r == 1:
+            cfg = [i, i * 2, f"opt-{i}"]
+        elif r == 2:
+            cfg = f"plain, with a comma {i}"
+        else:
+            cfg = f'"looks like a JSON string literal {i}"'
+        rows.append(
+            {
+                "id": i,
+                "service": "auth-service-primary-eu-central-1",
+                "cfg": cfg,
+            }
+        )
+    return rows
+
+
+def test_json_tagged_object_and_array_cells_round_trip_byte_exact() -> None:
+    """COR-13 (c): object/array cells in a ``json``-tagged column of a
+    flat table must decode back to objects/arrays, not strings.
+
+    The formatter ships such cells as CSV-quoted compact JSON.  Before
+    the fix ``_decode_cell`` treated every CSV-quoted cell as a string
+    ("CSV-quoted cells are ALWAYS strings" — factually wrong for this
+    producer), silently corrupting the type of every object/array cell
+    on the lossless path.
+    """
+    items = _make_json_mixed_rows(60)
+    text = _compress_csv(items)
+
+    # The trigger shape must actually be on the wire: at least one
+    # CSV-quoted JSON object cell and one quoted JSON array cell.
+    assert '"{' in text and '"[' in text, (
+        f"expected CSV-quoted JSON container cells in the render; "
+        f"got:\n{text[:300]}"
+    )
+
+    rows = decode_csv_schema_rows(text)
+    assert rows is not None
+    assert rows == items, (
+        "json-tagged object/array cells did not round-trip byte-exact "
+        "(decoded as strings?).\n"
+        f"First decoded cfg values: {[r.get('cfg') for r in rows[:4]]!r}\n"
+        f"Rendered (first 300):\n{text[:300]}"
+    )
+    # Belt-and-suspenders on the exact type boundary.
+    assert isinstance(rows[0]["cfg"], dict), f"object cell: {rows[0]['cfg']!r}"
+    assert isinstance(rows[1]["cfg"], list), f"array cell: {rows[1]['cfg']!r}"
+    assert isinstance(rows[2]["cfg"], str), f"comma-string cell: {rows[2]['cfg']!r}"
+    assert rows[3]["cfg"] == '"looks like a JSON string literal 3"', (
+        f"a string cell that LOOKS like a JSON string literal must stay a "
+        f"string verbatim: {rows[3]['cfg']!r}"
+    )
+
+
+def test_heterogeneous_buckets_shape_never_ships_unverifiable_lossless() -> None:
+    """COR-13 (a): a ``__buckets:`` render is unverifiable by the
+    reference decoder (``decode_csv_schema_rows`` returns ``None``), so
+    the crusher must DECLINE heterogeneous arrays from the lossless tier
+    (fail-closed) until the decoder covers the Buckets grammar.
+    """
+    items = _make_heterogeneous_rows(60)
+    route = _assert_decoded_exact_or_declined(items)
+
+    text = _compress_to_text(items)
+    assert not text.startswith("__buckets:"), (
+        "a Compaction::Buckets render shipped under the lossless claim, but "
+        "the reference decoder cannot decode the __buckets: grammar "
+        f"(COR-13).\nRendered (first 200):\n{text[:200]}"
+    )
+    # Today's expected route.  When full Buckets decoder coverage lands,
+    # this pin flips to "lossless" — deliberate, so the coverage change
+    # is made consciously.
+    assert route == "declined", f"unexpected route {route!r}"
+
+
+def test_nested_array_of_objects_cells_never_ship_unverifiable_lossless() -> None:
+    """COR-13 (b): ``CellValue::Nested`` cells render as CSV-quoted IR
+    JSON (``{"_compaction":...}`` envelope) which the reference decoder
+    cannot invert — a lossless-tier render carrying one is unverifiable.
+    The crusher must DECLINE tables containing Nested cells from the
+    lossless tier (fail-closed) until the decoder covers them.
+    """
+    items = _make_nested_array_rows(60)
+    route = _assert_decoded_exact_or_declined(items)
+    assert route == "declined", f"unexpected route {route!r}"
+
+
+def test_small_array_nested_cells_decline_lossless_zone() -> None:
+    """Same Nested shape through the SMALL-array lossless zone
+    (``crush_array``'s tier-1 boundary, crusher.rs site 1): a small
+    nested-cell array must stay verbatim passthrough, never ship an
+    unverifiable table.
+    """
+    items = _make_nested_array_rows(6)
+    route = _assert_decoded_exact_or_declined(items)
+    assert route == "declined", f"unexpected route {route!r}"
+
+
+def test_fuzz_cor13_shapes_decode_exact_or_decline() -> None:
+    """Seeded fuzz over the three COR-13 shape families × size variants
+    (203 rows total): heterogeneous (Buckets), nested array-of-objects
+    cells (Nested), and flat json-tagged mixed columns.  Every corpus
+    must satisfy the COR-13 contract — decode byte-exact or decline —
+    regardless of which crusher zone (small-array / big-array / lossy
+    survivor) the size routes it through.
+    """
+    rng = random.Random(_FUZZ_SEED + 4)
+    corpora: list[list[dict]] = [
+        _make_heterogeneous_rows(60),
+        _make_heterogeneous_rows(8),
+        _make_nested_array_rows(60),
+        _make_nested_array_rows(6),
+        _make_json_mixed_rows(60),
+        _make_json_mixed_rows(9),
+    ]
+    for items in corpora:
+        # Shuffled order (seeded): the contract may not depend on arith
+        # folds / row order.  Shuffle a copy — generators stay pristine.
+        shuffled = list(items)
+        rng.shuffle(shuffled)
+        _assert_decoded_exact_or_declined(shuffled)
 
 
 # ───────────────────────── Test #2 — Property / fuzz ──────────────────────────

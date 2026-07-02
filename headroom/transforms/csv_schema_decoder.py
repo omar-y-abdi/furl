@@ -55,6 +55,17 @@ Encodings understood:
   delimiter); each row cell is ``<head_index><delim><tail>``, reconstructed
   as ``head[index] + tail``. A plain data cell starting with ``__head:`` is
   CSV-quoted by the formatter, so the preamble lines are unambiguous.
+* **JSON container cells** — a ``json``-tagged column may hold object /
+  array cells, shipped as CSV-quoted compact JSON; a quoted cell in such
+  a column whose payload starts with ``{``/``[`` and parses as a JSON
+  container decodes via ``json.loads``. Unambiguous for a conformant
+  producer: the Rust compactor canonicalizes any string cell that parses
+  as a JSON container (the parsed value replaces the string), so a
+  container-looking STRING cell never reaches the wire, and a quoted
+  cell that fails the container parse stays a string. Shapes the decoder
+  cannot prove (``__buckets:`` renders, ``CellValue::Nested`` IR-JSON
+  cells) are declined from the lossless tier by the crusher's accept
+  gates (COR-13, fail-closed) rather than shipped unverifiable.
 
 Lines that do not parse as rows (e.g. the lossy-survivor
 ``{"_ccr_dropped": ...}`` sentinel line) are skipped; callers treat
@@ -271,15 +282,34 @@ def _unquote_csv(raw: str) -> str:
 def _decode_cell(raw: str, type_tag: str) -> Any:
     """One rendered cell back to a JSON value.
 
-    CSV-quoted cells are ALWAYS strings (the formatter only quotes
-    string renderings). For unquoted cells the declared type tag
-    disambiguates: a ``string`` column's cell stays a string even when
-    it happens to look numeric; other tags go through ``json.loads``
-    with a raw-string fallback.
+    A CSV-quoted cell is a string EXCEPT in a ``json``-tagged column,
+    where the formatter (``json_scalar_to_csv``) ships object/array
+    cells as CSV-quoted compact JSON — those decode via ``json.loads``
+    (COR-13). The two cannot collide for a conformant producer: the
+    Rust compactor canonicalizes any STRING cell that parses as a JSON
+    container (``CellClass::StringifiedJson`` replaces the string with
+    its parsed value), so a string cell whose bytes start with ``{`` /
+    ``[`` and parse as a container never reaches the wire. A quoted
+    string cell that merely LOOKS like a JSON scalar (``"123"``, a
+    JSON-string-literal spelling, ...) is left untouched — only
+    container payloads decode.
+
+    For unquoted cells the declared type tag disambiguates: a
+    ``string`` column's cell stays a string even when it happens to
+    look numeric; other tags go through ``json.loads`` with a
+    raw-string fallback.
     """
-    if raw.startswith('"') and raw.endswith('"') and len(raw) >= 2:
-        return _unquote_csv(raw)
     base_tag = type_tag.rstrip("?")
+    if raw.startswith('"') and raw.endswith('"') and len(raw) >= 2:
+        text = _unquote_csv(raw)
+        if base_tag == "json" and text.startswith(("{", "[")):
+            try:
+                parsed = json.loads(text)
+            except (json.JSONDecodeError, ValueError):
+                return text  # CSV-special string cell — never invent data
+            if isinstance(parsed, (dict, list)):
+                return parsed
+        return text
     if base_tag == "string" and raw != "":
         return raw
     try:

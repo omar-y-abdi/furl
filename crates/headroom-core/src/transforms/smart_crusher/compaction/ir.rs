@@ -271,6 +271,34 @@ impl Compaction {
         )
     }
 
+    /// True when this compaction is a shape the reference decoder
+    /// (`headroom/transforms/csv_schema_decoder.py`) can prove lossless:
+    /// a flat [`Compaction::Table`] with no [`CellValue::Nested`]
+    /// sub-compactions.
+    ///
+    /// "Lossless" in this engine means *exact reconstruction through
+    /// that decoder*, and today it covers neither [`Compaction::Buckets`]
+    /// renders (the `__buckets:` grammar decodes to `None`) nor `Nested`
+    /// cells (CSV-quoted IR JSON decodes to a plain string) — so the
+    /// crusher's lossless-accept gates DECLINE those shapes (COR-13,
+    /// fail-closed like every stamp gate) until the decoder covers them.
+    /// Declined shapes fall back to the lossy-recoverable or untouched
+    /// path instead of shipping unverifiable bytes under the lossless
+    /// claim. Opaque-substitution policy stays with each call site (see
+    /// [`Self::contains_opaque_ref`]) — this predicate is about decoder
+    /// coverage only.
+    pub fn is_decoder_verifiable(&self) -> bool {
+        fn row_has_nested(row: &Row) -> bool {
+            row.0.iter().any(|c| matches!(c, CellValue::Nested(_)))
+        }
+        match self {
+            Compaction::Table { rows, .. } => !rows.iter().any(row_has_nested),
+            Compaction::Buckets { .. }
+            | Compaction::OpaqueRef { .. }
+            | Compaction::Untouched(_) => false,
+        }
+    }
+
     /// True if ANY cell in the tree is an [`CellValue::OpaqueRef`]
     /// substitution (or the tree itself is a top-level
     /// [`Compaction::OpaqueRef`]). Used by callers that only want a
@@ -371,5 +399,61 @@ mod tests {
         let n = CellValue::Scalar(Value::Null);
         // Smoke test: just confirm both variants exist and Debug differs.
         assert_ne!(format!("{m:?}"), format!("{n:?}"));
+    }
+
+    // ---------- is_decoder_verifiable (COR-13) ----------
+
+    #[test]
+    fn flat_scalar_table_is_decoder_verifiable() {
+        let c = Compaction::Table {
+            schema: Schema { fields: vec![] },
+            rows: vec![
+                Row::new(vec![CellValue::Scalar(json!(1)), CellValue::Missing]),
+                Row::new(vec![
+                    CellValue::Scalar(json!("a")),
+                    CellValue::Scalar(json!(null)),
+                ]),
+            ],
+            original_count: 2,
+        };
+        assert!(c.is_decoder_verifiable());
+    }
+
+    #[test]
+    fn table_with_nested_cell_is_not_decoder_verifiable() {
+        let sub = Compaction::Table {
+            schema: Schema { fields: vec![] },
+            rows: vec![Row::new(vec![])],
+            original_count: 1,
+        };
+        let c = Compaction::Table {
+            schema: Schema { fields: vec![] },
+            rows: vec![Row::new(vec![
+                CellValue::Scalar(json!(1)),
+                CellValue::Nested(Box::new(sub)),
+            ])],
+            original_count: 1,
+        };
+        // A Nested cell renders as CSV-quoted IR JSON, which the
+        // reference decoder decodes to a plain string — unverifiable.
+        assert!(!c.is_decoder_verifiable());
+    }
+
+    #[test]
+    fn buckets_opaque_and_untouched_are_not_decoder_verifiable() {
+        let buckets = Compaction::Buckets {
+            discriminator: "type".into(),
+            buckets: vec![],
+            original_count: 0,
+        };
+        let opaque = Compaction::OpaqueRef {
+            ccr_hash: "abc123".into(),
+            byte_size: 10,
+            kind: OpaqueKind::LongString,
+        };
+        let untouched = Compaction::Untouched(json!([1, 2]));
+        assert!(!buckets.is_decoder_verifiable());
+        assert!(!opaque.is_decoder_verifiable());
+        assert!(!untouched.is_decoder_verifiable());
     }
 }
