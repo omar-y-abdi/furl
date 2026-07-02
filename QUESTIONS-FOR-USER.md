@@ -58,7 +58,10 @@
     **Rec: keep guarded + document** (safe; exposing is a surface-API change).
 
 ## B. New questions arising mid-run
-_(appended as they come up)_
+
+13. **README multiturn number sync (COR-52 contract-fix).** COR-52 fixed dedup to honor `protect_recent` (recent messages no longer wrongly deduped) → multiturn `86.5% → 85.1%` (contract-correct; the old number captured the over-dedup bug). I re-baselined `benchmarks/baseline_results.json` (multiturn 2211) autonomously, but the **README Proof table still says multiturn 87%** — now overstates by ~2pp. **Rec:** sync README multiturn to 85%. Trivial factual update, flagged only because README is outward-facing/you-arbitrated.
+
+14. **PR #5 CCR-offload — the `code 99%` framing (informational, no action unless you disagree).** Merged per your authorization; `code@7` shows 98.9% via CCR-offload (recoverable), but real agent file-reads (Read/Glob) are excluded from offload → stay 0%. README honestly says "identity preview + retrieval marker ships in place of the full files," but a reader could infer "my code compresses 99%." If you want, add one line clarifying the offload targets large non-file-read tool outputs. Left as-is (honest enough); flagging for transparency.
 
 ---
 ### Execution status while these wait
