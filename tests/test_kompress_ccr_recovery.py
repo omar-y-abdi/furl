@@ -143,3 +143,68 @@ def test_direct_path_band_0_70_still_recoverable(monkeypatch) -> None:
     result = comp.compress(content)
     assert result.compression_ratio < 0.8
     _assert_recoverable(result, content, ("word17", "word18", "word19"))
+
+
+# ---------------------------------------------------------------------------
+# COR-6  store-failure veto: _store_in_ccr returning None must NOT ship an
+# applied-but-unbacked (marker-less) sub-0.9 result — it must fall back to
+# passthrough so no word is dropped without a recovery copy.
+# ---------------------------------------------------------------------------
+
+
+def test_direct_path_store_failure_reverts_to_passthrough(monkeypatch) -> None:
+    """compress(): CCR store failure on a sub-0.9 compression must veto to
+    passthrough (COR-6). Pre-fix the swallowed None shipped the compressed
+    result with NO marker → dropped words unrecoverable.
+
+    RED before the fix: output == compressed (words dropped, no cache_key).
+    GREEN after: output == original, ratio 1.0, no marker."""
+    comp = _stub(monkeypatch, keep_k=17)  # 17/20 = 0.85 ∈ [0.8, 0.9)
+    # Simulate a store write failure: _store_in_ccr swallows and returns None.
+    monkeypatch.setattr(comp, "_store_in_ccr", lambda *a, **k: None)
+    content = _content(20)
+
+    result = comp.compress(content)
+
+    # Veto: nothing dropped, no marker, ratio 1.0 — the applied-but-unbacked
+    # band is closed by reverting to passthrough.
+    assert result.compressed == content, (
+        "store failure must revert to passthrough (no applied-but-unbacked loss)"
+    )
+    assert result.cache_key is None, "vetoed passthrough carries no cache_key"
+    assert result.compression_ratio == 1.0
+    assert "Retrieve more" not in result.compressed, "no CCR marker on a store-failure veto"
+    for w in ("word17", "word18", "word19"):
+        assert w in result.compressed, f"{w} must survive (nothing dropped) after the veto"
+
+
+def test_batch_path_store_failure_reverts_to_passthrough(monkeypatch) -> None:
+    """compress_batch() (production batched path): same COR-6 veto. Force the
+    batched code (not the ONNX-CPU sequential fallback) so the SECOND
+    _store_in_ccr call site is exercised."""
+    comp = _stub(monkeypatch, keep_k=17)
+    monkeypatch.setattr(comp, "_should_use_sequential_fallback", lambda: False)
+    monkeypatch.setattr(comp, "_store_in_ccr", lambda *a, **k: None)
+    content = _content(20)
+
+    results = comp.compress_batch([content], target_ratio=[None])
+
+    assert len(results) == 1
+    result = results[0]
+    assert result.compressed == content, (
+        "batched store failure must revert that text to passthrough (COR-6)"
+    )
+    assert result.cache_key is None
+    assert result.compression_ratio == 1.0
+    assert "Retrieve more" not in result.compressed
+
+
+def test_store_success_still_compresses_and_backs(monkeypatch) -> None:
+    """Control: with a WORKING store the sub-0.9 compression still applies and
+    is CCR-backed — proving the COR-6 veto is a change-on-FAILURE, not a
+    blanket disable of compression."""
+    comp = _stub(monkeypatch, keep_k=17)
+    content = _content(20)
+    result = comp.compress(content)
+    assert 0.8 <= result.compression_ratio < 0.9
+    _assert_recoverable(result, content, ("word17", "word18", "word19"))

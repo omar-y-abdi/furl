@@ -812,7 +812,17 @@ class KompressCompressor(Transform):
 
         try:
             model, tokenizer, backend = _load_kompress(self.config.model_id, self.config.device)
-            is_onnx = backend == "onnx"
+            # `startswith` so the CoreML loader's `backend="onnx_coreml"` also
+            # takes the ONNX inference path — a bare `== "onnx"` sent it down
+            # the PyTorch branch → AttributeError on `_OnnxModel.parameters`,
+            # disabling compression for HEADROOM_KOMPRESS_BACKEND=coreml
+            # (COR-11; matches `_model_device_type`'s existing intent).
+            # `startswith` so the CoreML loader's `backend="onnx_coreml"` also
+            # takes the ONNX inference path — a bare `== "onnx"` sent it down
+            # the PyTorch branch → AttributeError on `_OnnxModel.parameters`,
+            # disabling compression for HEADROOM_KOMPRESS_BACKEND=coreml
+            # (COR-11; matches `_model_device_type`'s existing intent).
+            is_onnx = backend.startswith("onnx")
             device_type = _model_device_type(model, backend)
 
             if self._should_batch_single_content(model, backend):
@@ -947,6 +957,24 @@ class KompressCompressor(Transform):
                         f"\n[{n_words} items compressed to {compressed_count}."
                         f" Retrieve more: hash={cache_key}]"
                     )
+                else:
+                    # CCR store failed (returned None) but apply() WOULD drop
+                    # these words (ratio < 0.9). Shipping the compressed result
+                    # with no recovery marker re-opens the applied-but-unbacked
+                    # band — the dropped words become silently unrecoverable
+                    # (#2, COR-6). Every sibling vetoes this loss loudly
+                    # (smart_crusher raises CcrMirrorError; diff/log/search veto
+                    # to passthrough); do the same here — fall back to
+                    # passthrough so nothing is dropped without a recovery copy.
+                    logger.error(
+                        "Kompress CCR store failed for a ratio=%.3f compression "
+                        "(%d->%d words); reverting to passthrough to avoid "
+                        "applied-but-unbacked word loss",
+                        ratio,
+                        n_words,
+                        compressed_count,
+                    )
+                    return self._passthrough(content, n_words)
 
             if inference_ms >= 1000.0:
                 logger.info(
@@ -1098,7 +1126,9 @@ class KompressCompressor(Transform):
             return [r for r in results if r is not None]
         # Other load errors are bugs (#4): propagate.
 
-        is_onnx = backend == "onnx"
+        # `startswith` so `onnx_coreml` (CoreML loader) takes the ONNX path;
+        # `== "onnx"` misrouted it to PyTorch → AttributeError (COR-11).
+        is_onnx = backend.startswith("onnx")
         device_type = _model_device_type(model, backend)
         kept_ids_per_text: dict[int, set[int]] = {i: set() for i in range(n) if results[i] is None}
         # For target_ratio texts: accumulate per-word scores across all chunks
@@ -1166,9 +1196,20 @@ class KompressCompressor(Transform):
                                 gmap[gid] = score
                     else:
                         # Threshold from config (default 0.5, matches ONNX get_keep_mask).
-                        for wid, score in word_scores.items():
-                            if score > self.config.score_threshold:
-                                kept_ids_per_text[text_idx].add(wid + chunk_start)
+                        #
+                        # Skip texts already FINALIZED to passthrough: when an
+                        # earlier batch raised a model-unavailable error, the
+                        # affected texts were popped from `kept_ids_per_text`
+                        # (:pop below). A later successful batch carrying the
+                        # same text's remaining chunks would then `.add(...)` on
+                        # the popped key → KeyError, propagating the handled
+                        # model-unavailable case as a "bug" (COR-12). The
+                        # membership guard skips those finalized texts.
+                        kept_ids = kept_ids_per_text.get(text_idx)
+                        if kept_ids is not None:
+                            for wid, score in word_scores.items():
+                                if score > self.config.score_threshold:
+                                    kept_ids.add(wid + chunk_start)
 
             except _MODEL_UNAVAILABLE_ERRORS as e:
                 # Runtime unavailable mid-batch — legitimate passthrough of the
@@ -1231,6 +1272,21 @@ class KompressCompressor(Transform):
                         f"\n[{n_words} items compressed to {compressed_count}."
                         f" Retrieve more: hash={cache_key}]"
                     )
+                else:
+                    # CCR store failed but apply() WOULD drop these words
+                    # (ratio < 0.9). Ship passthrough for this slot instead of
+                    # an applied-but-unbacked result (#2, COR-6) — same veto
+                    # the single-content path and every sibling transform make.
+                    logger.error(
+                        "Kompress CCR store failed for a ratio=%.3f batched "
+                        "compression (%d->%d words); reverting that text to "
+                        "passthrough to avoid applied-but-unbacked word loss",
+                        comp_ratio,
+                        n_words,
+                        compressed_count,
+                    )
+                    results[text_idx] = self._passthrough(content, n_words)
+                    continue
 
             results[text_idx] = result
 
@@ -1287,8 +1343,8 @@ class KompressCompressor(Transform):
 
         model, _tokenizer, backend = _kompress_cache[model_id]
 
-        if backend == "onnx":
-            return True  # ONNX CPU provider doesn't parallelize batch dim
+        if backend.startswith("onnx"):
+            return True  # ONNX provider doesn't parallelize batch dim (incl. onnx_coreml, COR-11)
         if backend == "pytorch":
             try:
                 import torch
