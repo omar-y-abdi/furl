@@ -57,12 +57,6 @@ mcp = [
     "mcp>=1.0.0",
     "httpx>=0.24.0",
 ]
-# HTML content extraction with trafilatura (article/main-content detection,
-# boilerplate removal). Powers the HTMLExtractor / HTML routing strategy in
-# headroom.transforms.html_extractor; absent => HTML extraction degrades off.
-html = [
-    "trafilatura>=1.6",
-]
 # Development dependencies
 dev = [
     "pytest>=7.0.0",
@@ -75,7 +69,7 @@ dev = [
 ]
 # All optional dependencies (everything the compression library can use)
 all = [
-    "headroom-ai[mcp,html]",
+    "headroom-ai[mcp]",
 ]
 
 # Maturin builds a single wheel containing both the Python source under

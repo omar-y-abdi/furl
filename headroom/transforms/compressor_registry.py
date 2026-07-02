@@ -1,9 +1,8 @@
 """Lazy compressor registry for the content router.
 
-Owns the five SELF-CONTAINED lazy compressor factories that the
+Owns the four SELF-CONTAINED lazy compressor factories that the
 :class:`~headroom.transforms.content_router.ContentRouter` dispatches to:
-SmartCrusher, SearchCompressor, LogCompressor, DiffCompressor, and
-HTMLExtractor.
+SmartCrusher, SearchCompressor, LogCompressor, and DiffCompressor.
 
 Each factory is a plain lazy-init-and-cache: it reads only from the router's
 ``ContentRouterConfig`` and memoizes the constructed compressor in a private
@@ -24,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 
 class CompressorRegistry:
-    """Lazy-init + cache for the five self-contained compressors.
+    """Lazy-init + cache for the four self-contained compressors.
 
     Construct with the router's :class:`ContentRouterConfig`; each ``get_*``
     method lazy-imports and instantiates its compressor on first call and
@@ -39,7 +38,6 @@ class CompressorRegistry:
         self._search_compressor: Any = None
         self._log_compressor: Any = None
         self._diff_compressor: Any = None
-        self._html_extractor: Any = None
 
     def get_smart_crusher(self) -> Any:
         """Get SmartCrusher (lazy load) with CCR config."""
@@ -99,14 +97,3 @@ class CompressorRegistry:
 
             self._diff_compressor = DiffCompressor()
         return self._diff_compressor
-
-    def get_html_extractor(self) -> Any:
-        """Get HTMLExtractor (lazy load)."""
-        if self._html_extractor is None:
-            try:
-                from .html_extractor import HTMLExtractor
-
-                self._html_extractor = HTMLExtractor()
-            except ImportError:
-                logger.debug("HTMLExtractor not available (install trafilatura)")
-        return self._html_extractor

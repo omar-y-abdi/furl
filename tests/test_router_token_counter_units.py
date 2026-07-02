@@ -62,7 +62,6 @@ def _apply_dispatch(dispatcher, content, strategy, *, crusher=None, token_counte
         get_search_compressor=lambda: None,
         get_log_compressor=lambda: None,
         get_diff_compressor=lambda: None,
-        get_html_extractor=lambda: None,
         record_to_toin=(toin if toin is not None else (lambda **kwargs: None)),
         token_counter=token_counter,
     )

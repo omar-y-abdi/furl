@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import importlib.util
 from importlib import import_module
 from typing import TYPE_CHECKING
 
@@ -27,12 +26,6 @@ if TYPE_CHECKING:
         DiffCompressor,
         DiffCompressorConfig,
     )
-    from headroom.transforms.html_extractor import (  # noqa: F401
-        HTMLExtractionResult,
-        HTMLExtractor,
-        HTMLExtractorConfig,
-        is_html_content,
-    )
     from headroom.transforms.log_compressor import (  # noqa: F401
         LogCompressionResult,
         LogCompressor,
@@ -45,8 +38,6 @@ if TYPE_CHECKING:
         SearchCompressorConfig,
     )
     from headroom.transforms.smart_crusher import SmartCrusher, SmartCrusherConfig  # noqa: F401
-
-_HTML_EXTRACTOR_AVAILABLE = importlib.util.find_spec("trafilatura") is not None
 
 __all__ = [
     # Base
@@ -76,20 +67,7 @@ __all__ = [
     # Other transforms
     "CacheAligner",
     "CrossMessageDeduper",
-    # HTML extraction (optional)
-    "_HTML_EXTRACTOR_AVAILABLE",
 ]
-
-# Conditionally add HTML extractor exports
-if _HTML_EXTRACTOR_AVAILABLE:
-    __all__.extend(
-        [
-            "HTMLExtractor",
-            "HTMLExtractorConfig",
-            "HTMLExtractionResult",
-            "is_html_content",
-        ]
-    )
 
 _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     # Base
@@ -135,19 +113,12 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
         "headroom.transforms.cross_message_dedup",
         "CrossMessageDeduper",
     ),
-    # HTML extraction (optional dependency - requires trafilatura)
-    "HTMLExtractor": ("headroom.transforms.html_extractor", "HTMLExtractor"),
-    "HTMLExtractorConfig": ("headroom.transforms.html_extractor", "HTMLExtractorConfig"),
-    "HTMLExtractionResult": ("headroom.transforms.html_extractor", "HTMLExtractionResult"),
-    "is_html_content": ("headroom.transforms.html_extractor", "is_html_content"),
 }
 
 
 def __getattr__(name: str) -> object:
     if name == "__path__":
         raise AttributeError(name)
-    if name == "_HTML_EXTRACTOR_AVAILABLE":
-        return _HTML_EXTRACTOR_AVAILABLE
 
     try:
         module_name, attr_name = _LAZY_EXPORTS[name]

@@ -641,7 +641,7 @@ def _get_pipeline() -> Any:
         # default False): when enabled it runs first and only WARNS about
         # unstable prefixes — detector-only, never rewrites the prompt.
         # ContentRouter: routes to the right compressor per content type
-        #   (SmartCrusher for JSON; log/search/diff/HTML compressors;
+        #   (SmartCrusher for JSON; log/search/diff compressors;
         #   plain text and source code pass through)
         # There is no trailing context-management stage —
         # live-zone-only compression never drops messages.
