@@ -372,7 +372,12 @@ fn parse_tag_at(bytes: &[u8], start: usize) -> TagParse {
                 };
             }
             b'/' => {
-                self_closing = true;
+                // Self-closing ONLY when the `/` immediately precedes `>`
+                // (`.../>`). A bare `/` elsewhere is ordinary attribute-value
+                // text — an unquoted URL like `url=http://x.com` contains
+                // slashes that must NOT flip the tag to self-closing (COR-9),
+                // or the body gets exposed and the close tag orphaned.
+                self_closing = i + 1 < n && bytes[i + 1] == b'>';
                 i += 1;
             }
             b'"' | b'\'' => {
@@ -388,9 +393,6 @@ fn parse_tag_at(bytes: &[u8], start: usize) -> TagParse {
                 self_closing = false;
             }
             _ => {
-                if bytes[i].is_ascii_whitespace() {
-                    self_closing = false;
-                }
                 i += 1;
             }
         }
@@ -564,12 +566,17 @@ fn identify_spans(
                 match matching {
                     Some(stack_idx) => {
                         if compress_tagged_content {
-                            // Pop everything above (orphan opens
-                            // inside the matched span — their open
-                            // markers were already recorded as spans
-                            // and we keep them).
+                            // Remove the matched open tag AND every orphan
+                            // open nested inside it (their open markers were
+                            // already recorded as spans and we keep them).
+                            // `truncate(stack_idx)` drops the matched tag at
+                            // `stack_idx` and everything above it in ONE step
+                            // — a following `pop()` would additionally remove
+                            // the ENCLOSING open tag (the one at
+                            // `stack_idx - 1`), leaving its close unmatched
+                            // and violating the restore-symmetry invariant
+                            // for nested tags like `<a><b>x</b>y</a>` (COR-8).
                             stack.truncate(stack_idx);
-                            let _ = stack.pop();
                             spans.push(Span {
                                 start: i,
                                 end: tag_end,
@@ -811,6 +818,33 @@ mod tests {
     }
 
     #[test]
+    fn unquoted_slash_attribute_is_not_self_closing() {
+        // COR-9 regression. A `/` inside an unquoted attribute value
+        // (`url=http://x.com`) used to set `self_closing = true`, so the
+        // open `<citation>` was misclassified as self-closing: its body
+        // was exposed and the `</citation>` close orphaned (unbalanced
+        // restore). A `/` is only self-closing when immediately followed
+        // by `>`. The whole element must be protected as ONE span.
+        let text = "<citation url=http://x.com>body</citation>";
+        let (cleaned, blocks) = protect(text);
+        assert_eq!(
+            blocks.len(),
+            1,
+            "unquoted-URL element must protect as one span, got {}: {:?}",
+            blocks.len(),
+            blocks
+        );
+        assert_eq!(blocks[0].1, text, "the full element must be captured");
+        assert!(
+            !cleaned.contains("body"),
+            "the body must NOT be exposed (tag was mis-parsed self-closing): {cleaned:?}"
+        );
+        // Round-trips exactly — no orphan close, no asymmetry.
+        let restored = restore_tags(&cleaned, &blocks);
+        assert_eq!(restored, text);
+    }
+
+    #[test]
     fn nested_custom_tags_collapse_to_outer_span() {
         let text = "<outer><inner>deep</inner></outer>";
         let (cleaned, blocks) = protect(text);
@@ -864,6 +898,47 @@ mod tests {
         assert!(!cleaned.contains("</system-reminder>"));
         assert!(cleaned.contains("Compressible content"));
         assert_eq!(blocks.len(), 2);
+    }
+
+    #[test]
+    fn marker_mode_nested_tags_protect_both_closes() {
+        // COR-8 regression. In marker mode, close-matching used to run
+        // `truncate(stack_idx)` AND `pop()`, so a nested inner close
+        // removed its ENCLOSING open from the stack — the later outer
+        // close then matched nothing and was left RAW in the cleaned
+        // text. A compressor stripping that orphan outer close yields
+        // asymmetric tags after restore (the exact failure this module
+        // prevents).
+        //
+        // Custom (non-HTML) tag names are required to reach the marker
+        // path — `is_known_html_tag` skips real HTML names like `a`/`b`
+        // (the recon's `<a><b>` shape never reaches this code). For
+        // `<outer><inner>x</inner>y</outer>` marker mode must emit FOUR
+        // marker placeholders (open outer, open inner, close inner,
+        // close outer) with the body text left inline — and NO raw tag
+        // may survive in the cleaned output.
+        let text = "<outer><inner>x</inner>y</outer>";
+        let (cleaned, blocks, _stats) = protect_tags(text, true);
+
+        assert_eq!(
+            blocks.len(),
+            4,
+            "expected 4 marker placeholders (both opens + both closes), \
+             got {}: {:?}",
+            blocks.len(),
+            blocks
+        );
+        // Body text stays inline; every tag marker is replaced.
+        assert!(cleaned.contains('x') && cleaned.contains('y'));
+        for raw in ["<outer>", "<inner>", "</inner>", "</outer>"] {
+            assert!(
+                !cleaned.contains(raw),
+                "raw tag {raw:?} leaked into cleaned marker-mode output: {cleaned:?}"
+            );
+        }
+        // Restore is symmetric: round-trips back to the exact original.
+        let restored = restore_tags(&cleaned, &blocks);
+        assert_eq!(restored, text, "nested marker-mode restore must round-trip");
     }
 
     #[test]
