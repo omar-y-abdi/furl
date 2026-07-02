@@ -12,7 +12,6 @@
 
 <p align="center">
   <a href="https://pypi.org/project/headroom-ai/"><img src="https://img.shields.io/pypi/v/headroom-ai.svg" alt="PyPI"></a>
-  <a href="https://huggingface.co/chopratejas/kompress-v2-base"><img src="https://img.shields.io/badge/model-Kompress--v2--base-yellow.svg" alt="Model: Kompress-v2-base"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" alt="License: Apache 2.0"></a>
 </p>
 
@@ -54,7 +53,7 @@ Headroom compresses everything your AI agent reads — tool outputs, logs, RAG c
     │  ────────────────────────────────────────────────  │
     │  CacheAligner  →  ContentRouter  →  CCR            │
     │                    ├─ SmartCrusher   (JSON)        │
-    │                    └─ Kompress-v2-base  (text+code)│
+    │                    └─ Search / Log / Diff          │
     │                                                    │
     │  Reversible CCR store  ·  MCP server               │
     └────────────────────────────────────────────────────┘
@@ -64,11 +63,10 @@ Headroom compresses everything your AI agent reads — tool outputs, logs, RAG c
 ```
 
 - **ContentRouter** — detects content type, selects the right compressor
-- **SmartCrusher / Kompress-v2-base** — compress JSON, or prose and source code
+- **SmartCrusher** — statistical JSON / array compression
+- **Search / Log / Diff compressors** — search results, build logs, diffs
 - **CacheAligner** — stabilizes prefixes so provider KV caches actually hit
 - **CCR** — stores originals locally; LLM calls `headroom_retrieve` if it needs them
-
-→ [Kompress-v2-base model card](https://huggingface.co/chopratejas/kompress-v2-base)
 
 ## Get started (60 seconds)
 
@@ -91,7 +89,7 @@ result = compress(messages, model="claude-sonnet-4")
 python -m headroom.ccr.mcp_server       # exposes headroom_compress / _retrieve / _stats
 ```
 
-Granular extras: `[mcp]`, `[ml]` (Kompress-v2-base), `[html]`, `[dev]`. Requires **Python 3.10+**.
+Granular extras: `[mcp]` (MCP server), `[dev]`. Requires **Python 3.10+**.
 
 ## Proof
 
@@ -101,14 +99,14 @@ Granular extras: `[mcp]`, `[ml]` (Kompress-v2-base), `[html]`, `[dev]`. Requires
 |---------------|------:|-------:|-------:|----------:|-------------|---------------:|
 | code          |     7 | 41,025 |    471 |       99% | lossy (CCR) |           100% |
 | disk          |     9 |    694 |    347 |       50% | lossless    |           100% |
-| multiturn     |   135 | 14,866 |  2,009 |       87% | lossy (CCR) |           100% |
+| multiturn     |   135 | 14,866 |  2,211 |       85% | lossy (CCR) |           100% |
 | logs          |    90 |  8,595 |    619 |       93% | lossy (CCR) |           100% |
 | search        |    90 |  4,102 |    318 |       92% | lossy (CCR) |           100% |
 | repeated logs |    90 |  3,621 |    120 |       97% | lossy (CCR) |           100% |
 
 <sub>**Regime** — *lossless*: the compressed output is self-contained (zero rows dropped). *lossy (CCR)*: rows are offloaded to the local CCR store and replaced with `<<ccr:HASH>>` markers — smaller output, and **every dropped row is byte-exactly recoverable on demand** (100% info retention, within the configured TTL). `code` (large distinct source files that no compressor can shrink) takes the reversible CCR-offload fallback: an identity preview (paths + first lines) plus a retrieval marker ships in place of the full files.</sub>
 
-These are a single deterministic capture at HEAD (`benchmarks/BASELINE.md`). Across the whole corpus the table sums to **95% fewer tokens** (72,903 → 3,884) at 100% information retention; the **60–95%** headline maps to this table's lossy-CCR range. Full methodology and the 6-seed adversarial sweep live in [BENCHMARKS.md](BENCHMARKS.md).
+These are a single deterministic capture at HEAD (`benchmarks/BASELINE.md`). Across the whole corpus the table sums to **94% fewer tokens** (72,903 → 4,086) at 100% information retention; the **60–95%** headline maps to this table's lossy-CCR range. Full methodology and the 6-seed adversarial sweep live in [BENCHMARKS.md](BENCHMARKS.md).
 
 ## When to use · When to skip
 
@@ -135,10 +133,10 @@ These are a single deterministic capture at HEAD (`benchmarks/BASELINE.md`). Acr
 <summary><b>What's inside</b></summary>
 
 - **SmartCrusher** — universal JSON: arrays of dicts, nested objects, mixed types.
-- **Kompress-v2-base** — our HuggingFace model, trained on agentic traces; also handles source code.
 - **SearchCompressor / LogCompressor / DiffCompressor** — search results, build logs, and diffs.
+- **CrossMessageDeduper** — deduplicates repeated content across conversation turns.
 - **CacheAligner** — stabilizes prefixes so Anthropic/OpenAI KV caches actually hit.
-- **CCR** — reversible compression; LLM retrieves originals on demand.
+- **CCR** — reversible compression; LLM retrieves originals on demand. Large distinct content no compressor can shrink (e.g. source files) takes the reversible CCR offload: an identity preview plus a retrieval marker.
 
 </details>
 
@@ -149,7 +147,7 @@ These are a single deterministic capture at HEAD (`benchmarks/BASELINE.md`). Acr
 
 `Input Received` → `Input Routed` → `Input Compressed`
 
-- **Transforms** do the work: CacheAligner, CrossMessageDeduper, ContentRouter, SmartCrusher, Kompress-v2-base.
+- **Transforms** do the work: CacheAligner, CrossMessageDeduper, ContentRouter, SmartCrusher.
 - **Pipeline extensions** observe or customize these stages via `on_pipeline_event(...)`; `compress()` passes your `hooks` object as the extension.
 - **Compression hooks** sit alongside the lifecycle as an additional extension seam.
 
@@ -184,7 +182,7 @@ hitting. Two rules keep caching and compression compatible:
 pip install "headroom-ai[all]"          # everything
 ```
 
-Granular extras: `[mcp]` (MCP server), `[ml]` (Kompress-v2-base), `[html]` (HTML extraction), `[dev]`. Requires **Python 3.10+**.
+Granular extras: `[mcp]` (MCP server), `[dev]`. Requires **Python 3.10+**.
 
 Using `pipx`? Choose a supported interpreter explicitly:
 
@@ -209,15 +207,12 @@ winget install Rustlang.Rustup && rustup default stable
 Restart your shell, then `pip install "headroom-ai[all]"`. A prebuilt wheel avoids the Rust
 build entirely where available: `pip install --only-binary headroom-ai headroom-ai`.
 
-Two runtime assets are fetched over TLS; if they are blocked, trust your corporate CA via
+One runtime asset is fetched over TLS; if it is blocked, trust your corporate CA via
 `REQUESTS_CA_BUNDLE` / `SSL_CERT_FILE` / `CURL_CA_BUNDLE`:
 
-- **`cdn.pyke.io`** — the ONNX Runtime for the Rust core. Alternatively pre-provide it with
-  `ORT_STRATEGY=system` and `ORT_LIB_LOCATION=/path/to/onnxruntime`.
-- **`huggingface.co`** — the `chopratejas/kompress-v2-base` compression model. Pre-download it and run with
-  `HF_HUB_OFFLINE=1`, or set `HF_ENDPOINT` to a trusted mirror.
-
-Running with compression disabled requires neither asset.
+- **`openaipublic.blob.core.windows.net`** — tiktoken's BPE encoding files, downloaded once on
+  first use and cached locally. Pre-populate the cache and point `TIKTOKEN_CACHE_DIR` at it to
+  run fully offline.
 
 ## Compared to
 
@@ -240,12 +235,11 @@ git clone <your-fork-url> && cd headroom
 pip install -e ".[dev]" && pytest
 ```
 
-Devcontainers in `.devcontainer/` (default + `memory-stack` with Qdrant & Neo4j). See [CONTRIBUTING.md](CONTRIBUTING.md).
+A devcontainer ships in `.devcontainer/`. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Community
 
 - **[Discord](https://discord.gg/yRmaUNpsPJ)** — questions, feedback, war stories.
-- **[Kompress-v2-base on HuggingFace](https://huggingface.co/chopratejas/kompress-v2-base)** — the model behind our text compression.
 
 ## License
 

@@ -1,7 +1,8 @@
 """Shared pytest fixtures for Headroom tests."""
 
-# CRITICAL: Must be set before ANY imports that could trigger sentence_transformers
-# The Rust tokenizers use parallelism that deadlocks with pytest-asyncio
+# Defensive default, set before any imports: silences fork-parallelism warnings
+# from third-party tokenizer libraries if one happens to be installed in the
+# test environment (not a Headroom dependency).
 import os
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -27,9 +28,8 @@ def pytest_runtest_call(item):
     """Wrap test execution to catch httpx.ReadTimeout and skip instead of fail.
 
     This handles flaky network timeouts that occur when:
-    - HuggingFace Hub is slow during model downloads (sentence-transformers)
-    - External embedding APIs timeout
-    - Network connectivity issues in CI
+    - External APIs are slow to respond
+    - Network connectivity degrades in CI
     """
     outcome = yield
 

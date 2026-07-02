@@ -2,7 +2,7 @@
 
 > Context optimization layer for LLM applications. Compress tool outputs, logs, files, and RAG chunks before they reach the model. Same answers, 60–95% fewer tokens. Python library and MCP server. Apache 2.0, local-first.
 
-Headroom is shipped as a Python package (`headroom-ai`) with an MCP server (`headroom_compress`, `headroom_retrieve`, `headroom_stats` tools). Both use the same compression pipeline: per-content-type compressors (JSON, code, logs, diffs, text) feed into a Compress-Cache-Retrieve (CCR) store so compression stays reversible — the LLM can ask for the original whenever it wants.
+Headroom is shipped as a Python package (`headroom-ai`) with an MCP server (`headroom_compress`, `headroom_retrieve`, `headroom_stats` tools). Both use the same compression pipeline: per-content-type compressors (JSON, search results, logs, diffs) feed into a Compress-Cache-Retrieve (CCR) store so compression stays reversible — the LLM can ask for the original whenever it wants.
 
 ## Packages
 
@@ -25,9 +25,9 @@ Headroom is shipped as a Python package (`headroom-ai`) with an MCP server (`hea
 
 - **How compression works**: Three-stage pipeline + automatic content routing.
 - **SmartCrusher**: Statistical JSON / array compression (70–90% on tool outputs).
-- **Code compression**: source code routes through the Kompress text compressor.
+- **Code & large files**: large distinct content no compressor can shrink (e.g. source files) takes the reversible CCR offload — an identity preview plus a retrieval marker.
 - **Text & log compression**: Search results, build logs, diffs.
-- **CCR (reversible)**: Compress-Cache-Retrieve — originals never deleted; LLM retrieves on demand.
+- **CCR (reversible)**: Compress-Cache-Retrieve — originals stored locally; LLM retrieves on demand (within the configured TTL).
 
 ## Operations
 
@@ -38,4 +38,4 @@ Headroom is shipped as a Python package (`headroom-ai`) with an MCP server (`hea
 
 ## Licensing
 
-Apache 2.0. Use commercially, modify, redistribute. Data stays on the user's machine when running the library or MCP server locally. Usage stats are recorded locally on-disk only — nothing leaves your machine; set `HEADROOM_TELEMETRY=off` to disable.
+Apache 2.0. Use commercially, modify, redistribute. Data stays on the user's machine when running the library or MCP server locally. There is no telemetry — nothing is recorded or sent anywhere beyond the local session state the MCP server keeps on disk.

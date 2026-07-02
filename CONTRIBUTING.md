@@ -96,10 +96,9 @@ pytest
 
 ### Dev Containers
 
-Two configs ship for VS Code / Codespaces:
+One config ships for VS Code / Codespaces:
 
 - **`.devcontainer/devcontainer.json`** — Python 3.12, `uv`, Node.js, `gh`.
-- **`.devcontainer/memory-stack/devcontainer.json`** — adds Qdrant + Neo4j sidecars (use `qdrant:6333`, `neo4j://neo4j:7687`).
 
 Inside, use: `uv run ruff check .`, `uv run pytest`, etc.
 
