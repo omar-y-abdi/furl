@@ -64,6 +64,13 @@ KOMPRESS_COREML_CACHE_DIR_ENV = "HEADROOM_KOMPRESS_COREML_CACHE_DIR"
 KOMPRESS_MAX_CONCURRENT_ENV = "HEADROOM_KOMPRESS_MAX_CONCURRENT"
 KOMPRESS_BATCH_SIZE_ENV = "HEADROOM_KOMPRESS_BATCH_SIZE"
 
+# Scoring ceiling: the model scores at most this many tokens per forward
+# pass. Chunks that tokenize past it are truncated by the tokenizer
+# (``truncation=True``); the compress paths detect the truncation via
+# word_ids coverage and re-chunk so the unscored tail words are scored
+# instead of silently deleted (COR-22).
+_MODEL_MAX_TOKENS = 512
+
 KompressBackend = Literal["auto", "onnx", "onnx_cpu", "onnx_coreml", "pytorch", "pytorch_mps"]
 
 # HuggingFace local-lookup errors that mean "asset not in cache" rather than a
@@ -716,6 +723,14 @@ class KompressConfig:
     trained on 50-word chunks needs chunk_words=50 at inference. The
     defaults match kompress-v2-base. For domain-specific models, set all three.
 
+    ``chunk_words`` counts whitespace words, but the model scores at most
+    512 tokens per forward pass (``_MODEL_MAX_TOKENS``). Plain prose at
+    ~1.3-1.5 tokens/word fits the default 350 in one pass; code, URLs, or
+    JSON routinely exceed it. Over-long chunks are truncated by the
+    tokenizer; the compress paths detect this and re-chunk so every word is
+    scored (COR-22) — raising chunk_words past the ceiling does not raise
+    the ceiling, it only adds re-chunk passes.
+
     Example — financial documents::
 
         KompressConfig(
@@ -753,6 +768,55 @@ class KompressResult:
         if self.original_tokens == 0:
             return 0.0
         return (self.tokens_saved / self.original_tokens) * 100
+
+
+def _chunk_words_scored(
+    chunk_words: list[str],
+    word_ids: list[int | None],
+    seq_len: int,
+) -> int:
+    """Number of leading ``chunk_words`` the model actually scored (COR-22).
+
+    With ``truncation=True, max_length=_MODEL_MAX_TOKENS`` the tokenizer
+    silently drops tail tokens once a chunk tokenizes past the model
+    ceiling (routine for code/URLs/JSON at chunk_words=350). Dropped words
+    get no ``word_ids`` entry, so no score — and were previously deleted
+    unconditionally, invisible to both the score threshold and the
+    target_ratio top-k. Callers re-chunk from the first unscored word so
+    every word gets scored.
+
+    Truncation is only possible when the (padded) sequence hit the ceiling;
+    shorter sequences are complete by construction. Returns at least 1
+    whenever anything was scored, so re-chunking always makes forward
+    progress — a single word tokenizing past the ceiling is consumed with
+    its partial-token score rather than looping.
+    """
+    if seq_len < _MODEL_MAX_TOKENS:
+        return len(chunk_words)
+    scored = [wid for wid in word_ids if wid is not None]
+    if not scored:
+        # Nothing scoreable in this chunk — nothing to re-chunk for.
+        return len(chunk_words)
+    last_scored = max(scored)
+    if last_scored + 1 >= len(chunk_words):
+        return len(chunk_words)
+    return last_scored + 1
+
+
+def _count_str_content(messages: list[dict[str, Any]], tokenizer: Tokenizer) -> int:
+    """Sum token counts over string message content only.
+
+    Block-list content (Anthropic-style) is skipped: Kompress never
+    rewrites it, and ``str()``-ing a block list counted its Python repr —
+    inflating tokens_before/tokens_after with tokens that do not exist
+    (COR-29).
+    """
+    total = 0
+    for message in messages:
+        content = message.get("content", "")
+        if isinstance(content, str):
+            total += tokenizer.count_text(content)
+    return total
 
 
 class KompressCompressor(Transform):
@@ -843,7 +907,11 @@ class KompressCompressor(Transform):
             inference_ms = 0.0
             chunk_count = 0
 
-            for chunk_start in range(0, n_words, max_chunk_words):
+            # While-loop (not a fixed range): a chunk that tokenizes past the
+            # model ceiling is truncated by the tokenizer, and its unscored
+            # tail words are re-chunked instead of deleted unscored (COR-22).
+            chunk_start = 0
+            while chunk_start < n_words:
                 chunk_count += 1
                 chunk_words = words[chunk_start : chunk_start + max_chunk_words]
 
@@ -853,7 +921,7 @@ class KompressCompressor(Transform):
                     chunk_words,
                     is_split_into_words=True,
                     truncation=True,
-                    max_length=512,
+                    max_length=_MODEL_MAX_TOKENS,
                     padding=True,
                     return_tensors=return_tensors,
                 )
@@ -861,6 +929,7 @@ class KompressCompressor(Transform):
                 input_ids = encoding["input_ids"]
                 attention_mask = encoding["attention_mask"]
                 word_ids = encoding.word_ids(batch_index=0)
+                seq_len = input_ids.shape[-1]
 
                 if not is_onnx:
                     device = next(model.parameters()).device
@@ -901,6 +970,11 @@ class KompressCompressor(Transform):
                             continue
                         if bool(mask_list[idx]):
                             kept_ids.add(wid + chunk_start)
+
+                # Advance past the words the model actually scored: a chunk
+                # truncated at the ceiling re-chunks from its first unscored
+                # word so the tail is scored too (COR-22).
+                chunk_start += _chunk_words_scored(chunk_words, word_ids, seq_len)
 
             if target_ratio is not None and global_word_scores:
                 # Single global top-k so the kept count matches the requested
@@ -1134,8 +1208,14 @@ class KompressCompressor(Transform):
         ratio_per_text: dict[int, float] = {}
         inference_ms = 0.0
 
-        for batch_start in range(0, len(chunk_queue), batch_size):
+        # While-loop (not a fixed range): chunks that tokenize past the model
+        # ceiling are truncated by the tokenizer, and their unscored tail
+        # words are re-queued as fresh chunks (COR-22) — the queue grows
+        # mid-iteration, which a range() over the initial length would miss.
+        batch_start = 0
+        while batch_start < len(chunk_queue):
             batch = chunk_queue[batch_start : batch_start + batch_size]
+            batch_start += len(batch)
             batch_word_lists = [c[2] for c in batch]
 
             try:
@@ -1144,13 +1224,14 @@ class KompressCompressor(Transform):
                     batch_word_lists,
                     is_split_into_words=True,
                     truncation=True,
-                    max_length=512,
+                    max_length=_MODEL_MAX_TOKENS,
                     padding=True,
                     return_tensors=return_tensors,
                 )
 
                 input_ids = encoding["input_ids"]
                 attention_mask = encoding["attention_mask"]
+                seq_len = input_ids.shape[-1]
 
                 if not is_onnx:
                     device = next(model.parameters()).device
@@ -1163,9 +1244,25 @@ class KompressCompressor(Transform):
                     scores = model.get_scores(input_ids, attention_mask)
                     inference_ms += (time.perf_counter() - inference_started) * 1000
 
-                for batch_idx, (text_idx, chunk_start, _chunk_words, ratio) in enumerate(batch):
+                for batch_idx, (text_idx, chunk_start, chunk_words, ratio) in enumerate(batch):
                     word_ids = encoding.word_ids(batch_index=batch_idx)
                     score_list = scores[batch_idx] if is_onnx else scores[batch_idx].cpu()
+
+                    # Truncated chunk: words past the model ceiling got no
+                    # word_ids, hence no score. Re-queue them as a fresh
+                    # chunk so they are scored instead of deleted unscored
+                    # (COR-22). Skip texts already finalized to passthrough
+                    # by a failed earlier batch (COR-12).
+                    scored_count = _chunk_words_scored(chunk_words, word_ids, seq_len)
+                    if scored_count < len(chunk_words) and results[text_idx] is None:
+                        chunk_queue.append(
+                            (
+                                text_idx,
+                                chunk_start + scored_count,
+                                chunk_words[scored_count:],
+                                ratio,
+                            )
+                        )
 
                     # Token -> word reduction (max score per word).
                     word_scores: dict[int, float] = {}
@@ -1368,12 +1465,24 @@ class KompressCompressor(Transform):
         tokenizer: Tokenizer,
         **kwargs: Any,
     ) -> TransformResult:
-        """Apply Kompress compression to messages (Transform interface)."""
-        tokens_before = sum(tokenizer.count_text(str(m.get("content", ""))) for m in messages)
+        """Apply Kompress compression to messages (Transform interface).
+
+        Honors ``frozen_message_count`` (kwargs): messages inside the
+        provider's prompt-cache prefix pass through untouched — rewriting
+        one would break prompt-cache prefix ordering (COR-29; same contract
+        as SmartCrusher.apply).
+        """
+        tokens_before = _count_str_content(messages, tokenizer)
         transformed = []
         transforms_applied = []
+        frozen_message_count = kwargs.get("frozen_message_count", 0)
 
-        for message in messages:
+        for msg_idx, message in enumerate(messages):
+            # Provider prefix-cached messages must never be rewritten (COR-29).
+            if msg_idx < frozen_message_count:
+                transformed.append(message)
+                continue
+
             role = message.get("role", "")
             content = message.get("content", "")
 
@@ -1393,7 +1502,7 @@ class KompressCompressor(Transform):
             else:
                 transformed.append(message)
 
-        tokens_after = sum(tokenizer.count_text(str(m.get("content", ""))) for m in transformed)
+        tokens_after = _count_str_content(transformed, tokenizer)
 
         return TransformResult(
             messages=transformed,
