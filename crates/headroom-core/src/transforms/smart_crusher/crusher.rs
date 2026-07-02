@@ -80,7 +80,9 @@ pub struct CrushArrayResult {
     pub items: Vec<Value>,
     /// Strategy debug string. One of:
     /// - `"none:adaptive_at_limit"` / `"skip:<reason>"` — passthrough
-    /// - `"lossless:table"` / `"lossless:buckets"` — lossless wins
+    /// - `"lossless:table"` — lossless wins (always `table`: the accept
+    ///   gates are restricted to decoder-verifiable flat tables until
+    ///   the reference decoder covers `Buckets`/`Nested` — COR-13)
     /// - `"smart_sample"` / `"top_n"` / `"cluster"` / `"time_series"` —
     ///   lossy path with row-dropping.
     pub strategy_info: String,
@@ -98,8 +100,10 @@ pub struct CrushArrayResult {
     /// path** won. `None` for the lossy path or when compaction wasn't
     /// configured.
     pub compacted: Option<String>,
-    /// Top-level [`Compaction`] variant tag — `"table"`, `"buckets"`,
-    /// `"ccr"`. Mirrors `compacted` — populated only when lossless won.
+    /// Top-level [`Compaction`] variant tag. Mirrors `compacted` —
+    /// populated only when lossless won, and always `"table"` today:
+    /// `"buckets"`/`"ccr"` shapes are declined from the lossless tier
+    /// until the reference decoder covers them (COR-13).
     pub compaction_kind: Option<&'static str>,
     /// Compact granular-retrieval marker (`<<ccr:HASH#rows N_chunks>>`)
     /// carried alongside the whole-blob `dropped_summary`. Surfaced in
@@ -851,9 +855,14 @@ impl SmartCrusher {
         // Tier-1 boundary: array already small enough — nothing to
         // drop. Still worth a LOSSLESS look: a cleanly-tabular small
         // array (df/ps-style tool output) shrinks 30%+ with zero loss,
-        // and small arrays are the COMMON case for tool output. Three
+        // and small arrays are the COMMON case for tool output. Four
         // gates protect the passthrough default beyond the big-array
         // ratio check:
+        // - decoder-verifiable shape only (COR-13, fail-closed): the
+        //   lossless claim is "exact reconstruction through the
+        //   reference decoder", which today covers flat `Table`s only —
+        //   `Buckets` renders and `Nested` cells DECLINE to passthrough
+        //   until the decoder covers them;
         // - no `OpaqueRef` substitution anywhere — on a small array
         //   every value must stay verbatim in the visible output
         //   (substituting a file's content with a CCR pointer would
@@ -867,7 +876,7 @@ impl SmartCrusher {
             if items.len() >= 2 {
                 if let Some(stage) = &self.compaction {
                     let (c, rendered) = stage.run(items);
-                    if c.was_compacted() && !c.contains_opaque_ref() {
+                    if c.is_decoder_verifiable() && !c.contains_opaque_ref() {
                         let input_bytes = estimate_array_bytes(&item_strings);
                         let saved = input_bytes.saturating_sub(rendered.len());
                         let savings_ratio = if input_bytes > 0 {
@@ -907,9 +916,12 @@ impl SmartCrusher {
         //
         // Run the compaction stage ONCE if present. The lossless render keeps
         // every row (nothing dropped); it is a valid candidate only when
-        // it actually compacted and clears the byte-savings gate — below
-        // that gate the rendering is not worth shipping over either the
-        // raw array or the lossy view, so it is not a real alternative.
+        // it actually compacted into a decoder-verifiable shape (COR-13:
+        // a flat `Table` — `Buckets`/`Nested` renders are unverifiable by
+        // the reference decoder and DECLINE, fail-closed) and clears the
+        // byte-savings gate — below that gate the rendering is not worth
+        // shipping over either the raw array or the lossy view, so it is
+        // not a real alternative.
         //
         // The single run also supplies `lossless_uses_opaque` (computed from
         // the same `Compaction` value below) so we do NOT call stage.run a
@@ -920,7 +932,7 @@ impl SmartCrusher {
                 let (c, rendered) = stage.run(items);
                 // Read `contains_opaque_ref` before `c` is potentially moved.
                 let uses_opaque = c.contains_opaque_ref();
-                let candidate = if c.was_compacted() {
+                let candidate = if c.is_decoder_verifiable() {
                     let input_bytes = estimate_array_bytes(&item_strings);
                     let savings_ratio = if input_bytes > 0 {
                         1.0 - (rendered.len() as f64 / input_bytes as f64)
@@ -1182,6 +1194,10 @@ impl SmartCrusher {
         // appended as a final line. Every kept value stays verbatim in
         // the output and the recovery pointer still names the full
         // original. Gated on:
+        // - decoder-verifiable shape only (COR-13, fail-closed): the
+        //   survivor render must be provable by the same reference
+        //   decoder as the lossless tier — flat `Table` only,
+        //   `Buckets`/`Nested` renders decline to the plain JSON form;
         // - no `OpaqueRef` substitution (survivor values must stay
         //   verbatim — same rule as the small-array lossless zone);
         // - absolute saving ≥ `LOSSY_SURVIVOR_RENDER_MIN_SAVED_BYTES`
@@ -1189,7 +1205,7 @@ impl SmartCrusher {
         if !dropped_summary.is_empty() {
             if let Some(stage) = &self.compaction {
                 let (c, rendered) = stage.run(&result);
-                if c.was_compacted() && !c.contains_opaque_ref() {
+                if c.is_decoder_verifiable() && !c.contains_opaque_ref() {
                     let sentinel = ccr_sentinel_map(&dropped_summary, row_index_marker.as_deref());
                     let sentinel_line = crate::transforms::anchor_selector::python_safe_json_dumps(
                         &Value::Object(sentinel.clone()),
@@ -2056,6 +2072,80 @@ mod tests {
         assert_eq!(result.strategy_info, "none:adaptive_at_limit");
         assert!(result.compacted.is_none());
         assert_eq!(result.items.len(), 4);
+    }
+
+    #[test]
+    fn small_array_with_nested_cells_stays_passthrough() {
+        // COR-13 fail-closed: an array-of-objects cell becomes
+        // `CellValue::Nested`, whose CSV-quoted IR-JSON rendering the
+        // reference decoder cannot invert — the small-array lossless
+        // zone must DECLINE it (verbatim passthrough), never ship it as
+        // "lossless"-verified. The long constant columns make the
+        // render clear both byte-savings gates, so only the
+        // decoder-coverage gate keeps this shape out.
+        let c = crusher();
+        let items: Vec<Value> = (0..6)
+            .map(|i| {
+                json!({
+                    "id": i,
+                    "service": "auth-service-primary-eu-central-1.internal.example.com",
+                    "status": "ok-and-healthy-and-ready",
+                    "region": "eu-central-1-availability-zone-a",
+                    "deployment": "blue-green-rollout-2026-06-15T00:00:00Z-primary",
+                    "children": [{"k": i}, {"k": i + 1}],
+                })
+            })
+            .collect();
+        let result = c.crush_array(&items, "", 1.0);
+        assert_eq!(
+            result.strategy_info, "none:adaptive_at_limit",
+            "a Nested-cell table must not ship under the lossless claim"
+        );
+        assert!(result.compacted.is_none());
+        assert_eq!(result.items.len(), 6, "nothing may be dropped");
+    }
+
+    #[test]
+    fn heterogeneous_buckets_array_never_ships_lossless() {
+        // COR-13 fail-closed: a heterogeneous array with a clean string
+        // discriminator compacts to `Compaction::Buckets`, whose
+        // `__buckets:` grammar the reference decoder cannot decode —
+        // the lossless accept gates must DECLINE it. The corpus routes
+        // through the big-array candidate gate (60 rows) so the lossy
+        // path stays available; whatever wins, no `lossless:` strategy
+        // and no `__buckets:` render may ship.
+        let c = crusher();
+        let items: Vec<Value> = (0..60_i64)
+            .map(|i| {
+                if i % 2 == 0 {
+                    json!({
+                        "kind": "user",
+                        "name": format!("user-{i:03}"),
+                        "email": format!("user{i}@example.com"),
+                        "role": if i % 4 == 0 { "admin" } else { "member" },
+                    })
+                } else {
+                    json!({
+                        "kind": "metric",
+                        "ts": 1_700_000_000_i64 + i,
+                        "value": i * 3,
+                        "unit": "ms",
+                    })
+                }
+            })
+            .collect();
+        let result = c.crush_array(&items, "", 1.0);
+        assert!(
+            !result.strategy_info.starts_with("lossless:"),
+            "Buckets must be declined from the lossless tier (COR-13); got: {}",
+            result.strategy_info
+        );
+        if let Some(compacted) = &result.compacted {
+            assert!(
+                !compacted.starts_with("__buckets:"),
+                "an unverifiable __buckets: render shipped: {compacted}"
+            );
+        }
     }
 
     #[test]
