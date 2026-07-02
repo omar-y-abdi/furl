@@ -407,6 +407,24 @@ enum TraceFlavor {
     Go,
 }
 
+/// How a line relates to the currently-open trace run (fixed_in_cor25).
+///
+/// The old boolean return couldn't express "this line is the trace's
+/// final line": Python's `ExceptionType: message` terminator answered
+/// `false` (keep running), but so did every following uppercase-starting
+/// log line (`INFO …`, `Build succeeded …`), sweeping unrelated noise
+/// into the trace until a lowercase/digit line or the line cap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TraceTermination {
+    /// Line is part of the trace; the run stays open.
+    Continue,
+    /// Line is the trace's terminator (Python's `ExceptionType: message`
+    /// line): include it in the trace, then close the run.
+    IncludeAndEnd,
+    /// Line is not part of the trace; the run closed before it.
+    End,
+}
+
 impl StackTraceDetector {
     fn flavor_for(line: &str) -> Option<TraceFlavor> {
         let trimmed = line.trim_start();
@@ -502,37 +520,76 @@ impl StackTraceDetector {
                 > 0
     }
 
-    /// True if `line` should end the current trace flavor's run.
-    fn terminates(flavor: TraceFlavor, line: &str) -> bool {
+    /// Classify how `line` relates to the current trace flavor's run.
+    fn terminates(flavor: TraceFlavor, line: &str) -> TraceTermination {
         let trimmed = line.trim_start();
         match flavor {
             TraceFlavor::PythonTraceback => {
                 // Continue across blank lines (chained-exception fix)
                 // and across known continuation markers (`Traceback`,
-                // `File`, "During handling..."); terminate on a non-
-                // indented line UNLESS it looks like the
-                // `ExceptionType: message` terminator (which we keep
-                // inside the trace before ending).
+                // `File`, "During handling..."). A non-indented
+                // uppercase-starting line is the `ExceptionType:
+                // message` terminator: it belongs inside the trace, but
+                // the run ends with it (fixed_in_cor25 — previously it
+                // kept the run open, so unrelated `INFO …` / `Build …`
+                // lines after a traceback were swept in until a
+                // lowercase/digit line or the line cap).
                 let is_indented_or_blank = line.starts_with([' ', '\t']) || line.is_empty();
                 let is_continuation = trimmed.starts_with("Traceback")
                     || trimmed.starts_with("File ")
                     || trimmed.starts_with("During handling")
                     || trimmed.starts_with("The above exception");
                 if is_indented_or_blank || is_continuation {
-                    false
+                    TraceTermination::Continue
+                } else if trimmed.starts_with(char::is_uppercase) {
+                    TraceTermination::IncludeAndEnd
                 } else {
-                    !trimmed.starts_with(char::is_uppercase)
+                    TraceTermination::End
                 }
             }
             TraceFlavor::Js | TraceFlavor::Java => {
-                // Terminate on the first non-`at` line.
-                !trimmed.starts_with("at ") && !line.is_empty()
+                // End on the first non-`at` line.
+                if trimmed.starts_with("at ") || line.is_empty() {
+                    TraceTermination::Continue
+                } else {
+                    TraceTermination::End
+                }
             }
-            TraceFlavor::RustError => !trimmed.starts_with("--> ") && !line.is_empty(),
+            TraceFlavor::RustError => {
+                if trimmed.starts_with("--> ") || line.is_empty() {
+                    TraceTermination::Continue
+                } else {
+                    TraceTermination::End
+                }
+            }
             TraceFlavor::Go => {
-                !trimmed.chars().next().is_some_and(|c| c.is_ascii_digit()) && !line.is_empty()
+                if trimmed.chars().next().is_some_and(|c| c.is_ascii_digit()) || line.is_empty() {
+                    TraceTermination::Continue
+                } else {
+                    TraceTermination::End
+                }
             }
         }
+    }
+
+    /// After a Python trace's `ExceptionType: message` terminator, the
+    /// run continues only when the next non-blank line is a chained-
+    /// exception connective ("During handling of the above exception…" /
+    /// "The above exception was the direct cause…"). CPython separates
+    /// the terminator and the connective with a single blank line, so
+    /// blank lines are skipped when looking ahead. Keeps chained traces
+    /// contiguous (fixed_in_3e5) while still ending the run before
+    /// unrelated log lines (fixed_in_cor25).
+    fn python_chain_continues(lines: &[&str], from: usize) -> bool {
+        for line in &lines[from..] {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let trimmed = line.trim_start();
+            return trimmed.starts_with("During handling")
+                || trimmed.starts_with("The above exception");
+        }
+        false
     }
 }
 
@@ -706,22 +763,48 @@ impl LogCompressor {
             // mark subsequent lines until the flavor terminates or we hit
             // `stack_trace_max_lines`.
             if let Some(flavor) = active {
-                if trace_lines >= self.config.stack_trace_max_lines
-                    || StackTraceDetector::terminates(flavor, line)
-                {
+                if trace_lines >= self.config.stack_trace_max_lines {
                     active = None;
                     trace_lines = 0;
-                    // Re-check the current line against opener — chained
-                    // traces start a new flavor on the same line that
-                    // terminated the previous one.
+                    // Re-check the current line against opener — a new
+                    // trace can start on the same line that hit the cap.
                     if let Some(new_flavor) = StackTraceDetector::flavor_for(line) {
                         active = Some(new_flavor);
                         trace_lines = 1;
                         entry.is_stack_trace = true;
                     }
                 } else {
-                    entry.is_stack_trace = true;
-                    trace_lines += 1;
+                    match StackTraceDetector::terminates(flavor, line) {
+                        TraceTermination::Continue => {
+                            entry.is_stack_trace = true;
+                            trace_lines += 1;
+                        }
+                        TraceTermination::IncludeAndEnd => {
+                            // The `ExceptionType: message` terminator is
+                            // part of the trace (fixed_in_cor25); the run
+                            // ends after it unless a chained-exception
+                            // connective follows, in which case the whole
+                            // chain stays one contiguous trace.
+                            entry.is_stack_trace = true;
+                            trace_lines += 1;
+                            if !StackTraceDetector::python_chain_continues(lines, i + 1) {
+                                active = None;
+                                trace_lines = 0;
+                            }
+                        }
+                        TraceTermination::End => {
+                            active = None;
+                            trace_lines = 0;
+                            // Re-check the current line against opener —
+                            // chained traces start a new flavor on the same
+                            // line that terminated the previous one.
+                            if let Some(new_flavor) = StackTraceDetector::flavor_for(line) {
+                                active = Some(new_flavor);
+                                trace_lines = 1;
+                                entry.is_stack_trace = true;
+                            }
+                        }
+                    }
                 }
             } else if let Some(flavor) = StackTraceDetector::flavor_for(line) {
                 active = Some(flavor);
@@ -1265,6 +1348,43 @@ mod tests {
                 lines[i].is_stack_trace, expect,
                 "line {}: '{}' expected is_stack_trace={}",
                 i, lines[i].content, expect
+            );
+        }
+    }
+
+    #[test]
+    fn fixed_in_cor25_traceback_terminator_ends_trace_before_log_lines() {
+        // The `ExceptionType: message` terminator used to keep the run
+        // open (`!starts_with(uppercase)` was false for it AND for every
+        // following uppercase-starting log line), so `INFO …` / `Build …`
+        // lines after a traceback were swept into the trace until a
+        // lowercase/digit line or the `stack_trace_max_lines` cap —
+        // inflating the +0.3 stack boost and stack-trace selection with
+        // unrelated noise.
+        let c = cmp();
+        let lines = c.parse_lines(&[
+            "Traceback (most recent call last):",
+            "  File \"app.py\", line 10, in <module>",
+            "    main()",
+            "ValueError: bad input",
+            "INFO Starting server",
+            "Build succeeded in 2.3s",
+            "INFO Ready to accept connections",
+        ]);
+        // Header, frames, and the single terminator line are the trace.
+        for i in 0..=3 {
+            assert!(
+                lines[i].is_stack_trace,
+                "line {}: '{}' belongs to the trace",
+                i, lines[i].content
+            );
+        }
+        // Uppercase-starting log lines after the terminator are NOT.
+        for i in 4..=6 {
+            assert!(
+                !lines[i].is_stack_trace,
+                "line {}: '{}' must not continue the trace",
+                i, lines[i].content
             );
         }
     }

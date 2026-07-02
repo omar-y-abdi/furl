@@ -556,17 +556,20 @@ impl SearchCompressor {
 /// 1. If the line starts with a Windows drive prefix (`C:\` or `C:/`),
 ///    record the drive letter + colon as the path's required prefix and
 ///    start the line-number scan after the drive colon.
-/// 2. Find the leftmost `<sep><digits><sep>` triplet where each `<sep>`
-///    is `:` or `-`. The path is everything before the first `<sep>`;
-///    the line number is the digit run; the content is everything after
-///    the second `<sep>`.
-/// 3. Both separators must agree in semantic — `:`/`-` may mix because
-///    ripgrep emits `file:line:content` for matches and
-///    `file-line-content` for context lines, sometimes intermingled.
+/// 2. Colon pass: find the leftmost `:<digits>:` marker. grep and
+///    ripgrep match lines are always `path:N:content`, so this form
+///    wins even when the filename contains a `-<digits>-` run
+///    (fixed_in_cor26: `utils-2-final.py:42:content` used to parse as
+///    file `utils`, line 2, content `final.py:42:content`).
+/// 3. Dash pass (ripgrep context lines, `path-N-content`): find the
+///    leftmost `-<digits>-` marker; runs only when no colon marker
+///    exists. Match and context lines may still be intermingled in one
+///    stream — each individual line is one of the two pure forms.
+///    Mixed separators (`:N-` / `-N:`) no longer parse; neither tool
+///    emits them.
 ///
-/// Returns `None` for lines that don't match the shape (no
-/// `<sep>\d+<sep>` found). Caller treats those as un-parseable and
-/// drops them.
+/// Returns `None` for lines that don't match either shape. Caller
+/// treats those as un-parseable and drops them.
 fn parse_match_line(line: &str) -> Option<(&str, u64, &str)> {
     let bytes = line.as_bytes();
     // Windows drive prefix: starts with [A-Za-z]:[\\/]
@@ -582,16 +585,36 @@ fn parse_match_line(line: &str) -> Option<(&str, u64, &str)> {
         0
     };
 
+    // Reject zero-length paths up front: a line that *starts* with a
+    // `<sep><digits><sep>` marker (any separator pair) has no file part.
+    // Matches the old leftmost-scan behavior, which aborted on these.
+    if scan_start == 0 && matches!(bytes.first(), Some(b':') | Some(b'-')) {
+        let mut j = 1;
+        while j < bytes.len() && bytes[j].is_ascii_digit() {
+            j += 1;
+        }
+        if j > 1 && j < bytes.len() && (bytes[j] == b':' || bytes[j] == b'-') {
+            return None;
+        }
+    }
+
+    find_marker(line, scan_start, b':').or_else(|| find_marker(line, scan_start, b'-'))
+}
+
+/// Find the leftmost `<sep><digits><sep>` marker where BOTH separators
+/// are `sep`, splitting the line into `(path, line_number, content)`.
+///
+/// The byte immediately before the first separator must not itself be a
+/// separator. That collapses adjacent-separator runs (`::`, `:-`, `--`)
+/// so a line like `src/file.py:-1:invalid` doesn't parse the `-` as the
+/// marker's first separator and `1` as the line number; the negative
+/// sign belongs to the content, not the marker, so the line is rejected
+/// as un-parseable.
+fn find_marker(line: &str, scan_start: usize, sep: u8) -> Option<(&str, u64, &str)> {
+    let bytes = line.as_bytes();
     let mut i = scan_start;
     while i < bytes.len() {
-        if bytes[i] == b':' || bytes[i] == b'-' {
-            // Reject markers where the byte immediately before the
-            // first separator is itself a separator. That collapses
-            // adjacent-separator runs (`::` or `:-`) so a line like
-            // `src/file.py:-1:invalid` doesn't parse the `-` as the
-            // marker's first separator and `1` as the line number;
-            // the negative sign belongs to the content, not the
-            // marker, so the line is rejected as un-parseable.
+        if bytes[i] == sep {
             if i > 0 && (bytes[i - 1] == b':' || bytes[i - 1] == b'-') {
                 i += 1;
                 continue;
@@ -602,9 +625,10 @@ fn parse_match_line(line: &str) -> Option<(&str, u64, &str)> {
             while j < bytes.len() && bytes[j].is_ascii_digit() {
                 j += 1;
             }
-            if j > digits_start && j < bytes.len() && (bytes[j] == b':' || bytes[j] == b'-') {
-                // Found <sep><digits><sep>. Reject zero-length path
-                // (line starts with separator).
+            if j > digits_start && j < bytes.len() && bytes[j] == sep {
+                // Zero-length path (line starts with the separator);
+                // the caller's up-front guard rejects these before the
+                // passes run, kept here so the helper stands alone.
                 if i == 0 {
                     return None;
                 }
@@ -699,6 +723,35 @@ mod tests {
                 "fail_fast: true".into()
             ))
         );
+    }
+
+    #[test]
+    fn fixed_in_cor26_digit_run_between_dashes_in_filename() {
+        // `foo-2-bar.py:42:x` used to parse as file `foo`, line 2,
+        // content `bar.py:42:x`: the leftmost any-separator scan matched
+        // the `-2-` run inside the filename before the real `:42:`
+        // marker. grep/rg match lines are always `path:N:content`, so
+        // the colon-only form is tried first.
+        assert_eq!(
+            parse_line("foo-2-bar.py:42:x"),
+            Some(("foo-2-bar.py".into(), 42, "x".into()))
+        );
+        // Same shape on a longer realistic name.
+        assert_eq!(
+            parse_line("utils-2-final.py:42:content"),
+            Some(("utils-2-final.py".into(), 42, "content".into()))
+        );
+    }
+
+    #[test]
+    fn fixed_in_cor26_mixed_separators_no_longer_parse() {
+        // grep emits `path:N:content`; rg context lines are
+        // `path-N-content`. Neither tool mixes separators within one
+        // line, so the old any-pair acceptance (`file.py:42-text`) only
+        // ever fired on coincidental shapes. Both passes now require a
+        // matching pair.
+        assert!(parse_line("file.py:42-text").is_none());
+        assert!(parse_line("file.py-42:text").is_none());
     }
 
     #[test]

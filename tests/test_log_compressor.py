@@ -113,6 +113,29 @@ Build succeeded in 5.2s
         assert "item 48" in result.compressed or "item 49" in result.compressed
         assert "item 51" in result.compressed or "item 52" in result.compressed
 
+    def test_traceback_terminator_does_not_sweep_following_log_lines(self):
+        """fixed_in_cor25: the `ExceptionType: message` line ends the trace.
+
+        Uppercase-starting log lines after a traceback (`INFO …`,
+        `Build …`) used to be swept into the stack-trace selection until
+        a lowercase/digit line or the 20-line cap.
+        """
+        lines = [
+            "Traceback (most recent call last):",
+            '  File "app.py", line 10, in <module>',
+            "    main()",
+            "ValueError: boom",
+        ] + [f"INFO idle tick {i}" for i in range(60)]
+
+        compressor = LogCompressor(config=LogCompressorConfig(enable_ccr=False))
+        result = compressor.compress("\n".join(lines))
+
+        assert "Traceback (most recent call last):" in result.compressed
+        assert "ValueError: boom" in result.compressed
+        # Tick 12 sits beyond the ±3 context window around the terminator;
+        # the old state machine swept ticks 0-15 into the trace selection.
+        assert "INFO idle tick 12" not in result.compressed
+
 
 class TestCompressionRatios:
     """Tests for compression ratio calculations."""

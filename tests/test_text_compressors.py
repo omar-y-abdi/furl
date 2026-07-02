@@ -1,10 +1,13 @@
 """Tests for text-based compressors (coding task support).
 
-Tests content detection, search compressor, and log compressor.
+Tests content detection, search compressor, log compressor, and diff
+compressor.
 """
 
 from headroom.transforms import (
     ContentType,
+    DiffCompressor,
+    DiffCompressorConfig,
     LogCompressor,
     LogCompressorConfig,
     SearchCompressor,
@@ -238,6 +241,45 @@ INFO: Done
         result = compressor.compress(content)
 
         assert result.compression_ratio == 1.0
+
+
+class TestDiffCompressor:
+    """Tests for git diff compression."""
+
+    def test_bare_binary_marker_survives_recompression(self):
+        """fixed_in_cor27: `Binary files differ` (the compressor's own
+        output form) must be recognized when compressed again.
+
+        The old `^Binary files .+ differ$` regex required at least one
+        character between "files " and " differ", so recompressing
+        compressor output silently dropped the binary marker line.
+        """
+        config = DiffCompressorConfig(min_lines_for_ccr=1, enable_ccr=False)
+        diff = (
+            "diff --git a/img.png b/img.png\n"
+            "Binary files a/img.png and b/img.png differ\n"
+        )
+
+        compressor = DiffCompressor(config=config)
+        first = compressor.compress(diff)
+        assert "Binary files differ" in first.compressed
+
+        second = compressor.compress(first.compressed)
+        assert "Binary files differ" in second.compressed
+
+    def test_crlf_binary_marker_detected(self):
+        """fixed_in_cor27: a trailing `\\r` (CRLF input) must not defeat
+        the binary-marker match."""
+        config = DiffCompressorConfig(min_lines_for_ccr=1, enable_ccr=False)
+        diff = (
+            "diff --git a/img.png b/img.png\r\n"
+            "Binary files a/img.png and b/img.png differ\r\n"
+        )
+
+        compressor = DiffCompressor(config=config)
+        result = compressor.compress(diff)
+
+        assert "Binary files differ" in result.compressed
 
 
 class TestSmartCrusherTextIntegration:
