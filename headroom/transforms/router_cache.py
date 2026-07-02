@@ -2,7 +2,13 @@
 
 Extracted verbatim from ``content_router.py`` as a focused, self-contained
 module. ``CompressionCache`` has no dependency on ``ContentRouter`` — it is a
-plain in-process dict cache keyed by content hash.
+plain in-process dict cache keyed by an opaque hashable value the CALLER
+builds. The router builds ``(hash(content), len(content), runtime, bias)``
+tuples (see ``content_router._result_cache_key``), so dict key equality —
+not just the 64-bit hash — verifies content length and the per-request
+options before a hit is served (COR-18: a bare ``hash(content)`` key both
+ignored per-request options and served another message's bytes on a SipHash
+collision).
 
 THREAD-SAFETY NOTE (do not "fix" this): the cache is intentionally LOCK-FREE.
 All access happens on the main thread (the ThreadPoolExecutor workers in the
@@ -13,6 +19,12 @@ preserved exactly. Adding a lock would be a behavior change, not a hardening.
 from __future__ import annotations
 
 import time
+from collections.abc import Hashable
+
+# Opaque cache key contract: the cache never inspects key structure — equality
+# and hash are all it needs. Callers own key construction (and therefore own
+# how much identity — content, length, options — a key encodes).
+CacheKey = Hashable
 
 
 class CompressionCache:
@@ -33,10 +45,10 @@ class CompressionCache:
     """
 
     def __init__(self, ttl_seconds: int = 1800):
-        # Tier 2: compressed results {hash: (text, ratio, strategy, timestamp)}
-        self._results: dict[int, tuple[str, float, str, float]] = {}
-        # Tier 1: hashes of content that won't compress {hash: timestamp}
-        self._skip: dict[int, float] = {}
+        # Tier 2: compressed results {key: (text, ratio, strategy, timestamp)}
+        self._results: dict[CacheKey, tuple[str, float, str, float]] = {}
+        # Tier 1: keys of content that won't compress {key: timestamp}
+        self._skip: dict[CacheKey, float] = {}
         self._ttl_seconds = ttl_seconds
         # Metrics
         self._hits = 0
@@ -46,7 +58,7 @@ class CompressionCache:
         self._total_lookup_ns = 0
         self._lookup_count = 0
 
-    def get(self, key: int) -> tuple[str, float, str] | None:
+    def get(self, key: CacheKey) -> tuple[str, float, str] | None:
         """Get cached compression result.
 
         Returns (compressed_text, ratio, strategy) or None if not found/expired.
@@ -69,7 +81,7 @@ class CompressionCache:
         self._lookup_count += 1
         return None
 
-    def is_skipped(self, key: int) -> bool:
+    def is_skipped(self, key: CacheKey) -> bool:
         """Check if content is known non-compressible (Tier 1)."""
         ts = self._skip.get(key)
         if ts is not None:
@@ -81,20 +93,20 @@ class CompressionCache:
                 self._evictions += 1
         return False
 
-    def put(self, key: int, compressed: str, ratio: float, strategy: str) -> None:
+    def put(self, key: CacheKey, compressed: str, ratio: float, strategy: str) -> None:
         """Store a compressed result (Tier 2)."""
         self._results[key] = (compressed, ratio, strategy, time.time())
 
-    def mark_skip(self, key: int) -> None:
+    def mark_skip(self, key: CacheKey) -> None:
         """Mark content as non-compressible (Tier 1)."""
         self._skip[key] = time.time()
 
-    def move_to_skip(self, key: int) -> None:
+    def move_to_skip(self, key: CacheKey) -> None:
         """Move a result to skip set (threshold tightened, no longer qualifies)."""
         self._results.pop(key, None)
         self._skip[key] = time.time()
 
-    def invalidate(self, key: int) -> None:
+    def invalidate(self, key: CacheKey) -> None:
         """Drop a result entry without marking it skipped.
 
         Used when a cached crushed output can no longer be safely served (its
