@@ -1,0 +1,19 @@
+codecov:
+  require_ci_to_pass: true
+
+coverage:
+  status:
+    project:
+      default:
+        target: auto
+    patch:
+      default:
+        target: auto
+
+ignore:
+  - "tests/**"
+  - "scripts/tests/**"
+  - ".github/**"
+  - ".claude-plugin/**"
+  - "plugins/headroom-agent-hooks/.claude-plugin/**"
+  - "plugins/headroom-agent-hooks/.github/**"
