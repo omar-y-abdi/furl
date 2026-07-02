@@ -19,7 +19,9 @@ use std::collections::BTreeMap;
 use headroom_core::signals::{
     ImportanceCategory, ImportanceContext, KeywordDetector, KeywordRegistry, LineImportanceDetector,
 };
-use headroom_core::transforms::smart_crusher::compaction::DocumentCompactor;
+use headroom_core::transforms::smart_crusher::compaction::{
+    has_serde_private_marker, DocumentCompactor,
+};
 use headroom_core::transforms::smart_crusher::{
     CrushResult as RustCrushResult, RoutingPolicy as RustRoutingPolicy,
     SmartCrusher as RustSmartCrusher, SmartCrusherConfig as RustSmartCrusherConfig,
@@ -888,6 +890,19 @@ impl PySmartCrusher {
         let (kept_json, ccr_hash, dropped_summary, strategy_info, compacted, compaction_kind) = py
             .allow_threads(|| {
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    // COR-44: decline magic-key payloads before from_str so
+                    // serde_json's arbitrary_precision / raw_value promotions
+                    // never fire.  Raises ValueError — same class as the
+                    // invalid-JSON path — so callers get a clean, catchable
+                    // signal rather than silently mutated output.
+                    if has_serde_private_marker(&items_json) {
+                        return Err(invalid_input(
+                            "items_json contains a serde_json internal key \
+                             ($serde_json::private::); parsing declined to \
+                             prevent silent data mutation"
+                                .to_string(),
+                        ));
+                    }
                     let parsed: serde_json::Value = serde_json::from_str(&items_json)
                         .map_err(|e| invalid_input(format!("items_json must be JSON: {e}")))?;
                     let items = match parsed {
@@ -950,6 +965,18 @@ impl PySmartCrusher {
         // input-validation `PyErr` (`?`).
         py.allow_threads(|| {
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                // COR-44: decline magic-key payloads before from_str so
+                // serde_json's arbitrary_precision / raw_value promotions
+                // never fire.  Raises ValueError — same class as the
+                // invalid-JSON path.
+                if has_serde_private_marker(&doc_json) {
+                    return Err(invalid_input(
+                        "doc_json contains a serde_json internal key \
+                         ($serde_json::private::); parsing declined to \
+                         prevent silent data mutation"
+                            .to_string(),
+                    ));
+                }
                 let parsed: serde_json::Value = serde_json::from_str(&doc_json)
                     .map_err(|e| invalid_input(format!("doc_json must be JSON: {e}")))?;
                 let mut dc = DocumentCompactor::new();

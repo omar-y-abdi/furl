@@ -168,10 +168,33 @@ fn walk_string(s: String, ctx: &DocumentCompactor) -> Value {
     Value::String(s)
 }
 
+/// Guard against serde_json internal magic keys (COR-44).
+///
+/// With the `arbitrary_precision` + `raw_value` workspace features enabled,
+/// serde_json treats `{"$serde_json::private::Number":"123"}` as the number
+/// literal `123`, and `{"$serde_json::private::RawValue":…}` unwraps to its
+/// payload.  Any parse entry point that calls `serde_json::from_str` on
+/// adversarial or tool-echoed content containing these markers would silently
+/// receive a mutated `Value` — shipping altered data and poisoning CCR
+/// recovery.  Declining to parse is strictly safer than accepting mutated
+/// output: callers fall back to the original bytes unchanged.
+pub fn has_serde_private_marker(s: &str) -> bool {
+    s.contains("$serde_json::private::")
+}
+
 /// Parse a string as JSON IF it looks like a container (starts with `{`
 /// or `[`) AND parses cleanly to Object/Array. Returns None otherwise —
 /// we don't recurse on bare scalars even if they parse.
+///
+/// Declines (returns `None`) when the input contains a serde_json internal
+/// magic key — see [`has_serde_private_marker`] (COR-44).
 pub fn try_parse_json_container(s: &str) -> Option<Value> {
+    // COR-44: decline before calling from_str so the magic-key promotion
+    // never fires.  Fall through to None (same as a parse failure) so the
+    // string leaf is returned unchanged by the caller.
+    if has_serde_private_marker(s) {
+        return None;
+    }
     let trimmed = s.trim_start();
     if !matches!(trimmed.chars().next(), Some('{') | Some('[')) {
         return None;
@@ -439,6 +462,46 @@ mod tests {
                 "no-op leaf must survive byte-identical: {leaf}"
             );
         }
+    }
+
+    // ── COR-44: magic-key guard in try_parse_json_container + walk_string ──
+
+    #[test]
+    fn try_parse_json_container_declines_serde_number_magic_key() {
+        // COR-44: with arbitrary_precision enabled, serde_json treats
+        // {"$serde_json::private::Number":"123"} as the number literal 123.
+        // The guard must return None before calling from_str so the promotion
+        // never fires — the string leaf passes through unchanged.
+        let magic = r#"{"$serde_json::private::Number":"123"}"#;
+        assert!(
+            try_parse_json_container(magic).is_none(),
+            "magic-key payload must be declined by try_parse_json_container"
+        );
+    }
+
+    #[test]
+    fn walk_string_magic_key_leaf_returned_byte_identical() {
+        // COR-44: when a string leaf contains a serde_json magic key, the
+        // walker must return the original string byte-identical rather than
+        // parsing (which would silently mutate it via the promotion).
+        let magic = r#"{"$serde_json::private::Number":"456"}"#;
+        let doc = json!({"payload": magic});
+        let out = dc().compact(doc);
+        assert_eq!(
+            out.pointer("/payload").and_then(|v| v.as_str()),
+            Some(magic),
+            "magic-key string leaf must come back byte-identical"
+        );
+    }
+
+    #[test]
+    fn try_parse_json_container_declines_raw_value_magic_key() {
+        // COR-44: the RawValue variant of the magic key.
+        let magic = r#"{"$serde_json::private::RawValue":"true"}"#;
+        assert!(
+            try_parse_json_container(magic).is_none(),
+            "raw_value magic-key payload must be declined by try_parse_json_container"
+        );
     }
 
     // ── COR-19: with_ccr_store wires the SINGLE config.ccr_store field ──
