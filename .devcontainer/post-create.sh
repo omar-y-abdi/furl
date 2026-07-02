@@ -10,10 +10,6 @@ workspace_root="$(cd "$script_dir/.." && pwd)"
 git_profile_script="/etc/profile.d/headroom-worktree-git.sh"
 sync_extras=(--extra dev)
 
-if [[ "$profile" == "memory-stack" ]]; then
-  sync_extras+=(--extra memory-stack)
-fi
-
 cd "$workspace_root"
 
 configure_worktree_git_env() {
@@ -73,9 +69,6 @@ else
 fi
 
 echo "Headroom devcontainer is ready."
-if [[ "$profile" == "memory-stack" ]]; then
-  echo "Memory stack sidecars are available at qdrant:6333 and neo4j://neo4j:7687."
-fi
 echo "Run checks with:"
 echo "  uv run ruff check ."
 echo "  uv run ruff format --check ."
