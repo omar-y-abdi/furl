@@ -95,17 +95,20 @@ Granular extras: `[mcp]`, `[ml]` (Kompress-v2-base), `[html]`, `[dev]`. Requires
 
 ## Proof
 
-**Token reduction on real captured data** — reproducible; inputs committed under `benchmarks/data/`, captured by `benchmarks/run_bench.py` into [BASELINE.md](benchmarks/BASELINE.md):
+**Token reduction on real captured data** — reproducible; inputs committed under `benchmarks/data/`, captured by `benchmarks/run_bench.py` into [BASELINE.md](benchmarks/BASELINE.md). Every number uses the engine's own tokenizer; needle recall is 100% (a known unique row is always recoverable — visible in the output or via CCR):
 
-| Dataset | Items | Before | After  | Reduction       | Info retention |
-|---------|------:|-------:|-------:|-----------------|---------------:|
-| search  |    90 |  4,102 |  2,462 | 40% (lossless)  |           100% |
-| logs    |    90 |  8,595 |  1,332 | 84%*            |   100% (via CCR) |
-| code    |     7 | 41,025 | 41,025 | 0% (passthrough)|           100% |
+| Dataset       | Items | Before | After  | Reduction | Regime      | Info retention |
+|---------------|------:|-------:|-------:|----------:|-------------|---------------:|
+| code          |     7 | 41,025 | 41,025 |        0% | lossless    |           100% |
+| disk          |     9 |    694 |    347 |       50% | lossless    |           100% |
+| multiturn     |   135 | 14,866 |  4,369 |       71% | lossy (CCR) |           100% |
+| logs          |    90 |  8,595 |    619 |       93% | lossy (CCR) |           100% |
+| search        |    90 |  4,102 |    318 |       92% | lossy (CCR) |           100% |
+| repeated logs |    90 |  3,621 |    131 |       96% | lossy (CCR) |           100% |
 
-<sub>*log savings come partly from row deletion, not free compression — every dropped row stays CCR-recoverable within the configured TTL. `code` is large distinct source files that don't compress, so Headroom passes them through untouched (0%).</sub>
+<sub>**Regime** — *lossless*: the compressed output is self-contained (zero rows dropped). *lossy (CCR)*: near-duplicate or low-signal rows are offloaded to the local CCR store and replaced with `<<ccr:HASH>>` markers — smaller output, and **every dropped row is byte-exactly recoverable on demand** (100% info retention, within the configured TTL). `code` is large distinct source files that don't compress, so Headroom passes them through untouched.</sub>
 
-The table above is a single conservative capture (lossless structural folding, minimal offload). The **60–95%** headline reflects the fuller 6-seed adversarial sweep — logs, search, and disk workloads land 80–95% with CCR offload, with honest per-workload caveats (code passes through at 0%, low-redundancy multiturn lands lower). Full methodology and re-runnable sweeps: [BENCHMARKS.md](BENCHMARKS.md).
+These are a single deterministic capture at HEAD (`benchmarks/BASELINE.md`). The **60–95%** headline is this table's lossy-CCR range (search/logs/repeated-logs land 92–96%); full methodology and the 6-seed adversarial sweep live in [BENCHMARKS.md](BENCHMARKS.md).
 
 ## When to use · When to skip
 
