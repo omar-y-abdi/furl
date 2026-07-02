@@ -94,10 +94,15 @@ pub fn extract_query_anchors(text: &str) -> HashSet<String> {
     }
 
     // Quoted strings — capture group 1 (the content between quotes),
-    // require trim().len() >= 2 (Python's `if len(match.strip()) >= 2`).
+    // require >= 2 CHARACTERS after trim, matching Python's
+    // `if len(match.strip()) >= 2` (Python `len` on `str` counts
+    // characters, never bytes). COR-23: this previously used Rust's
+    // byte-length `.len()`, which accepted single multibyte chars
+    // ('é' = 2 UTF-8 bytes, '日' = 3) that Python rejects — a
+    // keep-pinning divergence on unicode queries.
     for caps in QUOTED_STRING_PATTERN.captures_iter(text) {
         if let Some(inner) = caps.get(1) {
-            if inner.as_str().trim().len() >= 2 {
+            if inner.as_str().trim().chars().count() >= 2 {
                 anchors.insert(inner.as_str().to_lowercase());
             }
         }
@@ -287,6 +292,29 @@ mod tests {
         // Less than 2 chars after trim — skipped.
         let anchors = extract_query_anchors(r#"the "x" thing"#);
         assert!(!anchors.contains("x"));
+    }
+
+    #[test]
+    fn single_multibyte_char_quoted_rejected_like_python() {
+        // COR-23 regression pin: Python's `len('é'.strip()) >= 2` counts
+        // CHARACTERS (1 here) and rejects the anchor. The pre-fix Rust
+        // check used UTF-8 BYTE length ('é' = 2 bytes, '日' = 3 bytes),
+        // so single multibyte chars became anchors in Rust only —
+        // pinning array items on unicode queries where Python kept none.
+        let anchors = extract_query_anchors("the 'é' thing");
+        assert!(!anchors.contains("é"));
+        let anchors = extract_query_anchors("find '日' now");
+        assert!(!anchors.contains("日"));
+    }
+
+    #[test]
+    fn multichar_unicode_quoted_accepted_like_python() {
+        // Control for COR-23: two characters clear the >= 2 CHAR gate in
+        // both languages regardless of byte width (4 and 6 bytes here).
+        let anchors = extract_query_anchors("the 'éé' thing");
+        assert!(anchors.contains("éé"));
+        let anchors = extract_query_anchors("find '日本' now");
+        assert!(anchors.contains("日本"));
     }
 
     #[test]

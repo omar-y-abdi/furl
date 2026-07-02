@@ -98,18 +98,22 @@ pub fn detect_id_field_statistically(stats: &FieldStats, values: &[Value]) -> (b
 /// Direct port of `_detect_score_field_statistically` (Python
 /// `smart_crusher.py:533-603`). Returns `(is_score, confidence)`.
 ///
-/// # Detection rules (mirroring Python)
+/// # Detection rules (mirroring Python, plus the COR-24 variation gate)
 ///
 /// 1. Field must be numeric AND have both `min_val` and `max_val`.
-/// 2. Range must match a "common score range":
+/// 2. Must show variation: `unique_count > 1` AND `variance > 0`
+///    (COR-24 — a rank signal requires variation; see the gate comment
+///    in the body. Deviation from the retired Python twin, which lacked
+///    this gate).
+/// 3. Range must match a "common score range":
 ///    - `[0, 1]` (most common ML score range) → +0.4
 ///    - `[0, 10]` → +0.3
 ///    - `[0, 100]` → +0.25
 ///    - `[-1, 1]` (signed similarity) → +0.35
-/// 3. Must NOT be a sequential pattern (IDs are sequential; scores aren't).
-/// 4. If first-50 values appear sorted descending (>70% of pairs) → +0.3.
-/// 5. If >30% of first-20 are non-integer floats → +0.1.
-/// 6. Returns `(confidence >= 0.4, min(confidence, 0.95))`.
+/// 4. Must NOT be a sequential pattern (IDs are sequential; scores aren't).
+/// 5. If first-50 values appear sorted descending (>70% of pairs) → +0.3.
+/// 6. If >30% of first-20 are non-integer floats → +0.1.
+/// 7. Returns `(confidence >= 0.4, min(confidence, 0.95))`.
 ///
 /// `items` is the list of original-array dict items so we can pull the
 /// field's values in array order for the descending-sort check.
@@ -122,6 +126,26 @@ pub fn detect_score_field_statistically(stats: &FieldStats, items: &[Value]) -> 
         (Some(min_v), Some(max_v)) => (min_v, max_v),
         _ => return (false, 0.0),
     };
+
+    // COR-24: a rank signal requires variation — gate ALL confidence
+    // bonuses (bounded-range, descending, float-fraction) on it. Ties
+    // count as "descending" below (`w[0] >= w[1]`), so a constant
+    // bounded column (`progress: 50` ×30, 0-100 bucket) would otherwise
+    // take +0.25 + 0.3 = 0.55, and a fractional [0,1] constant
+    // (`progress: 0.5`) reaches 0.5 on the bounded+float bonuses alone —
+    // both misclassify as score fields, routing the array to the
+    // `search_results` pattern where TopN "sorts" on the constant and
+    // silently degrades to positional keep-first-K.
+    //
+    // `unique_count > 1` rejects pure constants; the `variance > 0`
+    // clause also rejects constants interleaved with nulls (their
+    // stringified unique_count is 2 but the sortable signal is flat —
+    // `analyze_field` computes variance over the finite numerics only).
+    // Deviation from the retired Python twin (`smart_crusher.py:533-603`),
+    // which lacked this gate; Rust is the live source of truth.
+    if stats.unique_count <= 1 || stats.variance.unwrap_or(0.0) <= 0.0 {
+        return (false, 0.0);
+    }
 
     let mut confidence: f64 = 0.0;
 
@@ -230,6 +254,11 @@ mod tests {
         let mut s = stats(name, "numeric", 1.0);
         s.min_val = Some(min_v);
         s.max_val = Some(max_v);
+        // COR-24: the variation gate consults `variance`. A fixture with
+        // a non-degenerate range models a varying column (any positive
+        // value satisfies the gate, which only tests > 0.0); a
+        // degenerate range models a constant one.
+        s.variance = Some(if min_v < max_v { 1.0 } else { 0.0 });
         s
     }
 
@@ -373,6 +402,66 @@ mod tests {
         let items: Vec<Value> = vec![json!({"score": 0.5})];
         let (is_score, _) = detect_score_field_statistically(&s, &items);
         assert!(!is_score);
+    }
+
+    #[test]
+    fn score_field_constant_bounded_column_rejected() {
+        // COR-24 regression pin (RED pre-fix): `progress: 50` ×30 — a
+        // CONSTANT bounded column. Ties count as "descending"
+        // (`w[0] >= w[1]`: 29/29 pairs), so pre-fix it scored +0.25
+        // (0-100 bucket) + 0.3 (descending) = 0.55 ≥ 0.4 → score field →
+        // `search_results` pattern → TopN sorted a constant → silently
+        // degraded to positional keep-first-K. A rank signal requires
+        // variation.
+        let mut s = stats_with_range("progress", 50.0, 50.0);
+        s.count = 30;
+        s.unique_count = 1;
+        s.unique_ratio = 1.0 / 30.0;
+        s.is_constant = true;
+        s.constant_value = Some(json!(50));
+        let items: Vec<Value> = (0..30).map(|_| json!({"progress": 50})).collect();
+        assert_eq!(detect_score_field_statistically(&s, &items), (false, 0.0));
+    }
+
+    #[test]
+    fn score_field_constant_fractional_column_rejected() {
+        // COR-24 (RED pre-fix): a fractional [0,1] constant crossed the
+        // 0.4 threshold WITHOUT the descending bonus — 0.4 (bounded) +
+        // 0.1 (float fraction) = 0.5 — so gating the descending bonus
+        // alone is not enough; the bounded/float bonuses are gated on
+        // variation too.
+        let mut s = stats_with_range("progress", 0.5, 0.5);
+        s.count = 30;
+        s.unique_count = 1;
+        s.unique_ratio = 1.0 / 30.0;
+        s.is_constant = true;
+        s.constant_value = Some(json!(0.5));
+        let items: Vec<Value> = (0..30).map(|_| json!({"progress": 0.5})).collect();
+        assert_eq!(detect_score_field_statistically(&s, &items), (false, 0.0));
+    }
+
+    #[test]
+    fn score_field_constant_with_nulls_rejected() {
+        // COR-24 variance clause: a constant numeric column interleaved
+        // with nulls stringifies to two distinct values ("50"/"None") so
+        // `unique_count > 1` alone would pass — but the sortable signal
+        // is still flat (`analyze_field` computes variance over the
+        // finite numerics only → 0.0). No rank information → not a
+        // score field.
+        let mut s = stats_with_range("progress", 50.0, 50.0);
+        s.count = 30;
+        s.unique_count = 2; // {"50", "None"} stringified
+        s.unique_ratio = 2.0 / 30.0;
+        let items: Vec<Value> = (0..30)
+            .map(|i| {
+                if i % 5 == 4 {
+                    json!({"progress": null})
+                } else {
+                    json!({"progress": 50})
+                }
+            })
+            .collect();
+        assert_eq!(detect_score_field_statistically(&s, &items), (false, 0.0));
     }
 
     #[test]
