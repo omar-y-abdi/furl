@@ -43,6 +43,7 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, Protocol
 
 from .csv_ingest import compress_tabular_csv, sniff_csv
+from .log_template import encode_verified
 from .router_policy import CompressionStrategy
 
 if TYPE_CHECKING:
@@ -60,6 +61,7 @@ class DispatchConfig(Protocol):
 
     enable_smart_crusher: bool
     enable_search_compressor: bool
+    enable_log_template: bool
     enable_log_compressor: bool
     enable_text_crusher: bool
     enable_code_aware: bool
@@ -239,7 +241,41 @@ class StrategyDispatcher:
                     decision_reason = "search_compressor"
 
         elif strategy == CompressionStrategy.LOG:
-            if self.config.enable_log_compressor and not self.config.lossless_only:
+            # LogTemplate (NR2-3b): lossless template mining, tried BEFORE the
+            # lossy line-dropping LogCompressor. `encode_verified` self-checks
+            # its round-trip and returns None on no structure / no win / verify
+            # failure, so this arm is lossless-or-None — architecturally the
+            # SMART_CRUSHER shape, NOT the lossy-log shape. It is therefore
+            # gated by `enable_log_template` ALONE and stays live under
+            # `lossless_only` (strict mode = lossless-or-passthrough, and the
+            # wire is self-describing so no CCR store is written). The size
+            # gate is re-checked in tokenizer units via the injected `count`:
+            # a wire smaller in code points can still cost more tokens.
+            log_template_won = False
+            if self.config.enable_log_template:
+                enc = encode_verified(content)
+                if enc is not None:
+                    enc_tokens = count(enc.wire)
+                    if enc_tokens < original_tokens:
+                        compressed, compressed_tokens = enc.wire, enc_tokens
+                        actual_strategy = CompressionStrategy.LOG
+                        compressor_name = "LogTemplate"
+                        decision_reason = "log_template"
+                        strategy_chain.append("log_template")
+                        log_template_won = True
+                        # Surface mining stats on the SAME debug channel the
+                        # tabular branch uses for its per-strategy extras.
+                        self._log_router_debug(
+                            "log_template_encoded",
+                            template_count=enc.template_count,
+                            templated_lines=enc.templated_lines,
+                            verbatim_lines=enc.verbatim_lines,
+                        )
+            if (
+                not log_template_won
+                and self.config.enable_log_compressor
+                and not self.config.lossless_only
+            ):
                 log_compressor_arm = get_log_compressor()
                 if log_compressor_arm:
                     compressor_name = type(log_compressor_arm).__name__
