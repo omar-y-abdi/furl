@@ -23,7 +23,7 @@ import json
 
 import pytest
 
-from furl_ctx.parser import detect_waste_signals
+from furl_ctx.parser import MAX_WASTE_SCAN_CHARS, detect_waste_signals
 
 
 class _LenTokenizer:
@@ -89,3 +89,50 @@ def test_single_large_json_object_counted_once(tok) -> None:
     bloat = detect_waste_signals(big, tok).json_bloat_tokens
     assert bloat == len(big)
     assert bloat > 500
+
+
+# ── ENGINE P1-9: waste-signal scan is capped (hot-path cost bound) ────────
+#
+# The scanner runs several regex + JSON-span passes over raw content on the
+# pipeline path. Content beyond MAX_WASTE_SCAN_CHARS must NOT be scanned;
+# signals inside the scanned prefix still count. Assertions are behavioral
+# (signals beyond the cap are invisible) — time-based asserts would be flaky.
+
+
+def _neutral_filler(n: int) -> str:
+    """*n* chars that trip NO signal: "x y " repeats have no 4+ whitespace
+    runs, no 50+ base64-alphabet runs, no tags/comments, no JSON objects."""
+    return ("x y " * (n // 4 + 1))[:n]
+
+
+def test_neutral_filler_is_signal_free(tok) -> None:
+    # Guard the fixture itself: if the filler ever trips a signal, the cap
+    # tests below would pass or fail for the wrong reason.
+    assert detect_waste_signals(_neutral_filler(2_000), tok).total() == 0
+
+
+def test_signals_beyond_cap_are_not_scanned(tok) -> None:
+    beyond = "<!-- waste beyond the cap -->" * 20
+    text = _neutral_filler(MAX_WASTE_SCAN_CHARS) + beyond
+    assert detect_waste_signals(text, tok).total() == 0
+
+
+def test_json_bloat_beyond_cap_is_not_scanned(tok) -> None:
+    big = json.dumps({"data": "v" * 600})
+    text = _neutral_filler(MAX_WASTE_SCAN_CHARS) + big
+    assert detect_waste_signals(text, tok).json_bloat_tokens == 0
+
+
+def test_signals_in_scanned_prefix_still_count_on_oversized_input(tok) -> None:
+    tag = '<div class="x">'
+    text = tag + _neutral_filler(MAX_WASTE_SCAN_CHARS)  # total length > cap
+    assert detect_waste_signals(text, tok).html_noise_tokens == len(tag)
+
+
+def test_input_exactly_at_cap_is_fully_scanned(tok) -> None:
+    # Boundary: an input of exactly MAX_WASTE_SCAN_CHARS loses nothing —
+    # a signal ending on the last char is still seen.
+    tag = "<span>"
+    text = _neutral_filler(MAX_WASTE_SCAN_CHARS - len(tag)) + tag
+    assert len(text) == MAX_WASTE_SCAN_CHARS
+    assert detect_waste_signals(text, tok).html_noise_tokens == len(tag)

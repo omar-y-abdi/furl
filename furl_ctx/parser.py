@@ -19,6 +19,16 @@ HTML_COMMENT_PATTERN = re.compile(r"<!--[\s\S]*?-->")
 BASE64_PATTERN = re.compile(r"[A-Za-z0-9+/]{50,}={0,2}")
 WHITESPACE_PATTERN = re.compile(r"[ \t]{4,}|\n{3,}")
 
+# Waste-signal analysis is diagnostics-only (WasteSignals feeds metrics,
+# never compression output), but its regex + JSON-span scans are
+# O(len(text)) and run on the pipeline path. Upstream caps the scan at
+# ~100K tokens; at the ~4 chars/token heuristic that is ~400K chars.
+# Content beyond the cap is not scanned — signals found in the scanned
+# prefix still count, and a signal split by the cut simply stops matching
+# (best-effort diagnostics, the same contract as the decoder-skip in
+# _iter_json_object_spans).
+MAX_WASTE_SCAN_CHARS = 400_000
+
 # Tool results below this size legitimately repeat ("ok", empty diffs,
 # exit codes) and are not evidence of a re-read.
 REREAD_MIN_TOKENS = 50
@@ -91,12 +101,18 @@ def detect_waste_signals(text: str, tokenizer: Tokenizer) -> WasteSignals:
         tokenizer: Tokenizer for counting tokens.
 
     Returns:
-        WasteSignals with detected waste.
+        WasteSignals with detected waste (scanned over at most the first
+        ``MAX_WASTE_SCAN_CHARS`` characters of ``text``).
     """
     signals = WasteSignals()
 
     if not text:
         return signals
+
+    if len(text) > MAX_WASTE_SCAN_CHARS:
+        # Bound the hot-path cost on pathological inputs: scan the prefix
+        # only. See MAX_WASTE_SCAN_CHARS for the contract.
+        text = text[:MAX_WASTE_SCAN_CHARS]
 
     # HTML tags and comments. The tag pattern ``<[^>]+>`` also matches a
     # whole comment up to its first ``>``, so counting tags + comments on the

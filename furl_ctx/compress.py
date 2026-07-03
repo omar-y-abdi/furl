@@ -423,10 +423,19 @@ def compress(
     if overrides:
         cfg = replace(cfg, **overrides)
 
-    pipeline = _get_pipeline()
-    pipeline_extensions = PipelineExtensionManager(hooks=hooks)
-
     try:
+        # Pipeline construction sits INSIDE the fail-open boundary (COR-43):
+        # the import chain behind TransformPipeline hard-requires the
+        # furl_ctx._core extension, so a broken/missing wheel raises
+        # ModuleNotFoundError at first request — exactly the deployment
+        # where "worst case: passthrough" must hold. The BaseException
+        # handler below turns that into a passthrough CompressResult with
+        # `error` set instead of letting it escape to the host. (Nothing is
+        # cached on failure, so a later fixed environment recovers without
+        # a restart.)
+        pipeline = _get_pipeline()
+        pipeline_extensions = PipelineExtensionManager(hooks=hooks)
+
         # Compute biases from hooks if provided
         biases = None
         if hooks:
@@ -581,11 +590,14 @@ def compress(
         raise
     except BaseException as e:  # noqa: BLE001
         # Fail-open: a compression bug must NEVER break the host's request, so
-        # we return the ORIGINAL messages and do not re-raise. But the failure
-        # must be LOUD and HONEST — log at ERROR with a full traceback (this may
-        # be a genuine bug or a Rust panic, not a benign no-op) and report the
-        # real input token count instead of a fabricated 0, so a caller cannot
-        # mistake a swallowed failure for "nothing to compress".
+        # we return the ORIGINAL messages and do not re-raise. This covers
+        # pipeline CONSTRUCTION too (COR-43): a broken/missing native
+        # extension fails open here, not as a ModuleNotFoundError to the
+        # host. But the failure must be LOUD and HONEST — log at ERROR with a
+        # full traceback (this may be a genuine bug or a Rust panic, not a
+        # benign no-op) and report the real input token count instead of a
+        # fabricated 0, so a caller cannot mistake a swallowed failure for
+        # "nothing to compress".
         #
         # We catch BaseException (not just Exception) on purpose: a Rust panic
         # crosses the PyO3 FFI as ``pyo3_runtime.PanicException``, which is a

@@ -23,8 +23,10 @@ from furl_ctx.transforms.content_router import (
 def test_compression_cache_handles_hits_skips_evictions_and_clear(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # The cache's expiry math rides time.monotonic() (ENGINE P1-9: wall-clock
+    # NTP steps must not break TTL semantics), so that is the clock to fake.
     times = iter([100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 112.0, 112.0])
-    monkeypatch.setattr(content_router_module.time, "time", lambda: next(times))
+    monkeypatch.setattr(content_router_module.time, "monotonic", lambda: next(times))
     monkeypatch.setattr(content_router_module.time, "perf_counter_ns", lambda: 50)
 
     cache = CompressionCache(ttl_seconds=10)
