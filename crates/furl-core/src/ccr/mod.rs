@@ -24,13 +24,13 @@
 
 pub mod backends;
 mod markers;
+pub(crate) mod persist;
 
 use std::time::Duration;
 
 pub use backends::InMemoryCcrStore;
 pub(crate) use markers::{
-    marker_for_diff, marker_for_opaque, marker_for_retrieve_more, marker_for_row_index,
-    marker_for_rows_offloaded,
+    marker_for_diff, marker_for_opaque, marker_for_row_index, marker_for_rows_offloaded,
 };
 
 /// Pluggable CCR storage backend. `Send + Sync` so it can sit behind an
@@ -74,8 +74,9 @@ pub const DEFAULT_CAPACITY: usize = 1000;
 pub const DEFAULT_TTL: Duration = Duration::from_secs(1800);
 
 // CCR marker construction lives in `markers.rs` — the single
-// construction point every Rust producer routes through. CCR *keys* are
-// computed at each producer's call site (the algorithm is per-producer
-// by design: SHA-256[:6] row hashes in the crusher, SHA-256 opaque prefixes
-// in the walker/formatter, MD5[:24] in the diff/log/search compressors).
-// Grammar and hashing are deliberately separate concerns.
+// construction point every Rust producer routes through. CCR *key
+// algorithms* live in `persist.rs` — one `md5_hex_24` (diff/log/search/
+// text cache keys) and one `sha6_hex12` (crusher row hashes, opaque
+// prefixes), consolidated from the per-producer copies (ARCH-5) so a
+// hash change can only happen in one place. Grammar and hashing remain
+// deliberately separate concerns (separate modules).

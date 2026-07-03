@@ -69,9 +69,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use md5::{Digest, Md5};
-
-use crate::ccr::{marker_for_retrieve_more, CcrStore};
+use crate::ccr::persist::persist_and_mark;
+use crate::ccr::CcrStore;
 use crate::signals::{ImportanceContext, LineImportanceDetector};
 use crate::transforms::adaptive_sizer::compute_optimal_k;
 
@@ -321,14 +320,11 @@ impl SearchCompressor {
             } else if ratio >= self.config.min_compression_ratio_for_ccr {
                 stats.ccr_skip_reason = Some("compression ratio too high");
             } else if let Some(store) = store {
-                let key = md5_hex_24(content);
-                store.put(&key, content);
-                // The leading `\n` stays at the call site so the marker
-                // grammar in `ccr::markers` is newline-free and composable.
-                let marker = format!(
-                    "\n{}",
-                    marker_for_retrieve_more(original_count, compressed_count, &key, "matches")
-                );
+                // Shared key→put→marker tail (`ccr::persist`, ARCH-5);
+                // the leading `\n` is composed there so the marker
+                // grammar in `ccr::markers` stays newline-free.
+                let (key, marker) =
+                    persist_and_mark(store, content, original_count, compressed_count, "matches");
                 compressed.push_str(&marker);
                 cache_key = Some(key);
                 stats.ccr_emitted = true;
@@ -713,17 +709,9 @@ fn hash_u64(s: &str) -> u64 {
     h.finish()
 }
 
-fn md5_hex_24(s: &str) -> String {
-    let mut hasher = Md5::new();
-    hasher.update(s.as_bytes());
-    let digest = hasher.finalize();
-    let mut hex = String::with_capacity(32);
-    for b in digest {
-        hex.push_str(&format!("{:02x}", b));
-    }
-    hex.truncate(24);
-    hex
-}
+// `md5_hex_24` (the CCR cache key) lives in `crate::ccr::persist` —
+// one shared implementation for the diff/log/search/text family
+// (ARCH-5); the tail above rides it via `persist_and_mark`.
 
 #[cfg(test)]
 mod tests {

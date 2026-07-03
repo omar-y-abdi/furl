@@ -54,7 +54,7 @@ from ..config import (
 )
 from ..tokenizer import Tokenizer
 from ..utils import concat_text_parts
-from .base import Transform
+from .base import CompressionObserver, Transform
 from .compressor_registry import CompressorRegistry
 from .content_detector import ContentType, DetectionResult
 from .content_detector import detect_content_type as _regex_detect_content_type
@@ -94,6 +94,16 @@ if TYPE_CHECKING:
     # ``_get_feedback_hints`` — content_router never imports the cache
     # package at module level (same deferred-import rule as the CCR store).
     from ..cache.retrieval_feedback import FeedbackHints
+
+    # Annotation-only compressor types for the lazy `_get_*` delegators
+    # (TYPE-3): the compressor modules stay lazily imported inside
+    # `CompressorRegistry`; these imports never run at runtime.
+    from .code_aware_compressor import CodeAwareCompressor
+    from .diff_compressor import DiffCompressor
+    from .log_compressor import LogCompressor
+    from .search_compressor import SearchCompressor
+    from .smart_crusher import SmartCrusher
+    from .text_crusher import TextCrusher
 
 logger = logging.getLogger(__name__)
 
@@ -736,18 +746,20 @@ class ContentRouter(Transform):
     def __init__(
         self,
         config: ContentRouterConfig | None = None,
-        observer: Any = None,
+        observer: CompressionObserver | None = None,
     ):
         """Initialize content router.
 
         Args:
             config: Router configuration. Uses defaults if None.
-            observer: Optional duck-typed observer called once per
-                routing decision after `compress()` finishes. Must
-                expose `record_compression(...)` (and may expose
-                `record_router_route_counts(...)`); exceptions it
-                raises are swallowed so a buggy observer can't break
-                compression. `None` disables observation.
+            observer: Optional `CompressionObserver` (structural protocol,
+                see `transforms.base`) called once per routing decision
+                after `compress()` finishes. Must expose
+                `record_compression(...)`; `record_router_route_counts(...)`
+                is tolerated missing at runtime for older duck-typed
+                observers. Exceptions it raises are swallowed so a buggy
+                observer can't break compression. `None` disables
+                observation.
         """
         self.config = config or ContentRouterConfig()
         self._observer = observer
@@ -1351,7 +1363,7 @@ class ContentRouter(Transform):
 
     # Lazy compressor getters
 
-    def _get_smart_crusher(self) -> Any:
+    def _get_smart_crusher(self) -> SmartCrusher | None:
         """Get SmartCrusher (lazy load) with CCR config.
 
         Thin delegator to :meth:`CompressorRegistry.get_smart_crusher`.
@@ -1385,35 +1397,35 @@ class ContentRouter(Transform):
         """
         return CcrMirror.extract_ccr_hashes(text)
 
-    def _get_search_compressor(self) -> Any:
+    def _get_search_compressor(self) -> SearchCompressor | None:
         """Get SearchCompressor (lazy load).
 
         Thin delegator to :meth:`CompressorRegistry.get_search_compressor`.
         """
         return self._registry.get_search_compressor()
 
-    def _get_log_compressor(self) -> Any:
+    def _get_log_compressor(self) -> LogCompressor | None:
         """Get LogCompressor (lazy load).
 
         Thin delegator to :meth:`CompressorRegistry.get_log_compressor`.
         """
         return self._registry.get_log_compressor()
 
-    def _get_diff_compressor(self) -> Any:
+    def _get_diff_compressor(self) -> DiffCompressor:
         """Get DiffCompressor (lazy load).
 
         Thin delegator to :meth:`CompressorRegistry.get_diff_compressor`.
         """
         return self._registry.get_diff_compressor()
 
-    def _get_text_crusher(self) -> Any:
+    def _get_text_crusher(self) -> TextCrusher:
         """Get TextCrusher (lazy load).
 
         Thin delegator to :meth:`CompressorRegistry.get_text_crusher`.
         """
         return self._registry.get_text_crusher()
 
-    def _get_code_aware_compressor(self) -> Any:
+    def _get_code_aware_compressor(self) -> CodeAwareCompressor:
         """Get CodeAwareCompressor (lazy load).
 
         Thin delegator to :meth:`CompressorRegistry.get_code_aware_compressor`.

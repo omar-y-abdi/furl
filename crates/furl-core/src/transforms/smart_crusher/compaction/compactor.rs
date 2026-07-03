@@ -43,7 +43,6 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 
 use super::classifier::{classify_cell, CellClass, ClassifyConfig};
 use super::ir::{Bucket, CellValue, ColumnEncoding, Compaction, FieldSpec, Row, Schema};
@@ -1060,13 +1059,11 @@ fn type_tag_for(v: &Value) -> &'static str {
 }
 
 fn hash_opaque(bytes: &[u8]) -> String {
-    let mut h = Sha256::new();
-    h.update(bytes);
-    let digest = h.finalize();
-    // 12-char hex prefix — collision-resistant enough for a single
-    // payload in flight, short enough to keep the marker compact.
-    let hex: String = digest.iter().take(6).map(|b| format!("{b:02x}")).collect();
-    hex
+    // 12-char SHA-256 hex prefix — collision-resistant enough for a
+    // single payload in flight, short enough to keep the marker compact.
+    // Algorithm consolidated in `ccr::persist` (ARCH-5); this domain
+    // alias stays so call sites and tests keep their vocabulary.
+    crate::ccr::persist::sha6_hex12(bytes)
 }
 
 // ─────────────────────────── heterogeneous bucketing ───────────────────────────

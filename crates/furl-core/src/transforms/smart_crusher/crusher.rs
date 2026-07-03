@@ -2219,15 +2219,11 @@ fn dropped_indices_by_multiset_diff(original: &[Value], kept: &[Value]) -> Vec<u
 /// string. Caller is responsible for producing the canonical form via
 /// [`canonical_array_json`] (or another byte-equal serializer) — the
 /// hash is over the bytes, so a stable serializer is the contract.
+/// Algorithm consolidated in `ccr::persist` (ARCH-5); this domain alias
+/// stays so the row-drop call sites and the parity pins keep their
+/// vocabulary.
 fn hash_canonical(canonical: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let mut h = Sha256::new();
-    h.update(canonical.as_bytes());
-    h.finalize()
-        .iter()
-        .take(6)
-        .map(|b| format!("{b:02x}"))
-        .collect()
+    crate::ccr::persist::sha6_hex12(canonical.as_bytes())
 }
 
 // `hash_array_for_ccr` (a test-only `canonical_array_json + hash_canonical`
@@ -4285,6 +4281,71 @@ mod tests {
             canonical_array_json(&[json!({"id": 1}), json!({"id": 2}), json!({"id": 3})]),
             r#"[{"id":1},{"id":2},{"id":3}]"#
         );
+    }
+
+    #[test]
+    fn hash_canonical_wire_form_pinned_vectors() {
+        // TEST-33: the WIRE-FORM half of the Py↔Rust parity lock. This
+        // canonical is LITERAL-PRESERVING for decimal tokens (serde_json
+        // `arbitrary_precision`: `1.50` stays `1.50`, digits beyond f64
+        // precision survive) and normalizes ONLY the exponent spelling
+        // (`1E5` → `1e+5`: lowercase `e`, explicit sign — serde's number
+        // scanner, not a float round-trip). The documented Python
+        // reference (`json.loads` → `json.dumps`) round-trips through
+        // float and computes a DIFFERENT key for every numeric vector
+        // here (`1.50`→`1.5`, `1E5`→`100000.0`, `1e400`→`Infinity`) — it
+        // is valid for Python-normal-form inputs only. Pinned identically
+        // (from the canonical TEXT, not parsed values) on the Python side
+        // (tests/test_ccr_hash_parity_vectors.py::_WIRE_VECTORS):
+        //   python3 -c "import hashlib; print(hashlib.sha256(C.encode()).hexdigest()[:12])"
+        let wire_vectors: [(&str, &str, &str); 6] = [
+            // (wire input, serde canonical, pinned SHA-256[:12])
+            (
+                r#"[{"price":1.50}]"#,
+                r#"[{"price":1.50}]"#,
+                "86cf954ca9f3", // trailing zero preserved verbatim
+            ),
+            ("[1E5]", "[1e+5]", "5c20cc153829"), // exponent spelling normalized
+            ("[1e400]", "[1e+400]", "7e9854d86909"), // overflows f64; token kept
+            (
+                "[2.5000000000000000000000000001]",
+                "[2.5000000000000000000000000001]",
+                "44a8948fa037", // beyond f64 precision, preserved verbatim
+            ),
+            // Non-ASCII and control-char forms — these AGREE with the
+            // Python reference (same hashes pinned in its `_VECTORS`);
+            // included so the lock covers the full canonical grammar,
+            // not just ASCII scalars.
+            (
+                r#"["café","日本語","naïve"]"#,
+                r#"["café","日本語","naïve"]"#,
+                "3a6991f2cdbf",
+            ),
+            (
+                r#"["line1\nline2","tab\there","bell\u0007"]"#,
+                r#"["line1\nline2","tab\there","bell\u0007"]"#,
+                "333b058285a5",
+            ),
+        ];
+        for (input, canonical, expected) in wire_vectors {
+            // The production path hashes `canonical_array_json(parsed
+            // rows)` — pin that parsing the wire text re-serializes to
+            // EXACTLY the canonical bytes above (`preserve_order` +
+            // `arbitrary_precision`). A serde feature-flag regression or
+            // a serializer swap flips this before it can corrupt a key.
+            let items: Vec<Value> =
+                serde_json::from_str(input).expect("wire vector must parse as a JSON array");
+            assert_eq!(
+                canonical_array_json(&items),
+                canonical,
+                "canonical for wire input {input:?}"
+            );
+            assert_eq!(
+                hash_canonical(canonical),
+                expected,
+                "hash for {canonical:?}"
+            );
+        }
     }
 
     #[test]

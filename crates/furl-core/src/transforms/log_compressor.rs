@@ -48,10 +48,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::OnceLock;
 
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
-use md5::{Digest, Md5};
 use regex::Regex;
 
-use crate::ccr::{marker_for_retrieve_more, CcrStore};
+use crate::ccr::persist::persist_and_mark;
+use crate::ccr::CcrStore;
 use crate::transforms::adaptive_sizer::compute_optimal_k;
 
 // ─── Types ──────────────────────────────────────────────────────────────
@@ -712,14 +712,11 @@ impl LogCompressor {
             if ratio >= self.config.min_compression_ratio_for_ccr {
                 stats.ccr_skip_reason = Some("compression ratio too high");
             } else if let Some(store) = store {
-                let key = md5_hex_24(content);
-                store.put(&key, content);
-                // The leading `\n` stays at the call site so the marker
-                // grammar in `ccr::markers` is newline-free and composable.
-                let marker = format!(
-                    "\n{}",
-                    marker_for_retrieve_more(original_line_count, selected.len(), &key, "lines")
-                );
+                // Shared key→put→marker tail (`ccr::persist`, ARCH-5);
+                // the leading `\n` is composed there so the marker
+                // grammar in `ccr::markers` stays newline-free.
+                let (key, marker) =
+                    persist_and_mark(store, content, original_line_count, selected.len(), "lines");
                 compressed.push_str(&marker);
                 cache_key = Some(key);
                 stats.ccr_emitted = true;
@@ -1271,17 +1268,9 @@ fn path_regex() -> &'static Regex {
     R.get_or_init(|| Regex::new(r"/[\w/]+/").expect("static regex must compile"))
 }
 
-fn md5_hex_24(s: &str) -> String {
-    let mut hasher = Md5::new();
-    hasher.update(s.as_bytes());
-    let digest = hasher.finalize();
-    let mut hex = String::with_capacity(32);
-    for b in digest {
-        hex.push_str(&format!("{:02x}", b));
-    }
-    hex.truncate(24);
-    hex
-}
+// `md5_hex_24` (the CCR cache key) lives in `crate::ccr::persist` —
+// one shared implementation for the diff/log/search/text family
+// (ARCH-5); the tail above rides it via `persist_and_mark`.
 
 #[cfg(test)]
 mod tests {

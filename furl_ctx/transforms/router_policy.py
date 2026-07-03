@@ -11,16 +11,20 @@ would form an import cycle. ``content_router`` re-exports the enum, so existing
 ``from ...content_router import CompressionStrategy`` imports and the package
 lazy-export both keep resolving the single canonical object.
 
-Dependency-light by design: imports only ``ContentType`` from
-``content_detector``; never imports ``content_router``.
+Dependency-light by design: imports only ``ContentType`` /
+``DetectionResult`` from ``content_detector``; never imports
+``content_router``. The config parameters are therefore typed as narrow
+PROTOCOLS of exactly the fields each policy function reads (TYPE-3) —
+``ContentRouterConfig`` satisfies them structurally without this module
+importing it.
 """
 
 from __future__ import annotations
 
 from enum import Enum
-from typing import Any
+from typing import Protocol
 
-from .content_detector import ContentType
+from .content_detector import ContentType, DetectionResult
 
 
 class CompressionStrategy(Enum):
@@ -39,11 +43,28 @@ class CompressionStrategy(Enum):
     CCR_OFFLOAD = "ccr_offload"
 
 
-def strategy_from_detection(config: Any, detection: Any) -> CompressionStrategy:
+class StrategyPolicyConfig(Protocol):
+    """The config fields the strategy-mapping policy reads."""
+
+    fallback_strategy: CompressionStrategy
+    enable_code_aware: bool
+
+
+class RatioPolicyConfig(Protocol):
+    """The config fields the adaptive-ratio policy reads."""
+
+    min_ratio_relaxed: float
+    min_ratio_aggressive: float
+
+
+def strategy_from_detection(
+    config: StrategyPolicyConfig, detection: DetectionResult
+) -> CompressionStrategy:
     """Get strategy from content detection result.
 
     Args:
-        config: ContentRouterConfig providing ``fallback_strategy``.
+        config: ``ContentRouterConfig`` (or any object with the
+            ``StrategyPolicyConfig`` fields).
         detection: Result from detect_content_type.
 
     Returns:
@@ -60,7 +81,7 @@ def strategy_from_detection(config: Any, detection: Any) -> CompressionStrategy:
     return mapping.get(detection.content_type, config.fallback_strategy)
 
 
-def _source_code_strategy(config: Any) -> CompressionStrategy:
+def _source_code_strategy(config: StrategyPolicyConfig) -> CompressionStrategy:
     """SOURCE_CODE routing: PASSTHROUGH by default — code ships unmangled,
     exactly the behavior the retired AST/ML code compressors left behind.
     The opt-in CodeAwareCompressor (``enable_code_aware=True``, Engine
@@ -71,7 +92,9 @@ def _source_code_strategy(config: Any) -> CompressionStrategy:
     return CompressionStrategy.PASSTHROUGH
 
 
-def strategy_from_detection_type(config: Any, content_type: ContentType) -> CompressionStrategy:
+def strategy_from_detection_type(
+    config: StrategyPolicyConfig, content_type: ContentType
+) -> CompressionStrategy:
     """Get strategy from ContentType enum."""
     mapping = {
         ContentType.SOURCE_CODE: _source_code_strategy(config),
@@ -99,7 +122,7 @@ def content_type_from_strategy(strategy: CompressionStrategy) -> ContentType:
     return mapping.get(strategy, ContentType.PLAIN_TEXT)
 
 
-def adaptive_min_ratio(config: Any, context_pressure: float) -> float:
+def adaptive_min_ratio(config: RatioPolicyConfig, context_pressure: float) -> float:
     """Compression-acceptance threshold scaled by context pressure.
 
     A compression is accepted when ``ratio < min_ratio`` (lower ratio =

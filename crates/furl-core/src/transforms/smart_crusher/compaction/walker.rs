@@ -39,8 +39,6 @@ use super::formatter::{CsvSchemaFormatter, Formatter};
 use super::ir::OpaqueKind;
 use crate::ccr::{marker_for_opaque, CcrStore};
 
-use sha2::{Digest, Sha256};
-
 /// Walks any JSON value and applies lossless compaction in place.
 ///
 /// Reuses the compaction primitives:
@@ -217,14 +215,9 @@ pub fn emit_opaque_ccr_marker(
     kind: &OpaqueKind,
     store: Option<&Arc<dyn CcrStore>>,
 ) -> String {
-    let mut h = Sha256::new();
-    h.update(payload.as_bytes());
-    let hash: String = h
-        .finalize()
-        .iter()
-        .take(6)
-        .map(|b| format!("{b:02x}"))
-        .collect();
+    // 12-char SHA-256 hex prefix via the consolidated `ccr::persist`
+    // implementation (ARCH-5) — same key with or without a store.
+    let hash = crate::ccr::persist::sha6_hex12(payload.as_bytes());
     if let Some(s) = store {
         s.put(&hash, payload);
     }

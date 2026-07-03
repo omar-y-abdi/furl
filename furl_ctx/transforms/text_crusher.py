@@ -39,6 +39,8 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any
 
+from ._ccr_persist import persist_to_python_ccr
+
 logger = logging.getLogger(__name__)
 
 
@@ -169,35 +171,20 @@ class TextCrusher:
     def _persist_to_python_ccr(self, original: str, compressed: str, cache_key: str) -> bool:
         """Promote a Rust-emitted cache_key into the production Python
         CompressionStore. Returns ``True`` on success, ``False`` on any
-        failure (store import or store write). On ``False`` the caller serves
-        the ORIGINAL uncompressed content so the CCR marker never ships
-        dangling — the recoverability invariant SmartCrusher (raise) and
-        cross_message_dedup (veto) already enforce. Mirrors diff_compressor.py
-        / search_compressor.py / log_compressor.py."""
-        try:
-            from ..cache.compression_store import get_compression_store
-        except ImportError as e:
-            logger.error("CCR store import failed; cache_key %s won't persist: %s", cache_key, e)
-            return False
-        try:
-            store: Any = get_compression_store()
-            # The Rust-emitted marker embeds MD5(original)[:24], but
-            # store() defaults to SHA-256(original)[:24]. Pass the
-            # marker's key explicitly so retrieving the marker hash
-            # actually finds the entry.
-            # compression_strategy attributes the entry to its route so
-            # retrievals feed the shape-keyed retrieval-feedback loop
-            # (Engine P2-13; value = CompressionStrategy.TEXT.value).
-            store.store(original, compressed, explicit_hash=cache_key, compression_strategy="text")
-            return True
-        except Exception as e:
-            logger.error(
-                "CCR store write failed; cache_key %s — serving original "
-                "uncompressed (no dangling marker): %s",
-                cache_key,
-                e,
-            )
-            return False
+        failure (store import or store write) — the caller then serves the
+        ORIGINAL uncompressed prose so the CCR marker never ships dangling.
+
+        Thin delegator to the shared :func:`~._ccr_persist.persist_to_python_ccr`
+        (ARCH-5; one implementation for the diff/log/search/text/code-aware
+        family; ``compression_strategy`` = ``CompressionStrategy.TEXT.value``).
+        Kept as a method for the test/monkeypatch seam."""
+        return persist_to_python_ccr(
+            original,
+            compressed,
+            cache_key,
+            compression_strategy="text",
+            logger=logger,
+        )
 
     @staticmethod
     def _passthrough_result(content: str, r: Any) -> TextCrushResult:

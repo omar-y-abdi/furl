@@ -60,6 +60,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
+from ._ccr_persist import persist_to_python_ccr
+
 logger = logging.getLogger(__name__)
 
 # ─── Optional-dependency management (lazy, fail-open, warn-once) ────────────
@@ -707,29 +709,18 @@ class CodeAwareCompressor:
         the marker's exact hash. Returns ``True`` on success, ``False`` on
         any failure (store import or store write) — the caller then serves
         the ORIGINAL uncompressed code so the marker never ships dangling.
-        Mirrors text_crusher.py / diff / log / search."""
-        try:
-            from ..cache.compression_store import get_compression_store
-        except ImportError as e:
-            logger.error("CCR store import failed; cache_key %s won't persist: %s", cache_key, e)
-            return False
-        try:
-            store: Any = get_compression_store()
-            store.store(
-                original,
-                shipped,
-                explicit_hash=cache_key,
-                compression_strategy="code_aware",
-            )
-            return True
-        except Exception as e:
-            logger.error(
-                "CCR store write failed; cache_key %s — serving original "
-                "uncompressed (no dangling marker): %s",
-                cache_key,
-                e,
-            )
-            return False
+
+        Thin delegator to the shared :func:`~._ccr_persist.persist_to_python_ccr`
+        (ARCH-5; one implementation for the diff/log/search/text/code-aware
+        family; ``compression_strategy`` = ``CompressionStrategy.CODE_AWARE.value``).
+        Kept as a method for the test/monkeypatch seam."""
+        return persist_to_python_ccr(
+            original,
+            shipped,
+            cache_key,
+            compression_strategy="code_aware",
+            logger=logger,
+        )
 
     # ─── Symbol importance analysis ─────────────────────────────────────
 

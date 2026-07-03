@@ -71,9 +71,8 @@
 use std::collections::BTreeSet;
 use std::collections::HashSet;
 
-use md5::{Digest, Md5};
-
-use crate::ccr::{marker_for_retrieve_more, CcrStore};
+use crate::ccr::persist::{md5_hex_24, retrieve_more_marker_line};
+use crate::ccr::CcrStore;
 use crate::relevance::{BM25Scorer, RelevanceScorer};
 use crate::signals::{ImportanceContext, KeywordDetector, LineImportanceDetector};
 use crate::transforms::tag_protector::{protect_tags, restore_tags};
@@ -546,11 +545,13 @@ impl TextCrusher {
         let rendered = render(&cleaned, &segments, &kept);
         let restored = restore_tags(&rendered, &blocks);
 
+        // Key + marker via the shared `ccr::persist` helpers (ARCH-5) —
+        // but NOT `persist_and_mark`: the ratio veto below is computed
+        // over the FINAL output (body + marker), so the store write must
+        // wait until after the gate or a passthrough would leave an
+        // orphan store entry.
         let key = md5_hex_24(content);
-        let marker = format!(
-            "\n{}",
-            marker_for_retrieve_more(segments.len(), kept.len(), &key, "segments")
-        );
+        let marker = retrieve_more_marker_line(segments.len(), kept.len(), &key, "segments");
         let compressed = format!("{restored}{marker}");
         let ratio = compressed.len() as f64 / content.len().max(1) as f64;
         if ratio >= self.config.max_shippable_ratio {
@@ -918,18 +919,9 @@ fn hash_u64(s: &str) -> u64 {
     h.finish()
 }
 
-/// Same CCR key algorithm as the diff/log/search siblings: MD5[:24].
-fn md5_hex_24(s: &str) -> String {
-    let mut hasher = Md5::new();
-    hasher.update(s.as_bytes());
-    let digest = hasher.finalize();
-    let mut hex = String::with_capacity(32);
-    for b in digest {
-        hex.push_str(&format!("{:02x}", b));
-    }
-    hex.truncate(24);
-    hex
-}
+// `md5_hex_24` (the CCR cache key, same algorithm as the diff/log/search
+// siblings) lives in `crate::ccr::persist` — one shared implementation
+// (ARCH-5), imported at the top of this module.
 
 #[cfg(test)]
 mod tests {

@@ -9,31 +9,53 @@ text compressor is itself replaced); when the arm is gated off
 (``enable_text_crusher=False`` or ``lossless_only``) it resolves to
 passthrough, so the dispatch stays total.
 
-This is a TRUE leaf module: it imports nothing from ``content_router`` (so there
-is no import cycle) and never receives the router. Every dependency is injected
-explicitly:
+This is a TRUE leaf module: it imports nothing from ``content_router`` at
+runtime (so there is no import cycle) and never receives the router. Every
+dependency is injected explicitly:
 
 * ``config`` and the debug helpers (``log_router_debug`` / ``json_shape``) plus
   the shared ``logger`` come in via the constructor — they are stable for the
-  router's lifetime.
+  router's lifetime. ``config`` is typed as the narrow :class:`DispatchConfig`
+  protocol of exactly the gate fields this module reads (TYPE-3);
+  ``ContentRouterConfig`` satisfies it structurally.
 * The compressor getters (``get_smart_crusher`` etc.) are passed to
   :meth:`apply` *per call*. The router's thin
   ``_apply_strategy_to_content`` delegator resolves them fresh on every
   invocation, so monkeypatching ``router._get_log_compressor`` (as the
   test-suite does) still bites — a construction-time capture would have been
-  stale.
+  stale. Each getter is typed against its concrete compressor class
+  (annotation-only ``TYPE_CHECKING`` imports — the lazy-import discipline of
+  ``CompressorRegistry`` is untouched), so mypy checks the ``result``
+  attribute reads below instead of trusting a ``Callable[[], Any]`` alias.
 """
 
 from __future__ import annotations
 
 import logging
 from collections.abc import Callable
-from typing import Any
+from typing import TYPE_CHECKING, Any, Protocol
 
 from .router_policy import CompressionStrategy
 
-# Type alias for the injected callables (documentation, not enforcement).
-_GetCompressor = Callable[[], Any]
+if TYPE_CHECKING:
+    from .code_aware_compressor import CodeAwareCompressor
+    from .diff_compressor import DiffCompressor
+    from .log_compressor import LogCompressor
+    from .search_compressor import SearchCompressor
+    from .smart_crusher import SmartCrusher
+    from .text_crusher import TextCrusher
+
+
+class DispatchConfig(Protocol):
+    """The config gate fields the dispatcher reads (a structural subset of
+    ``ContentRouterConfig``)."""
+
+    enable_smart_crusher: bool
+    enable_search_compressor: bool
+    enable_log_compressor: bool
+    enable_text_crusher: bool
+    enable_code_aware: bool
+    lossless_only: bool
 
 
 def _word_count(text: str) -> int:
@@ -52,7 +74,7 @@ class StrategyDispatcher:
 
     def __init__(
         self,
-        config: Any,
+        config: DispatchConfig,
         *,
         logger: logging.Logger,
         log_router_debug: Callable[..., None],
@@ -72,12 +94,12 @@ class StrategyDispatcher:
         question: str | None = None,
         bias: float = 1.0,
         *,
-        get_smart_crusher: _GetCompressor,
-        get_search_compressor: _GetCompressor,
-        get_log_compressor: _GetCompressor,
-        get_diff_compressor: _GetCompressor,
-        get_text_crusher: _GetCompressor,
-        get_code_aware_compressor: _GetCompressor,
+        get_smart_crusher: Callable[[], SmartCrusher | None],
+        get_search_compressor: Callable[[], SearchCompressor | None],
+        get_log_compressor: Callable[[], LogCompressor | None],
+        get_diff_compressor: Callable[[], DiffCompressor | None],
+        get_text_crusher: Callable[[], TextCrusher | None],
+        get_code_aware_compressor: Callable[[], CodeAwareCompressor | None],
         token_counter: Callable[[str], int] | None = None,
     ) -> tuple[str, int, list[str]]:
         """Apply a compression strategy to content.
@@ -144,49 +166,49 @@ class StrategyDispatcher:
                 crusher = get_smart_crusher()
                 if crusher:
                     compressor_name = type(crusher).__name__
-                    result = crusher.crush(content, query=context, bias=bias)
+                    crush_result = crusher.crush(content, query=context, bias=bias)
                     compressed, compressed_tokens = (
-                        result.compressed,
-                        count(result.compressed),
+                        crush_result.compressed,
+                        count(crush_result.compressed),
                     )
                     decision_reason = "smart_crusher"
 
         elif strategy == CompressionStrategy.SEARCH:
             if self.config.enable_search_compressor and not self.config.lossless_only:
-                compressor = get_search_compressor()
-                if compressor:
-                    compressor_name = type(compressor).__name__
-                    result = compressor.compress(content, context=context, bias=bias)
+                search_compressor = get_search_compressor()
+                if search_compressor:
+                    compressor_name = type(search_compressor).__name__
+                    search_result = search_compressor.compress(content, context=context, bias=bias)
                     compressed, compressed_tokens = (
-                        result.compressed,
-                        count(result.compressed),
+                        search_result.compressed,
+                        count(search_result.compressed),
                     )
                     decision_reason = "search_compressor"
 
         elif strategy == CompressionStrategy.LOG:
             if self.config.enable_log_compressor and not self.config.lossless_only:
-                compressor = get_log_compressor()
-                if compressor:
-                    compressor_name = type(compressor).__name__
-                    result = compressor.compress(content, bias=bias)
+                log_compressor_arm = get_log_compressor()
+                if log_compressor_arm:
+                    compressor_name = type(log_compressor_arm).__name__
+                    log_arm_result = log_compressor_arm.compress(content, bias=bias)
                     # Use the same count metric the rest of the
                     # router uses; `compressed_line_count` is in
                     # lines, not tokens — recording it here made
                     # ratios meaningless against `original_tokens`.
                     compressed, compressed_tokens = (
-                        result.compressed,
-                        count(result.compressed),
+                        log_arm_result.compressed,
+                        count(log_arm_result.compressed),
                     )
                     decision_reason = "log_compressor"
 
         elif strategy == CompressionStrategy.DIFF:
-            compressor = get_diff_compressor() if not self.config.lossless_only else None
-            if compressor:
-                compressor_name = type(compressor).__name__
-                result = compressor.compress(content, context=context)
+            diff_compressor = get_diff_compressor() if not self.config.lossless_only else None
+            if diff_compressor:
+                compressor_name = type(diff_compressor).__name__
+                diff_result = diff_compressor.compress(content, context=context)
                 compressed, compressed_tokens = (
-                    result.compressed,
-                    count(result.compressed),
+                    diff_result.compressed,
+                    count(diff_result.compressed),
                 )
                 decision_reason = "diff_compressor"
 
@@ -203,13 +225,13 @@ class StrategyDispatcher:
             # text still gets the router's reversible CCR offload
             # downstream.
             if self.config.enable_text_crusher and not self.config.lossless_only:
-                compressor = get_text_crusher()
-                if compressor:
-                    compressor_name = type(compressor).__name__
-                    result = compressor.compress(content, context=context, bias=bias)
+                text_crusher = get_text_crusher()
+                if text_crusher:
+                    compressor_name = type(text_crusher).__name__
+                    text_result = text_crusher.compress(content, context=context, bias=bias)
                     compressed, compressed_tokens = (
-                        result.compressed,
-                        count(result.compressed),
+                        text_result.compressed,
+                        count(text_result.compressed),
                     )
                     decision_reason = "text_crusher"
 
@@ -223,13 +245,15 @@ class StrategyDispatcher:
             # store-write failure), which the generic no-savings handling
             # below reports honestly.
             if self.config.enable_code_aware and not self.config.lossless_only:
-                compressor = get_code_aware_compressor()
-                if compressor:
-                    compressor_name = type(compressor).__name__
-                    result = compressor.compress(content, language=language, context=context)
+                code_compressor = get_code_aware_compressor()
+                if code_compressor:
+                    compressor_name = type(code_compressor).__name__
+                    code_result = code_compressor.compress(
+                        content, language=language, context=context
+                    )
                     compressed, compressed_tokens = (
-                        result.compressed,
-                        count(result.compressed),
+                        code_result.compressed,
+                        count(code_result.compressed),
                     )
                     decision_reason = "code_aware_compressor"
 

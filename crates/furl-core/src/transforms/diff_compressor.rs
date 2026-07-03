@@ -39,9 +39,9 @@ use std::collections::BTreeMap;
 use std::sync::OnceLock;
 use std::time::Instant;
 
-use md5::{Digest, Md5};
 use regex::Regex;
 
+use crate::ccr::persist::md5_hex_24;
 use crate::ccr::{marker_for_diff, CcrStore};
 
 // ─── Score-weight constants ────────────────────────────────────────────────
@@ -1308,20 +1308,10 @@ fn count_split_lines(s: &str) -> usize {
     s.split('\n').count()
 }
 
-/// MD5 of `s`'s UTF-8 bytes, hex-encoded, truncated to 24 chars. Matches
-/// `hashlib.md5(s.encode()).hexdigest()[:24]` from
-/// `furl_ctx.cache.compression_store.CompressionStore.store`.
-fn md5_hex_24(s: &str) -> String {
-    let mut hasher = Md5::new();
-    hasher.update(s.as_bytes());
-    let digest = hasher.finalize();
-    let mut hex = String::with_capacity(32);
-    for b in digest {
-        hex.push_str(&format!("{:02x}", b));
-    }
-    hex.truncate(24);
-    hex
-}
+// `md5_hex_24` (the CCR cache key) lives in `crate::ccr::persist` — one
+// shared implementation for the diff/log/search/text family (ARCH-5),
+// imported at the top of this module. Its Python-parity pin
+// (`md5_24_matches_python`) moved there with it.
 
 /// Emit a `tracing::info` event for the OTel pipeline and return the stats
 /// unchanged (so callers can see them too).
@@ -1379,12 +1369,8 @@ mod tests {
         assert_eq!(r.files_affected, 0);
     }
 
-    #[test]
-    fn md5_24_matches_python() {
-        // Verified against Python: hashlib.md5(b"hello").hexdigest()[:24]
-        assert_eq!(md5_hex_24("hello"), "5d41402abc4b2a76b9719d91");
-        assert_eq!(md5_hex_24(""), "d41d8cd98f00b204e9800998");
-    }
+    // `md5_24_matches_python` moved to `ccr::persist::tests` with the
+    // consolidated `md5_hex_24` implementation (ARCH-5).
 
     #[test]
     fn count_split_lines_matches_python_split_n() {

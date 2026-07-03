@@ -25,8 +25,12 @@ def test_compression_cache_handles_hits_skips_evictions_and_clear(
 ) -> None:
     # The cache's expiry math rides time.monotonic() (ENGINE P1-9: wall-clock
     # NTP steps must not break TTL semantics), so that is the clock to fake.
-    times = iter([100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 112.0, 112.0])
-    monkeypatch.setattr(content_router_module.time, "monotonic", lambda: next(times))
+    # A settable clock, NOT an exhaustible iterator (TEST-21): every
+    # monotonic() read observes the same instant until the test advances it,
+    # so a refactor that adds or removes clock reads can neither raise
+    # StopIteration nor shift the expiry schedule.
+    clock = SimpleNamespace(now=100.0)
+    monkeypatch.setattr(content_router_module.time, "monotonic", lambda: clock.now)
     monkeypatch.setattr(content_router_module.time, "perf_counter_ns", lambda: 50)
 
     cache = CompressionCache(ttl_seconds=10)
@@ -42,7 +46,8 @@ def test_compression_cache_handles_hits_skips_evictions_and_clear(
     assert cache.get(1) is None
     assert cache.is_skipped(1) is True
 
-    # Expire both skip entries
+    # Advance past the 10s TTL and expire both skip entries
+    clock.now = 112.0
     assert cache.is_skipped(2) is False
     assert cache.is_skipped(1) is False
 

@@ -9,11 +9,12 @@
 //! Rust counterpart to stay in lockstep with, and a marker shape can only
 //! change by editing this file.
 //!
-//! Hashing stays at the call sites: each producer computes its own hash
-//! (SHA-256[:6] row hashes, SHA-256[:6] opaque prefixes, MD5[:24]
-//! diff/log/search keys) and hands the finished `hash` string in. This module owns the
-//! *grammar*, not the *hash algorithm* — the two are deliberately
-//! separate so producers keep their existing keys byte-for-byte.
+//! Hashing lives in the sibling `ccr::persist` module: producers compute
+//! their key there (`sha6_hex12` row/opaque hashes, `md5_hex_24`
+//! diff/log/search/text keys) and hand the finished `hash` string in.
+//! This module owns the *grammar*, not the *hash algorithm* — the two
+//! are deliberately separate so producers keep their existing keys
+//! byte-for-byte.
 //!
 //! # Marker shapes
 //!
