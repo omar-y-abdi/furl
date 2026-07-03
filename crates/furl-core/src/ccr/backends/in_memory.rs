@@ -111,7 +111,17 @@ impl InMemoryCcrStore {
         Self::with_capacity_and_ttl(DEFAULT_CAPACITY, DEFAULT_TTL)
     }
 
+    /// # Panics
+    ///
+    /// Panics when `capacity == 0`. The evict-then-insert order in
+    /// [`CcrStore::put`] would still leave the newest entry live, so a
+    /// capacity-0 store silently holds one entry — an invariant
+    /// violation, not a usable configuration (COR-41).
     pub fn with_capacity_and_ttl(capacity: usize, ttl: Duration) -> Self {
+        assert!(
+            capacity >= 1,
+            "InMemoryCcrStore capacity must be >= 1 (a capacity-0 store would still hold one entry)"
+        );
         Self {
             map: DashMap::with_capacity(capacity),
             order: Mutex::new(VecDeque::with_capacity(capacity)),
@@ -286,7 +296,16 @@ impl CcrStore for InMemoryCcrStore {
     }
 
     fn len(&self) -> usize {
-        self.map.len()
+        // Honest live count (COR-41): skip entries past their TTL that
+        // lazy expiry hasn't reaped yet — `get` refuses to serve them,
+        // so counting them would overreport to telemetry. NOTE: the
+        // capacity-eviction math intentionally keeps using the RAW map
+        // size (`self.map.len()`) — expired-but-unreaped entries still
+        // occupy capacity until a `get` or an eviction removes them.
+        self.map
+            .iter()
+            .filter(|kv| kv.value().inserted.elapsed() <= self.ttl)
+            .count()
     }
 
     fn capacity(&self) -> usize {
@@ -350,6 +369,34 @@ mod tests {
         std::thread::sleep(Duration::from_millis(25));
         assert_eq!(store.get("a"), None);
         assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn len_skips_expired_entries() {
+        // COR-41: `CcrStore::len` is documented as the number of LIVE
+        // entries, and `get` refuses expired ones — so entries past
+        // their TTL that lazy expiry has not reaped yet must not be
+        // counted. (Capacity eviction deliberately keeps using the raw
+        // stored count — expired-but-unreaped entries still occupy
+        // capacity until removed.)
+        let store = InMemoryCcrStore::with_capacity_and_ttl(10, Duration::from_millis(10));
+        store.put("a", "1");
+        store.put("b", "2");
+        assert_eq!(store.len(), 2);
+        std::thread::sleep(Duration::from_millis(25));
+        // No get() has touched the entries; the raw map still holds 2.
+        assert_eq!(store.len(), 0, "len() must not count expired entries");
+        assert!(store.is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "capacity")]
+    fn capacity_zero_is_rejected() {
+        // COR-41: capacity-0 used to hold one entry anyway (the
+        // evict-then-insert order leaves the newest put live), silently
+        // violating "capacity bounds the live set". Constructing such a
+        // store is a programming error — fail fast.
+        let _ = InMemoryCcrStore::with_capacity_and_ttl(0, DEFAULT_TTL);
     }
 
     #[test]

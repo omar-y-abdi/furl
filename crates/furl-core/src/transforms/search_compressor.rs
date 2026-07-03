@@ -198,6 +198,10 @@ pub struct SearchCompressorStats {
     pub files_dropped: usize,
     pub matches_dropped_by_per_file_cap: usize,
     pub matches_dropped_by_global_cap: usize,
+    /// Duplicate match instances collapsed by the intra-file dedup
+    /// (same line number + content). Mutually exclusive with the two
+    /// cap counters (COR-41).
+    pub matches_dropped_by_dedup: usize,
     pub ccr_emitted: bool,
     pub ccr_skip_reason: Option<&'static str>,
 }
@@ -463,10 +467,8 @@ impl SearchCompressor {
             // uses linear `not in` — quadratic for big files).
             let mut seen: BTreeSet<(u64, u64)> = BTreeSet::new();
 
-            let remaining_cap = self
-                .config
-                .max_matches_per_file
-                .min(adaptive_total.saturating_sub(total_selected));
+            let remaining_global = adaptive_total.saturating_sub(total_selected);
+            let remaining_cap = self.config.max_matches_per_file.min(remaining_global);
 
             let push_unique = |m: &SearchMatch,
                                file_selected: &mut Vec<SearchMatch>,
@@ -506,8 +508,24 @@ impl SearchCompressor {
             // Restore line order for output.
             file_selected.sort_by_key(|m| m.line_number);
 
-            let dropped_here = fm.matches.len().saturating_sub(file_selected.len());
-            stats.matches_dropped_by_per_file_cap += dropped_here;
+            // Attribute every truncated match to its actual cause
+            // (COR-41): duplicate instances collapsed by the intra-file
+            // dedup; unique matches beyond the per-file cap (dropped
+            // regardless of budget); and unique matches that fit the
+            // per-file cap but not the remaining global budget. The three
+            // buckets sum to `fm.matches.len() - file_selected.len()`.
+            let unique_total = fm
+                .matches
+                .iter()
+                .map(|m| (m.line_number, hash_u64(&m.content)))
+                .collect::<BTreeSet<_>>()
+                .len();
+            stats.matches_dropped_by_dedup += fm.matches.len() - unique_total;
+            stats.matches_dropped_by_per_file_cap +=
+                unique_total.saturating_sub(self.config.max_matches_per_file);
+            stats.matches_dropped_by_global_cap += unique_total
+                .min(self.config.max_matches_per_file)
+                .saturating_sub(remaining_global);
 
             total_selected += file_selected.len();
             selected.insert(
@@ -866,6 +884,72 @@ src/main.py-44-context line";
                 .windows(2)
                 .all(|w| w[0].line_number < w[1].line_number));
         }
+    }
+
+    #[test]
+    fn truncation_stats_attribute_global_cap_inside_processed_file() {
+        // COR-41: matches truncated inside a PROCESSED file because the
+        // global budget ran out used to be booked under
+        // `matches_dropped_by_per_file_cap`. Here the per-file cap (10)
+        // never binds — the global cap (5) does.
+        let compressor = SearchCompressor::new(SearchCompressorConfig {
+            max_matches_per_file: 10,
+            max_total_matches: 5,
+            ..Default::default()
+        });
+        let mut files = BTreeMap::new();
+        for file in ["a.py", "b.py"] {
+            let mut fm = FileMatches::new(file);
+            for i in 0..4 {
+                fm.matches.push(SearchMatch::new(
+                    file,
+                    i + 1,
+                    format!("{} line {}", file, i + 1),
+                ));
+            }
+            files.insert(file.to_string(), fm);
+        }
+
+        let mut stats = SearchCompressorStats::default();
+        let selected = compressor.select_matches(&files, 1.0, &mut stats);
+
+        // 8 total matches, global budget 5: a.py ships all 4, b.py ships
+        // 1 and truncates 3 — because of the GLOBAL cap.
+        let total: usize = selected.values().map(|fm| fm.matches.len()).sum();
+        assert_eq!(total, 5);
+        assert_eq!(
+            stats.matches_dropped_by_per_file_cap, 0,
+            "per-file cap never bound; nothing may be booked under it"
+        );
+        assert_eq!(
+            stats.matches_dropped_by_global_cap, 3,
+            "global-budget truncation inside a processed file must be booked to the global cap"
+        );
+        assert_eq!(stats.matches_dropped_by_dedup, 0);
+    }
+
+    #[test]
+    fn truncation_stats_attribute_intra_file_dedup() {
+        // COR-41: duplicates collapsed by the intra-file dedup are not
+        // per-file-cap drops (the file is far under both caps here).
+        let compressor = SearchCompressor::new(SearchCompressorConfig::default());
+        let mut fm = FileMatches::new("d.py");
+        fm.matches.push(SearchMatch::new("d.py", 1, "dup line"));
+        fm.matches.push(SearchMatch::new("d.py", 2, "unique line"));
+        fm.matches.push(SearchMatch::new("d.py", 1, "dup line"));
+        let mut files = BTreeMap::new();
+        files.insert("d.py".to_string(), fm);
+
+        let mut stats = SearchCompressorStats::default();
+        let selected = compressor.select_matches(&files, 1.0, &mut stats);
+
+        assert_eq!(selected["d.py"].matches.len(), 2);
+        assert_eq!(stats.matches_dropped_by_per_file_cap, 0);
+        assert_eq!(stats.matches_dropped_by_global_cap, 0);
+        assert_eq!(
+            stats.matches_dropped_by_dedup, 1,
+            "the collapsed duplicate instance is a dedup drop"
+        );
     }
 
     #[test]

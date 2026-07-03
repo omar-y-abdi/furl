@@ -228,8 +228,7 @@ impl<'a> SmartCrusherPlanner<'a> {
         }
 
         // 5/6. Query-anchor matches + relevance scores.
-        let query_pinned =
-            self.apply_query_signals(items, query_context, item_strings, &mut keep, false);
+        let query_pinned = self.apply_query_signals(items, query_context, item_strings, &mut keep);
 
         // preserve_fields (caller-supplied; None on the production path).
         self.apply_preserve_field_matches(items, query_context, preserve_fields, &mut keep);
@@ -313,12 +312,16 @@ impl<'a> SmartCrusherPlanner<'a> {
         // 2. Structural outliers + error keywords (configured via Constraint trait).
         self.apply_constraints(items, item_strings, &mut keep);
 
-        // 3. Query-anchor matches (additive — preserved regardless of top-N).
+        // 3. Query-anchor matches (additive — preserved regardless of
+        // top-N). Collected separately: anchor matches take priority when
+        // the keep set must be capped back to `max_items` below.
+        let mut anchor_pinned: BTreeSet<usize> = BTreeSet::new();
         if !query_context.is_empty() {
             let anchors = extract_query_anchors(query_context);
             for (i, item) in items.iter().enumerate() {
-                if !keep.contains(&i) && item_matches_anchors(item, &anchors) {
+                if item_matches_anchors(item, &anchors) {
                     keep.insert(i);
+                    anchor_pinned.insert(i);
                 }
             }
         }
@@ -353,6 +356,35 @@ impl<'a> SmartCrusherPlanner<'a> {
         }
 
         self.apply_preserve_field_matches(items, query_context, preserve_fields, &mut keep);
+
+        // Enforce the budget (COR-35). The adds above (constraints,
+        // anchors, relevance, preserve-fields) historically left the keep
+        // set unbounded above `max_items`, silently ignoring the
+        // CCR-backed (possibly halved) effective budget on the TopN
+        // strategy — the only planner that skips `prioritize_indices`.
+        // Cap it back: query-anchor matches first (the user literally
+        // named those values — mirroring the prioritizer's query
+        // pinning), then the highest-scored keeps fill the rest (stable
+        // sort ⇒ ties resolve by ascending index). Every dropped row
+        // stays CCR-recoverable, so the cap loses no information.
+        if keep.len() > max_items {
+            let mut capped: BTreeSet<usize> = BTreeSet::new();
+            for &i in &anchor_pinned {
+                if capped.len() >= max_items {
+                    break;
+                }
+                capped.insert(i);
+            }
+            for (idx, _) in &scored {
+                if capped.len() >= max_items {
+                    break;
+                }
+                if keep.contains(idx) {
+                    capped.insert(*idx);
+                }
+            }
+            keep = capped;
+        }
 
         plan.keep_count = keep.len();
         plan.keep_indices = keep.into_iter().collect();
@@ -425,8 +457,7 @@ impl<'a> SmartCrusherPlanner<'a> {
         }
 
         // 4/5. Query signals.
-        let query_pinned =
-            self.apply_query_signals(items, query_context, item_strings, &mut keep, false);
+        let query_pinned = self.apply_query_signals(items, query_context, item_strings, &mut keep);
 
         // preserve_fields (caller-supplied; None on the production path).
         self.apply_preserve_field_matches(items, query_context, preserve_fields, &mut keep);
@@ -487,8 +518,7 @@ impl<'a> SmartCrusherPlanner<'a> {
         self.apply_constraints(items, item_strings, &mut keep);
 
         // 4/5. Query signals.
-        let query_pinned =
-            self.apply_query_signals(items, query_context, item_strings, &mut keep, false);
+        let query_pinned = self.apply_query_signals(items, query_context, item_strings, &mut keep);
 
         // preserve_fields (caller-supplied; None on the production path).
         self.apply_preserve_field_matches(items, query_context, preserve_fields, &mut keep);
@@ -510,9 +540,8 @@ impl<'a> SmartCrusherPlanner<'a> {
     // --- Shared helpers ---
 
     /// Apply query-anchor matches (deterministic) + relevance scoring
-    /// (probabilistic). When `keep_existing_only` is true (top_n's
-    /// "additive only" mode), only items not already in keep are added.
-    /// When false, all matches are added.
+    /// (probabilistic) to `keep`. (`plan_top_n` runs its own inline
+    /// variant of this logic; the other three planners share this one.)
     ///
     /// Returns the **query-pinned** subset: indices the user's query
     /// names directly (deterministic anchor matches) plus a capped
@@ -529,7 +558,6 @@ impl<'a> SmartCrusherPlanner<'a> {
         query_context: &str,
         item_strings: Option<&[String]>,
         keep: &mut BTreeSet<usize>,
-        keep_existing_only: bool,
     ) -> BTreeSet<usize> {
         let mut query_pinned: BTreeSet<usize> = BTreeSet::new();
         if query_context.is_empty() {
@@ -539,9 +567,6 @@ impl<'a> SmartCrusherPlanner<'a> {
         // Deterministic anchor match.
         let anchors = extract_query_anchors(query_context);
         for (i, item) in items.iter().enumerate() {
-            if keep_existing_only && keep.contains(&i) {
-                continue;
-            }
             if item_matches_anchors(item, &anchors) {
                 keep.insert(i);
                 query_pinned.insert(i);
@@ -564,9 +589,6 @@ impl<'a> SmartCrusherPlanner<'a> {
         let mut high_pins = 0usize;
         let scores = self.scorer.score_batch(&strs, query_context);
         for (i, sc) in scores.iter().enumerate() {
-            if keep_existing_only && keep.contains(&i) {
-                continue;
-            }
             if sc.score >= self.config.relevance_threshold {
                 keep.insert(i);
                 if sc.score >= high_threshold && high_pins < MAX_QUERY_RELEVANCE_PINS {
@@ -952,6 +974,58 @@ mod tests {
             plan.keep_indices.contains(&0),
             "highest-scored item (idx 0) should be kept"
         );
+    }
+
+    #[test]
+    fn top_n_keep_set_capped_at_max_items_anchors_first() {
+        // COR-35: the pre-cap keep set is top-N + constraint + anchor +
+        // relevance adds, historically unbounded above `max_items` — 20
+        // anchor matches on a 10-item budget shipped ~27 rows and ignored
+        // the CCR-backed (possibly halved) budget on the TopN strategy.
+        // The cap keeps query-anchor matches (user-named values) first,
+        // then fills by score.
+        let (cfg, asel, scorer, analyzer, cs) = make_planner_deps();
+        let p = fixture(&cfg, &asel, &scorer, &analyzer, &cs);
+        let shared = "550e8400-e29b-41d4-a716-446655440000";
+        let other = "11111111-2222-3333-4444-555555555555";
+        let items: Vec<Value> = (0..30)
+            .map(|i| {
+                json!({
+                    "id": i,
+                    "score": (29 - i) as f64 * 0.03,
+                    "uuid": if i < 10 { other } else { shared },
+                })
+            })
+            .collect();
+        let analysis = analyzer.analyze_array(&items);
+        let plan_in = CompressionPlan {
+            strategy: CompressionStrategy::TopN,
+            ..CompressionPlan::default()
+        };
+        let query = format!("find {}", shared);
+        let plan = p.plan_top_n(
+            &analysis,
+            &items,
+            plan_in,
+            &query,
+            None,
+            10,
+            None,
+            &BTreeSet::new(),
+        );
+        // Guard: the score field was detected (no smart_sample fallback).
+        assert!(plan.sort_field.is_some());
+        assert!(
+            plan.keep_indices.len() <= 10,
+            "TopN keep set must honor max_items; got {} indices: {:?}",
+            plan.keep_indices.len(),
+            plan.keep_indices
+        );
+        // Anchor-matched items (indices 10..30 carry the queried UUID)
+        // take priority over generic top-scored fill; the ten
+        // lowest-indexed anchor matches fill the whole budget.
+        let expected: Vec<usize> = (10..20).collect();
+        assert_eq!(plan.keep_indices, expected);
     }
 
     // ---------- plan_cluster_sample ----------

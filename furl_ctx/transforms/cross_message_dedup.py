@@ -11,7 +11,7 @@ price. This transform removes that waste at the conversation level:
   sentinel: the original is persisted in the CCR ``compression_store``
   FIRST, and only then is the content swapped for a
   ``{"_ccr_dropped": "... <<ccr:HASH ...>>"}`` pointer naming the message
-  that still carries the bytes. If the store write fails, the content is
+  that carried the bytes. If the store write fails, the content is
   left untouched — recoverability is a precondition of removal, never an
   afterthought.
 
@@ -51,10 +51,12 @@ Two tiers, both pointer-backed:
 * **Near** — a later JSON dict-array sharing a meaningful set of
   byte-identical rows with an earlier kept-verbatim array ships only its
   DIFFERING rows; the shared rows are elided with a sentinel naming the
-  message that still shows them, and the full original stays recoverable
-  under the surfaced hash. Reference sources are always kept-verbatim
-  units, so every elided row remains visible somewhere in the
-  conversation.
+  message that carried them, and the full original stays recoverable
+  under the surfaced hash. Reference sources are units THIS transform
+  kept verbatim — the per-message router may still compress the
+  reference message afterwards, so the sentinel's message pointer is
+  best-effort context; recoverability rests on the CCR hash backing,
+  not on the elided rows remaining visible there.
 """
 
 from __future__ import annotations
@@ -116,9 +118,10 @@ class _FirstOccurrence:
 class _ArraySource:
     """A kept-verbatim JSON dict-array unit usable as a near-dup reference.
 
-    Only units that ship verbatim are registered, so a pointer at
-    ``message_index`` always names a message where the shared rows remain
-    visible.
+    Only units this transform ships verbatim are registered, so a pointer
+    at ``message_index`` names the message that carried the shared rows.
+    Best-effort: downstream per-message compression may still rewrite that
+    message — the CCR hash is the recovery guarantee.
     """
 
     message_index: int
@@ -452,9 +455,10 @@ class CrossMessageDeduper(Transform):
 
         Tier order: exact match first (cheapest, biggest win), then the
         near-duplicate row-overlap tier. Units kept verbatim are registered
-        as reference sources; replaced units are NOT (a pointer must always
-        name a message that still shows the referenced bytes/rows).
-        Store-before-replace holds for both tiers.
+        as reference sources; replaced units are NOT (a pointer names the
+        message that carried the referenced bytes/rows — best-effort, since
+        later router passes may compress it; the CCR hash stays the
+        recovery guarantee). Store-before-replace holds for both tiers.
         """
         if len(content) < MIN_DEDUP_CHARS:
             return None

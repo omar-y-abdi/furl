@@ -44,7 +44,9 @@ pub trait CcrStore: Send + Sync {
     /// Look up `hash`. Returns `None` if missing or expired.
     fn get(&self, hash: &str) -> Option<String>;
 
-    /// Number of live entries. Informational; used by tests + telemetry.
+    /// Number of live entries — stored AND not past TTL. Backends with
+    /// lazy expiry must not count expired-but-unreaped entries (a `get`
+    /// would refuse them). Informational; used by tests + telemetry.
     /// Some backends (notably Redis) cannot answer this efficiently and
     /// return 0 — see backend-specific docs.
     fn len(&self) -> usize;

@@ -753,6 +753,13 @@ impl LogCompressor {
         let mut out: Vec<LogLine> = Vec::with_capacity(lines.len());
         let mut active: Option<TraceFlavor> = None;
         let mut trace_lines = 0usize;
+        // Flavor of a trace whose run was closed by `stack_trace_max_lines`
+        // but whose lines keep coming (COR-41). While set, its continuation
+        // is consumed WITHOUT re-opening: frame lines match the opener
+        // patterns, so the tail of one oversized trace used to re-open as a
+        // "new" trace per cap window — each chunk then consumed a
+        // `max_stack_traces` slot and re-inflated the kept line count.
+        let mut ended_by_cap: Option<TraceFlavor> = None;
 
         for (i, line) in lines.iter().enumerate() {
             let mut entry = LogLine::new(i, *line);
@@ -766,12 +773,33 @@ impl LogCompressor {
                 if trace_lines >= self.config.stack_trace_max_lines {
                     active = None;
                     trace_lines = 0;
-                    // Re-check the current line against opener — a new
-                    // trace can start on the same line that hit the cap.
-                    if let Some(new_flavor) = StackTraceDetector::flavor_for(line) {
-                        active = Some(new_flavor);
-                        trace_lines = 1;
-                        entry.is_stack_trace = true;
+                    // The cap closed the RUN, not necessarily the trace.
+                    // Classify the current line against the capped flavor:
+                    // its own continuation must not re-open as a "new"
+                    // trace; only a naturally-ended trace frees the line
+                    // for a fresh opener check.
+                    match StackTraceDetector::terminates(flavor, line) {
+                        TraceTermination::Continue => {
+                            ended_by_cap = Some(flavor);
+                        }
+                        TraceTermination::IncludeAndEnd => {
+                            // Terminator line (beyond the cap, unmarked).
+                            // A chained exception keeps the consumption
+                            // going, exactly like the active-run path.
+                            if StackTraceDetector::python_chain_continues(lines, i + 1) {
+                                ended_by_cap = Some(flavor);
+                            }
+                        }
+                        TraceTermination::End => {
+                            // The capped trace ended right here — a
+                            // genuinely NEW trace can start on the same
+                            // line that hit the cap (pre-existing case).
+                            if let Some(new_flavor) = StackTraceDetector::flavor_for(line) {
+                                active = Some(new_flavor);
+                                trace_lines = 1;
+                                entry.is_stack_trace = true;
+                            }
+                        }
                     }
                 } else {
                     match StackTraceDetector::terminates(flavor, line) {
@@ -803,6 +831,26 @@ impl LogCompressor {
                                 trace_lines = 1;
                                 entry.is_stack_trace = true;
                             }
+                        }
+                    }
+                }
+            } else if let Some(capped) = ended_by_cap {
+                // Tail of a trace whose run hit `stack_trace_max_lines`:
+                // consume it (unmarked — it is beyond the cap) without
+                // re-opening until the trace ends naturally.
+                match StackTraceDetector::terminates(capped, line) {
+                    TraceTermination::Continue => {}
+                    TraceTermination::IncludeAndEnd => {
+                        if !StackTraceDetector::python_chain_continues(lines, i + 1) {
+                            ended_by_cap = None;
+                        }
+                    }
+                    TraceTermination::End => {
+                        ended_by_cap = None;
+                        if let Some(flavor) = StackTraceDetector::flavor_for(line) {
+                            active = Some(flavor);
+                            trace_lines = 1;
+                            entry.is_stack_trace = true;
                         }
                     }
                 }
@@ -1387,6 +1435,51 @@ mod tests {
                 i, lines[i].content
             );
         }
+    }
+
+    #[test]
+    fn capped_trace_does_not_reopen_per_chunk() {
+        // COR-41: a trace longer than `stack_trace_max_lines` used to
+        // re-open as a "new" trace on the next frame line of the SAME
+        // traceback (frame lines match the opener patterns), chunking one
+        // real trace into several runs — each chunk then consumed a
+        // `max_stack_traces` slot downstream and re-inflated the kept
+        // line count. The capped trace's own continuation must be
+        // consumed without re-opening until it terminates naturally.
+        let c = LogCompressor::new(LogCompressorConfig {
+            stack_trace_max_lines: 2,
+            ..Default::default()
+        });
+        // Digit-ending `File "…", line N` frames match the opener pattern
+        // (`is_python_file_frame`), so the tail of a capped trace used to
+        // re-open on every such frame.
+        let input = [
+            "Traceback (most recent call last):", // 0: opener (run line 1)
+            "  File \"a.py\", line 1",            // 1: frame (run line 2 = cap)
+            "    code()",                         // 2: cap hit — capped tail
+            "  File \"b.py\", line 2",            // 3: tail frame (old: re-opened here)
+            "    more()",                         // 4: tail
+            "  File \"c.py\", line 3",            // 5: tail frame (old: re-opened again)
+            "ValueError: kaput",                  // 6: natural terminator
+            "INFO recovered",                     // 7: unrelated
+        ];
+        let lines = c.parse_lines(&input);
+        assert!(lines[0].is_stack_trace);
+        assert!(lines[1].is_stack_trace);
+        for i in 2..=7 {
+            assert!(
+                !lines[i].is_stack_trace,
+                "line {}: '{}' is past the cap and must not re-open a run",
+                i, lines[i].content
+            );
+        }
+
+        let mut stats = LogCompressorStats::default();
+        let _ = c.select_lines(&lines, 1.0, &mut stats);
+        assert_eq!(
+            stats.stack_traces_seen, 1,
+            "one real traceback must register as ONE trace, not per-cap chunks"
+        );
     }
 
     #[test]

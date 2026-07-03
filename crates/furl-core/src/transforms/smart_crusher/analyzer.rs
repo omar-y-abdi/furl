@@ -350,8 +350,10 @@ impl SmartAnalyzer {
         "generic".to_string()
     }
 
-    /// Temporal-field detector. Mirrors `_detect_temporal_field` at
-    /// `smart_crusher.py:1173-1209`.
+    /// Temporal-field detector. (Ported from Python's
+    /// `_detect_temporal_field`, since retired in the excision — this is
+    /// the only implementation; the numeric branch is tightened vs the
+    /// port, see COR-34 below.)
     pub fn detect_temporal_field(
         &self,
         field_stats: &BTreeMap<String, FieldStats>,
@@ -380,12 +382,19 @@ impl SmartAnalyzer {
                     }
                 }
                 "numeric" => {
-                    if let (Some(mn), Some(_)) = (stats.min_val, stats.max_val) {
-                        // Unix epoch range checks. Python uses `if min_val and max_val`
-                        // which is falsy for 0; we mirror by checking `mn != 0` to
-                        // match Python's behavior (very unlikely range edge but pinned).
-                        let unix_seconds = (1_000_000_000.0..=2_000_000_000.0).contains(&mn);
-                        let unix_millis = (1_000_000_000_000.0..=2_000_000_000_000.0).contains(&mn);
+                    if let (Some(mn), Some(mx)) = (stats.min_val, stats.max_val) {
+                        // Unix epoch range check — BOTH ends must sit in
+                        // the same plausible window (seconds or millis).
+                        // Checking only the min let a field spanning
+                        // min=1.5e9..max=9e17 classify as temporal and
+                        // flip the strategy to TIME_SERIES (COR-34). The
+                        // retired Python twin checked only the min; with
+                        // no parity constraint left, both ends are
+                        // checked here.
+                        let secs = 1_000_000_000.0..=2_000_000_000.0;
+                        let millis = 1_000_000_000_000.0..=2_000_000_000_000.0;
+                        let unix_seconds = secs.contains(&mn) && secs.contains(&mx);
+                        let unix_millis = millis.contains(&mn) && millis.contains(&mx);
                         if unix_seconds || unix_millis {
                             return true;
                         }
@@ -1108,6 +1117,38 @@ mod tests {
         let mut fs: BTreeMap<String, FieldStats> = BTreeMap::new();
         fs.insert("ts".to_string(), a.analyze_field("ts", &items));
         assert!(a.detect_temporal_field(&fs, &items));
+    }
+
+    #[test]
+    fn temporal_unix_millis_range() {
+        // Millisecond timestamps in the 2023-2024 range — both ends
+        // inside the plausible epoch-millis window.
+        let items: Vec<Value> = (0..10)
+            .map(|i| json!({"ts": 1_700_000_000_000_i64 + i * 86_400_000}))
+            .collect();
+        let a = analyzer();
+        let mut fs: BTreeMap<String, FieldStats> = BTreeMap::new();
+        fs.insert("ts".to_string(), a.analyze_field("ts", &items));
+        assert!(a.detect_temporal_field(&fs, &items));
+    }
+
+    #[test]
+    fn temporal_absurd_max_not_detected() {
+        // COR-34: a min alone inside the plausible epoch-seconds window
+        // must not classify the field as temporal when the max is absurd
+        // — a numeric field spanning 1.5e9..9e17 is not a timestamp
+        // column, and flipping it to TIME_SERIES misplans the array.
+        let mut items: Vec<Value> = (0..9)
+            .map(|i| json!({"ts": 1_500_000_000_i64 + i}))
+            .collect();
+        items.push(json!({"ts": 900_000_000_000_000_000_i64}));
+        let a = analyzer();
+        let mut fs: BTreeMap<String, FieldStats> = BTreeMap::new();
+        fs.insert("ts".to_string(), a.analyze_field("ts", &items));
+        assert!(
+            !a.detect_temporal_field(&fs, &items),
+            "min=1.5e9 with max=9e17 must not be temporal"
+        );
     }
 
     #[test]
