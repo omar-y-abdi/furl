@@ -57,16 +57,28 @@ pub fn is_diff(content: &str) -> bool {
         return false;
     }
 
-    let mut patch = PatchSet::new();
-    if patch.parse(content).is_err() {
-        return false;
-    }
+    // Panic containment (P0-1, restores the upstream `catch_unwind`):
+    // unidiff 0.4.0 runs `source_file.clone().unwrap()` when it meets a
+    // `+++ ` target header with no preceding `--- ` source header — an
+    // orphaned `+++` line (lib.rs:665). That shape occurs in the wild:
+    // `set -x` shell traces prefix three-level nested expansions with
+    // `+++ `, and this detector runs on EVERY message via the router's
+    // `detect_content_type` bridge. A panicking parse means "not a diff
+    // we can process" — fail open to PlainText routing instead of
+    // crashing the host request.
+    std::panic::catch_unwind(|| {
+        let mut patch = PatchSet::new();
+        if patch.parse(content).is_err() {
+            return false;
+        }
 
-    // `PatchSet::is_empty()` covers "found zero files"; the inner
-    // loop covers "found a file but with zero hunks" (e.g. mode-only
-    // changes). For diff-compressor routing we want at least one
-    // hunk — that's where the actual line-level change content lives.
-    !patch.is_empty() && patch.files().iter().any(|f| !f.is_empty())
+        // `PatchSet::is_empty()` covers "found zero files"; the inner
+        // loop covers "found a file but with zero hunks" (e.g. mode-only
+        // changes). For diff-compressor routing we want at least one
+        // hunk — that's where the actual line-level change content lives.
+        !patch.is_empty() && patch.files().iter().any(|f| !f.is_empty())
+    })
+    .unwrap_or(false)
 }
 
 /// [`ContentType`]-typed wrapper. Returns `Some(ContentType::GitDiff)`
@@ -205,6 +217,42 @@ mod tests {
                     -line one\n\
                     -line two\n";
         assert!(is_diff(diff));
+    }
+
+    #[test]
+    fn orphaned_target_header_does_not_panic() {
+        // Regression (P0-1): a `set -x` shell trace prefixes three-level
+        // nested expansions with `+++ `. unidiff 0.4.0 sees such a line
+        // as a target file header with no preceding `--- ` source header
+        // and unwraps a `None` (lib.rs:665) — a panic that previously
+        // escaped straight through the FFI on the hook's hottest path.
+        // Containment turns it into "not a diff" (fail-open).
+        let trace = "+ ./deploy.sh --env prod\n\
+                     ++ dirname /opt/app/deploy.sh\n\
+                     +++ readlink -f /opt/app\n\
+                     + cd /opt/app\n\
+                     ++ git rev-parse HEAD\n\
+                     +++ git describe --tags\n\
+                     + echo done\n";
+        assert!(!is_diff(trace));
+        assert_eq!(detect_diff(trace), None);
+    }
+
+    #[test]
+    fn orphaned_target_header_before_valid_diff_does_not_panic() {
+        // The orphan precedes an otherwise-valid diff. unidiff panics at
+        // the first orphaned `+++` (before reaching the valid hunks), so
+        // containment classifies the whole input as not-a-diff — the
+        // fail-open passthrough beats a crash; the router serves the
+        // content as plain text.
+        let mixed = "+++ orphan-target-first\n\
+                     --- a/foo.py\n\
+                     +++ b/foo.py\n\
+                     @@ -1,1 +1,1 @@\n\
+                     -old\n\
+                     +new\n";
+        assert!(!is_diff(mixed));
+        assert_eq!(detect_diff(mixed), None);
     }
 
     #[test]

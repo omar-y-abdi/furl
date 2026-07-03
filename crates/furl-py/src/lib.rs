@@ -465,15 +465,24 @@ impl PyDiffCompressor {
         py: Python<'_>,
         content: &str,
         context: &str,
-    ) -> (PyDiffCompressionResult, PyDiffCompressorStats) {
+    ) -> PyResult<(PyDiffCompressionResult, PyDiffCompressorStats)> {
         let content = content.to_string();
         let context = context.to_string();
-        let (result, stats) =
-            py.allow_threads(|| self.inner.compress_with_stats(&content, &context));
-        (
+        // catch_unwind inside allow_threads (see `panic_to_pyerr`): the
+        // sidecar path parses the same diff as `compress` and can hit the
+        // same unidiff panics (e.g. orphaned `+++` headers) — same COR-7
+        // containment (P0-1).
+        let (result, stats) = py
+            .allow_threads(|| {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    self.inner.compress_with_stats(&content, &context)
+                }))
+            })
+            .map_err(panic_to_pyerr)?;
+        Ok((
             PyDiffCompressionResult { inner: result },
             PyDiffCompressorStats { inner: stats },
-        )
+        ))
     }
 }
 
@@ -1086,17 +1095,29 @@ impl PyDetectionResult {
 /// Releases the GIL while detecting — unidiff parsing can be
 /// substantial on large bodies, and freeing the GIL
 /// lets other Python threads make progress in the meantime.
+///
+/// This is the router's hottest bridge — `_detect_content` calls it on
+/// EVERY message — so it carries the COR-7 catch_unwind containment: an
+/// engine-bug panic anywhere in the detection chain becomes a catchable
+/// `PyRuntimeError` instead of a `pyo3_runtime.PanicException`
+/// (`BaseException`) that would sail past every `except Exception` on
+/// the way up and crash the host request (P0-1).
 #[pyfunction]
-fn detect_content_type(py: Python<'_>, content: &str) -> PyDetectionResult {
+fn detect_content_type(py: Python<'_>, content: &str) -> PyResult<PyDetectionResult> {
     let owned = content.to_string();
-    let content_type = py.allow_threads(move || rust_detect_chain(&owned));
-    PyDetectionResult {
+    // catch_unwind inside allow_threads (see `panic_to_pyerr`): COR-7.
+    let content_type = py
+        .allow_threads(move || {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rust_detect_chain(&owned)))
+        })
+        .map_err(panic_to_pyerr)?;
+    Ok(PyDetectionResult {
         inner: RustDetectionResult {
             content_type,
             confidence: 1.0,
             metadata: serde_json::Map::new(),
         },
-    }
+    })
 }
 
 // ─── signals: line-importance detector bridge ────────────────────────────
@@ -1143,29 +1164,40 @@ fn category_to_str(cat: ImportanceCategory) -> &'static str {
 /// Returns `Some((category | None, priority, confidence))` for known
 /// contexts (`text|search|diff|log`) and `None` for an unknown context
 /// — the Python shim translates `None` into `ValueError` for the
-/// caller. Returning `Option` instead of `PyResult` dodges the
-/// pyo3-0.22 + clippy `useless_conversion` false positive that the
-/// `#[pyfunction]` macro triggers when its inner result-shape carries
-/// `PyErr`. The bridge layer is the right place for this conversion;
-/// keeping the Rust signature panic-free and `PyResult`-free is worth
-/// a one-line shim on the Python side.
+/// caller. (Historical note: this used to return a bare `Option` to
+/// dodge a pyo3-0.22 + clippy `useless_conversion` false positive; the
+/// P0-1 panic-containment audit wrapped it in `PyResult` for the COR-7
+/// catch_unwind, and the lint no longer fires on this shape.)
+///
+/// No `allow_threads` here: this is called per line in tight Python
+/// loops and the compute is a single aho-corasick scan — releasing and
+/// reacquiring the GIL per call would cost more than the scan itself.
 #[pyfunction]
 #[pyo3(signature = (line, context = "text"))]
-fn score_line(line: &str, context: &str) -> Option<(Option<&'static str>, f32, f32)> {
-    let ctx = ctx_from_str(context)?;
-    let signal = shared_keyword_detector().score(line, ctx);
-    Some((
-        signal.category.map(category_to_str),
-        signal.priority,
-        signal.confidence,
-    ))
+fn score_line(line: &str, context: &str) -> PyResult<Option<(Option<&'static str>, f32, f32)>> {
+    // catch_unwind → PyRuntimeError (see `panic_to_pyerr`): COR-7 (P0-1 audit).
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let ctx = ctx_from_str(context)?;
+        let signal = shared_keyword_detector().score(line, ctx);
+        Some((
+            signal.category.map(category_to_str),
+            signal.priority,
+            signal.confidence,
+        ))
+    }))
+    .map_err(panic_to_pyerr)
 }
 
 /// Lax substring check: does `text` contain any error indicator? Mirrors
-/// Python `error_detection.content_has_error_indicators`.
+/// Python `error_detection.content_has_error_indicators`. Same
+/// no-`allow_threads` rationale as `score_line`.
 #[pyfunction]
-fn content_has_error_indicators(text: &str) -> bool {
-    shared_keyword_detector().contains_error_indicator(text)
+fn content_has_error_indicators(text: &str) -> PyResult<bool> {
+    // catch_unwind → PyRuntimeError (see `panic_to_pyerr`): COR-7 (P0-1 audit).
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        shared_keyword_detector().contains_error_indicator(text)
+    }))
+    .map_err(panic_to_pyerr)
 }
 
 /// Snapshot of the default keyword sets, exposed as a dict so the Python
@@ -1376,17 +1408,26 @@ impl PySearchCompressor {
 /// runs even when callers use the legacy internal helpers (which exist
 /// only for backwards-compat with the existing test surface).
 #[pyfunction]
-fn parse_search_lines(content: &str) -> Vec<(String, u64, String)> {
-    let compressor = RustSearchCompressor::new(RustSearchConfig::default());
-    let mut stats = RustSearchStats::default();
-    let parsed = compressor.parse_search_results(content, &mut stats);
-    let mut out = Vec::new();
-    for fm in parsed.values() {
-        for m in &fm.matches {
-            out.push((m.file.clone(), m.line_number, m.content.clone()));
-        }
-    }
-    out
+fn parse_search_lines(py: Python<'_>, content: &str) -> PyResult<Vec<(String, u64, String)>> {
+    let owned = content.to_string();
+    // catch_unwind inside allow_threads (see `panic_to_pyerr`): COR-7
+    // containment for the legacy parse helper — it runs the same parser
+    // as the wrapped `SearchCompressor.compress` bridge (P0-1 audit).
+    py.allow_threads(move || {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let compressor = RustSearchCompressor::new(RustSearchConfig::default());
+            let mut stats = RustSearchStats::default();
+            let parsed = compressor.parse_search_results(&owned, &mut stats);
+            let mut out = Vec::new();
+            for fm in parsed.values() {
+                for m in &fm.matches {
+                    out.push((m.file.clone(), m.line_number, m.content.clone()));
+                }
+            }
+            out
+        }))
+    })
+    .map_err(panic_to_pyerr)
 }
 
 // ─── log_compressor bridge (Phase 3e.5) ───────────────────────────────
@@ -1568,10 +1609,17 @@ impl PyLogCompressor {
 
 /// Helper for the Python shim's `_detect_format`.
 #[pyfunction]
-fn detect_log_format(lines: Vec<String>) -> &'static str {
-    let compressor = RustLogCompressor::new(RustLogConfig::default());
-    let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
-    compressor.detect_format(&refs).as_str()
+fn detect_log_format(py: Python<'_>, lines: Vec<String>) -> PyResult<&'static str> {
+    // catch_unwind inside allow_threads (see `panic_to_pyerr`): COR-7
+    // containment for the format-detection helper (P0-1 audit).
+    py.allow_threads(move || {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let compressor = RustLogCompressor::new(RustLogConfig::default());
+            let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+            compressor.detect_format(&refs).as_str()
+        }))
+    })
+    .map_err(panic_to_pyerr)
 }
 
 /// Suppress unused-import warnings for the LogLevel/LogFormat imports

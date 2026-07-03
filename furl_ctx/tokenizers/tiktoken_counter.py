@@ -10,6 +10,7 @@ It supports multiple encodings:
 
 from __future__ import annotations
 
+import threading
 from functools import lru_cache
 from typing import Any
 
@@ -75,6 +76,14 @@ MODEL_TO_ENCODING = {
 # Default encoding for unknown models
 DEFAULT_ENCODING = "cl100k_base"
 
+# Hard deadline for first-time encoding acquisition (P0-6). tiktoken
+# downloads BPE vocab files over the network on the first
+# `get_encoding(...)` for an encoding not yet cached on disk; a hung
+# download would otherwise hang the caller — and therefore compress() —
+# indefinitely. Module-level (not bound as a default argument) so it is
+# read at call time and tests can patch it.
+ENCODING_LOAD_TIMEOUT_SECONDS = 10.0
+
 
 @lru_cache(maxsize=8)
 def _get_encoding(encoding_name: str):
@@ -82,6 +91,60 @@ def _get_encoding(encoding_name: str):
     import tiktoken
 
     return tiktoken.get_encoding(encoding_name)
+
+
+def _load_encoding_bounded(encoding_name: str, timeout: float | None = None):
+    """Load a tiktoken encoding with a hard deadline (thread + join).
+
+    Thread-based rather than signal-based because compress() may run off
+    the main thread (signal handlers only fire on the main thread). The
+    worker is a daemon so a stuck download never blocks interpreter
+    exit; if it eventually completes anyway, the `_get_encoding`
+    lru_cache makes the next retry instant.
+
+    Args:
+        encoding_name: tiktoken encoding name (e.g. 'o200k_base').
+        timeout: Deadline in seconds; defaults to
+            ``ENCODING_LOAD_TIMEOUT_SECONDS`` (read at call time).
+
+    Returns:
+        The loaded tiktoken encoding.
+
+    Raises:
+        TimeoutError: The load did not finish within the deadline.
+        Exception: Whatever ``tiktoken.get_encoding`` raised, re-raised
+            on the calling thread (e.g. ``ValueError: Unknown encoding``
+            from a tiktoken build older than the encoding).
+    """
+    deadline = ENCODING_LOAD_TIMEOUT_SECONDS if timeout is None else timeout
+    outcome: dict[str, Any] = {}
+
+    def _worker() -> None:
+        try:
+            outcome["encoding"] = _get_encoding(encoding_name)
+        except Exception as exc:  # re-raised on the calling thread below
+            outcome["error"] = exc
+
+    thread = threading.Thread(
+        target=_worker,
+        name=f"tiktoken-load-{encoding_name}",
+        daemon=True,
+    )
+    thread.start()
+    thread.join(deadline)
+    if thread.is_alive():
+        # Leave the worker running (daemon): if the download eventually
+        # succeeds it populates the lru_cache and the next retry is free.
+        raise TimeoutError(
+            f"tiktoken encoding {encoding_name!r} did not load within {deadline}s "
+            "(stalled BPE vocab download?)"
+        )
+    if "error" in outcome:
+        raise outcome["error"]
+    encoding = outcome.get("encoding")
+    if encoding is None:  # totality net: worker died without a result
+        raise RuntimeError(f"tiktoken encoding {encoding_name!r} load produced no result")
+    return encoding
 
 
 def get_encoding_for_model(model: str) -> str:
@@ -137,22 +200,57 @@ class TiktokenCounter(BaseTokenizer):
     def __init__(self, model: str = "gpt-4o"):
         """Initialize tiktoken counter.
 
+        The encoding is resolved EAGERLY here — with a hard deadline
+        (see `_load_encoding_bounded`) — so a load failure or a stalled
+        vocab download surfaces at construction, where
+        ``TokenizerRegistry.get()`` degrades the call to the estimation
+        fallback WITHOUT caching the failure (COR-40c: the next
+        ``get()`` retries the real tokenizer). Lazy loading deferred
+        failures to the first ``count_text`` — after the registry had
+        already cached this instance as a success — and put an
+        unbounded network wait on compress()'s hot path.
+
         Args:
             model: Model name to determine encoding.
                    Defaults to 'gpt-4o' (o200k_base encoding).
+
+        Raises:
+            TimeoutError: Encoding did not load within
+                ``ENCODING_LOAD_TIMEOUT_SECONDS``.
+            ValueError: tiktoken does not know the encoding (e.g. a
+                tiktoken build older than the model's encoding).
         """
         self.model = model
         # Lowercase once: encoding lookup is case-sensitive, and callers pass
         # names like "GPT-4o" which must not fall through to the default.
         self.encoding_name = get_encoding_for_model(model.lower())
-        self._encoding = None  # Lazy load
+        self._encoding = _load_encoding_bounded(self.encoding_name)
 
     @property
     def encoding(self):
-        """Lazy-load the encoding."""
+        """The tiktoken encoding (loaded at construction).
+
+        The bounded reload below only serves legacy paths that bypass
+        ``__init__`` or cleared the cached encoding.
+        """
         if self._encoding is None:
-            self._encoding = _get_encoding(self.encoding_name)
+            self._encoding = _load_encoding_bounded(self.encoding_name)
         return self._encoding
+
+    def _encode_tolerant(self, text: str) -> list[int]:
+        """Encode, treating literal special-token strings as ordinary text.
+
+        tiktoken's default ``encode`` raises ValueError when the text
+        contains a literal special-token string (``<|endoftext|>`` and
+        friends — common in scraped / LLM-adjacent tool output). Retry
+        with ``disallowed_special=()`` so the literal is tokenized as
+        plain text: when counting someone else's content the string is
+        data, not a control token (P0-6).
+        """
+        try:
+            return self.encoding.encode(text)
+        except ValueError:
+            return self.encoding.encode(text, disallowed_special=())
 
     def count_text(self, text: str) -> int:
         """Count tokens in text using tiktoken.
@@ -165,7 +263,7 @@ class TiktokenCounter(BaseTokenizer):
         """
         if not text:
             return 0
-        return len(self.encoding.encode(text))
+        return len(self._encode_tolerant(text))
 
     def count_messages(self, messages: list[dict[str, Any]]) -> int:
         """Count tokens in messages using OpenAI's exact formula.
@@ -242,13 +340,16 @@ class TiktokenCounter(BaseTokenizer):
     def encode(self, text: str) -> list[int]:
         """Encode text to token IDs.
 
+        Literal special-token strings in ``text`` are tokenized as
+        ordinary text rather than raising (see `_encode_tolerant`).
+
         Args:
             text: Text to encode.
 
         Returns:
             List of token IDs.
         """
-        return self.encoding.encode(text)
+        return self._encode_tolerant(text)
 
     def decode(self, tokens: list[int]) -> str:
         """Decode token IDs to text.

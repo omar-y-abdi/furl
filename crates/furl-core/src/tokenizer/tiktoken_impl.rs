@@ -201,6 +201,25 @@ mod tests {
     }
 
     #[test]
+    fn special_token_literals_are_counted_as_ordinary_text() {
+        // Lock-in (P0-6): `encode_ordinary` treats literal special-token
+        // strings as plain text — no panic, no error. This is the Rust
+        // counterpart of the Python `disallowed_special=()` retry; a
+        // future switch to `encode` (which errors on these) would fail
+        // this test.
+        let t = TiktokenCounter::for_model("gpt-4o-mini").unwrap();
+        for s in [
+            "scraped text with <|endoftext|> literal inside",
+            "<|endoftext|>",
+            "<|fim_prefix|>code<|fim_suffix|>more",
+            "<|im_start|>assistant<|im_end|>",
+        ] {
+            let n = t.count_text(s);
+            assert!(n >= 1, "count for {s:?} was {n}");
+        }
+    }
+
+    #[test]
     fn very_long_input() {
         let t = TiktokenCounter::for_model("gpt-4o-mini").unwrap();
         let s = "the quick brown fox ".repeat(50_000); // ~1MB

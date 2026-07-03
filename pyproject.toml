@@ -46,7 +46,11 @@ classifiers = [
 ]
 dependencies = [
     # Core: lightweight compression (SmartCrusher, ContentRouter, CCR)
-    "tiktoken>=0.5.0",            # Tokenizer for all compressors
+    # >=0.7.0: the default gpt-4o/o1 tokenizer needs the o200k_base
+    # encoding, which tiktoken only ships from 0.7.0 — at the 0.5 floor
+    # every count degraded to chars/4 estimation via
+    # "ValueError: Unknown encoding o200k_base" (TEST-32b).
+    "tiktoken>=0.7.0",            # Tokenizer for all compressors
     "tomli>=2.0.0; python_version < '3.11'",  # tomllib backport for helper scripts
 ]
 

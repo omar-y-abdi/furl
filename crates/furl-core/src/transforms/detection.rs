@@ -130,6 +130,19 @@ mod tests {
     }
 
     #[test]
+    fn set_x_trace_with_orphaned_plus_lines_routes_to_plain_text() {
+        // Regression (P0-1): `+++ cmd` lines from `set -x` nested
+        // expansion panic unidiff 0.4.0 (orphaned target header →
+        // unwrap on None). The contained detector must treat the trace
+        // as PlainText — not crash the detection chain.
+        let trace = "+ make build\n\
+                     ++ nproc\n\
+                     +++ getconf _NPROCESSORS_ONLN\n\
+                     + ./run_tests.sh\n";
+        assert_eq!(detect(trace), ContentType::PlainText);
+    }
+
+    #[test]
     fn plain_prose_routes_to_plain_text() {
         let prose = "The quick brown fox jumps over the lazy dog. \
                      Just regular English with no special structure.";
