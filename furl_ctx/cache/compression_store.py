@@ -282,14 +282,16 @@ class CompressionStore:
             max_entries: Maximum number of entries to store.
             default_ttl: Default TTL in seconds.
             enable_feedback: Whether to track retrieval events.
-            backend: Storage backend to use. Defaults to InMemoryBackend, the
-                     only concrete backend that ships today. A backend
-                     implementing the ``CompressionStoreBackend`` protocol could
-                     change WHERE entries live, but on its own it does NOT widen
-                     the recovery window: eviction still removes the oldest entry
-                     at capacity (durability != retention). A persistent CCR
-                     backend (e.g. Sqlite/Redis) does not currently exist and
-                     would be a net-new build.
+            backend: Storage backend to use. Defaults to InMemoryBackend. A
+                     durable ``SqliteBackend`` also ships
+                     (``cache.backends.sqlite``, Engine P1-7): it is the MCP
+                     server's default and opt-in elsewhere via
+                     ``FURL_CCR_BACKEND=sqlite``. A backend only changes WHERE
+                     entries live — it does NOT widen the recovery window:
+                     eviction still removes the oldest entry at capacity
+                     (durability != retention). The durable backend does keep
+                     un-evicted entries across restarts and makes them
+                     retrievable from other processes.
         """
         # Import here to avoid circular imports
         from .backends import InMemoryBackend
@@ -417,7 +419,13 @@ class CompressionStore:
             # in-memory, so changing the hash function on upgrade has no
             # persistence-side effect — the same content always hashes
             # deterministically under whichever function is in use.
-            hash_key = hashlib.sha256(original.encode()).hexdigest()[:24]
+            # ``surrogatepass`` keeps this path total: a lone-surrogate
+            # original (JSON delivers them via \uD800 escapes, reachable
+            # through the MCP furl_compress tool) hashes instead of raising
+            # UnicodeEncodeError. For every valid-UTF8 original the emitted
+            # bytes are identical to a strict encode, so existing keys are
+            # unchanged.
+            hash_key = hashlib.sha256(original.encode("utf-8", "surrogatepass")).hexdigest()[:24]
 
         entry = CompressionEntry(
             hash=hash_key,
@@ -594,8 +602,8 @@ class CompressionStore:
         Returns:
             List of matching items from original content.
         """
-        # Get entry without logging (we'll log the search separately)
-        entry = self._get_entry_for_search(hash_key, query)
+        # Get entry without logging or access-bumping (results aren't known yet)
+        entry = self._get_entry_for_search(hash_key)
         if entry is None:
             return []
 
@@ -617,6 +625,16 @@ class CompressionStore:
         scored_items.sort(key=lambda x: x[1], reverse=True)
 
         results = [item for item, _ in scored_items[:max_results]]
+
+        # COR-37: record the access only AFTER results are known, and only
+        # when the search actually returned items. A zero-result probe must
+        # not bump retrieval_count — the MCP retrieve path documents that
+        # retrieval metrics reflect ACTUAL retrievals (its no-match branch
+        # uses the side-effect-free exists() on the same rationale). The
+        # retrieval-EVENT log below still records zero-result probes with an
+        # honest items_retrieved=0.
+        if results:
+            self._record_search_access(hash_key, query)
 
         # Log retrieval event
         if self._enable_feedback:
@@ -872,17 +890,20 @@ class CompressionStore:
     def _get_entry_for_search(
         self,
         hash_key: str,
-        query: str | None = None,
     ) -> CompressionEntry | None:
-        """Get entry without logging retrieval (used by search to avoid double-logging).
+        """Get entry without logging retrieval or recording an access.
 
         CRITICAL FIX #4: Returns a copy of the entry to prevent race conditions.
         The caller may use the entry after we release the lock, and another thread
         could modify or evict the original entry.
 
+        COR-37: this read is side-effect-free (beyond expiry reaping) — the
+        access bump happens in ``_record_search_access`` only after search
+        knows it returned results, so zero-result probes never count as
+        retrievals.
+
         Args:
             hash_key: Hash key returned by store().
-            query: Optional query for access tracking.
 
         Returns:
             CompressionEntry copy if found and not expired, None otherwise.
@@ -899,15 +920,25 @@ class CompressionStore:
                 self._stale_heap_entries += 1
                 return None
 
-            # Track access but don't log retrieval event (search will log separately)
-            entry.record_access(query)
-            # Update the backend with the modified entry
-            self._backend.set(hash_key, entry)
-
             # CRITICAL FIX #4: Return a copy to prevent race conditions
             # The entry contains mutable fields (search_queries list) that could be
             # modified by other threads after we release the lock
             return replace(entry, search_queries=list(entry.search_queries))
+
+    def _record_search_access(self, hash_key: str, query: str | None) -> None:
+        """Record an access on an entry AFTER a search returned results.
+
+        Runs after scoring, so the entry may have expired or been evicted
+        between the search's read and this bump — in that case there is
+        nothing to record and the results (built from a pre-eviction copy)
+        still ship to the caller.
+        """
+        with self._lock:
+            entry = self._backend.get(hash_key)
+            if entry is None or entry.is_expired():
+                return
+            entry.record_access(query)
+            self._backend.set(hash_key, entry)
 
     def exists(self, hash_key: str, clean_expired: bool = False) -> bool:
         """Check if a hash key exists and is not expired.
@@ -1176,12 +1207,26 @@ def clear_request_compression_store() -> None:
 def _create_default_ccr_backend() -> CompressionStoreBackend | None:
     """Create a CCR backend from env (e.g. FURL_CCR_BACKEND=<your-plugin-name>).
 
-    Loads adapters via setuptools entry point 'furl_ctx.ccr_backend'.
+    Built-in names resolve first: ``memory`` (the default, returns None) and
+    ``sqlite`` (the durable workspace-file backend). Anything else loads via
+    the setuptools entry point 'furl_ctx.ccr_backend'.
     Returns None to use default InMemoryBackend.
     """
     backend_type = (os.environ.get("FURL_CCR_BACKEND") or "").strip().lower()
     if not backend_type or backend_type == "memory":
         return None
+    if backend_type == "sqlite":
+        # Built-in durable backend (Engine P1-7). Construction fails open
+        # internally (corruption -> in-memory fallback + one ERROR log); the
+        # guard here only covers the import/unforeseen cases so backend
+        # selection never crashes the caller.
+        try:
+            from .backends.sqlite import SqliteBackend
+
+            return SqliteBackend()
+        except Exception as e:
+            logger.warning("Failed to initialize sqlite CCR backend: %s", e)
+            return None
     try:
         from importlib.metadata import entry_points
 

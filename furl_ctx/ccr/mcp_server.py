@@ -63,6 +63,12 @@ COMPRESS_TOOL_NAME = "furl_compress"
 STATS_TOOL_NAME = "furl_stats"
 READ_TOOL_NAME = "furl_read"
 
+# Model this server compresses with — and therefore counts tokens with:
+# _handle_read's original_tokens must come from the same tokenizer
+# compress() uses (COR-36: a whitespace word count fed as a token count
+# understates content by roughly the words-per-token factor).
+_MCP_TOKEN_MODEL = "claude-sonnet-4-5-20250929"
+
 logger = logging.getLogger("furl_ctx.ccr.mcp")
 
 
@@ -164,6 +170,43 @@ _READ_ENABLED = os.environ.get("FURL_MCP_READ", "off").lower().strip() in (
 # as the coding session.
 MCP_SESSION_TTL = 3600
 
+
+def _default_store_backend_factory() -> Any:
+    """Build the durable SQLite CCR backend (separate seam so tests can
+    inject a construction failure without touching the sqlite module)."""
+    from furl_ctx.cache.backends.sqlite import SqliteBackend
+
+    return SqliteBackend()
+
+
+def _default_store_backend() -> Any:
+    """Resolve the MCP server's default store backend (Engine P1-7).
+
+    The MCP deployment defaults to the durable SQLite backend: the MCP server
+    is the process that restarts mid-session (restart used to destroy every
+    retrievable original) and that runs one instance per sub-agent (a
+    per-process in-memory store meant sub-agents could never resolve
+    main-agent hashes). The library default (plain ``compress()``) stays
+    in-memory — durability is a deployment property of THIS server.
+
+    Returns ``None`` when ``FURL_CCR_BACKEND`` is set to anything (including
+    ``memory``, the documented opt-out, or ``sqlite``/a plugin name), deferring
+    to ``get_compression_store``'s env-selected loader. Never raises: a
+    backend construction failure logs one ERROR and falls back to the
+    in-memory default rather than blocking the host.
+    """
+    if (os.environ.get("FURL_CCR_BACKEND") or "").strip():
+        return None
+    try:
+        return _default_store_backend_factory()
+    except Exception:
+        logger.error(
+            "event=mcp_ccr_backend_init_failed backend=sqlite falling_back_to=memory",
+            exc_info=True,
+        )
+        return None
+
+
 # Shared stats file: all MCP instances (main + sub-agents) append here.
 # furl_stats aggregates across all instances within the session window.
 # Respects FURL_WORKSPACE_DIR.
@@ -231,10 +274,19 @@ def _read_shared_events(window_seconds: int = SESSION_WINDOW_SECONDS) -> list[di
 
 @dataclass
 class SessionStats:
-    """Track compression statistics for the current MCP session."""
+    """Track compression statistics for the current MCP session.
+
+    ``cache_hits``/``cache_tokens_avoided`` are deliberately SEPARATE from the
+    compression totals (COR-36): a furl_read cache hit avoids re-emitting a
+    file body but compresses nothing, so booking it as a compression inflated
+    ``total_input_tokens``/``total_tokens_saved``/``savings_percent`` with
+    fictional work.
+    """
 
     compressions: int = 0
     retrievals: int = 0
+    cache_hits: int = 0
+    cache_tokens_avoided: int = 0
     total_input_tokens: int = 0
     total_output_tokens: int = 0
     total_tokens_saved: int = 0
@@ -279,6 +331,26 @@ class SessionStats:
         if len(self.events) > 50:
             self.events = self.events[-50:]
 
+    def record_cache_hit(self, tokens_avoided: int) -> None:
+        """Record a furl_read cache hit WITHOUT touching compression totals.
+
+        A hit avoids re-emitting the file body; it does not compress anything.
+        The old behavior booked it via ``record_compression`` — inflating the
+        compression totals with fictional savings (COR-36).
+        """
+        self.cache_hits += 1
+        avoided = max(0, tokens_avoided)
+        self.cache_tokens_avoided += avoided
+        event = {
+            "type": "read_cache_hit",
+            "tokens_avoided": avoided,
+            "timestamp": time.time(),
+        }
+        self.events.append(event)
+        _append_shared_event(event)
+        if len(self.events) > 50:
+            self.events = self.events[-50:]
+
     def to_dict(self) -> dict[str, Any]:
         savings_pct = (
             round((self.total_tokens_saved / self.total_input_tokens) * 100, 1)
@@ -292,6 +364,8 @@ class SessionStats:
             "session_duration_seconds": round(time.time() - self.started_at),
             "compressions": self.compressions,
             "retrievals": self.retrievals,
+            "cache_hits": self.cache_hits,
+            "cache_tokens_avoided": self.cache_tokens_avoided,
             "total_input_tokens": self.total_input_tokens,
             "total_output_tokens": self.total_output_tokens,
             "total_tokens_saved": self.total_tokens_saved,
@@ -343,11 +417,20 @@ class FurlMCPServer:
         retrieval surfaces alive for the same window — and at 3600 s the MCP
         store stays at least as durable as the library default. The compress
         path still passes its own per-entry ``ttl`` at store time.
+
+        Backend (Engine P1-7): the MCP deployment defaults to the durable
+        SQLite backend so originals survive a server restart and sub-agent
+        processes can retrieve main-agent hashes through the shared workspace
+        database file. ``FURL_CCR_BACKEND=memory`` opts back out (any other
+        explicit value defers to the library's env-selected loader).
         """
         if self._local_store is None:
             from furl_ctx.cache.compression_store import get_compression_store
 
-            self._local_store = get_compression_store(default_ttl=MCP_SESSION_TTL)
+            self._local_store = get_compression_store(
+                default_ttl=MCP_SESSION_TTL,
+                backend=_default_store_backend(),
+            )
         return self._local_store
 
     def _compress_content(self, content: str) -> dict[str, Any]:
@@ -369,7 +452,21 @@ class FurlMCPServer:
         # Wrap content as a tool message (most common compression target)
         messages = [{"role": "tool", "content": content}]
 
-        result = compress(messages, model="claude-sonnet-4-5-20250929")
+        result = compress(messages, model=_MCP_TOKEN_MODEL)
+
+        if result.error:
+            # COR-36: compress() failed open — result.messages are the
+            # ORIGINAL messages and tokens_after is 0. Storing that would
+            # persist the original as "compressed" under a marker, and
+            # recording it would book a fictional savings_percent=100 into
+            # the session totals. Skip both and return an error-shaped
+            # payload so the host sees the failure loudly (compress()
+            # already logged the full traceback at ERROR).
+            logger.error("event=mcp_compress_failed error=%s", result.error)
+            return {
+                "error": f"compression failed: {result.error}",
+                "original_tokens": result.tokens_before,
+            }
 
         compressed_content = result.messages[0].get("content", content)
         input_tokens = result.tokens_before
@@ -963,8 +1060,10 @@ class FurlMCPServer:
                 # File unchanged — but is the CCR entry still alive?
                 store = self._get_local_store()
                 if store.exists(ccr_hash):
-                    # CCR alive — return cache marker
-                    self._stats.record_compression(cached_tokens, 5, "read_cache_hit")
+                    # CCR alive — return cache marker. A hit AVOIDS tokens,
+                    # it does not compress: record it under the dedicated
+                    # cache counters (COR-36), never the compression totals.
+                    self._stats.record_cache_hit(cached_tokens - 5)
                     return [
                         TextContent(
                             type="text",
@@ -990,18 +1089,23 @@ class FurlMCPServer:
                 del self._file_cache[str_path]
             # File changed — fall through to fresh read
 
-        # Fresh read: store in CCR and cache the hash
+        # Fresh read: store in CCR and cache the hash. Count tokens with the
+        # same tokenizer the compress path uses (COR-36: a whitespace word
+        # count is not a token count and understated every furl_read entry).
+        from furl_ctx.tokenizers import get_tokenizer
+
+        token_estimate = get_tokenizer(_MCP_TOKEN_MODEL).count_text(content)
+
         store = self._get_local_store()
         ccr_hash = store.store(
             original=content,
             compressed=f"[File: {path.name}, {line_count} lines]",
-            original_tokens=len(content.split()),
+            original_tokens=token_estimate,
             compressed_tokens=5,
             tool_name="furl_read",
             ttl=MCP_SESSION_TTL,
         )
 
-        token_estimate = len(content.split())
         self._file_cache[str_path] = (content_hash, ccr_hash, line_count, token_estimate)
 
         # Return full content with line numbers (like Claude Code's Read tool)

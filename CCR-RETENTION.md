@@ -8,11 +8,20 @@
 > retrieve returns a **loud, cause-honest miss** (never a silent `None`). So the
 > invariant — **no silent loss** — holds, but it was never "never evict."
 >
-> **Open epic (un-built, owner-deferred):** true cross-call retention so evicted
-> data is actually still *there*, not merely missed loudly. There is no durable
-> CCR backend today — adding one is a net-new feature build, not a wiring task.
-> This file exists so we can return to that — the free lunch has always been the
-> goal.
+> **Update (Engine P1-7, 2026-07-03):** a durable CCR backend now EXISTS —
+> `SqliteBackend` (`furl_ctx/cache/backends/sqlite.py`), the MCP server's
+> default store backend (`FURL_CCR_BACKEND=memory` opts out; the library
+> default stays in-memory). It closes the restart-loss and cross-process
+> retrieval gaps: un-evicted entries survive an MCP restart and sub-agent
+> processes resolve main-agent hashes through the shared workspace file.
+> It does NOT widen the eviction window — see option 1 below.
+>
+> **Open epic (owner-deferred): the retention half.** True cross-call retention
+> so *evicted* data is actually still there, not merely missed loudly. The
+> store is still single-tier: capacity/TTL eviction deletes the row from
+> whichever backend holds it (no spill tier, no session-scoped lifetime yet).
+> This file exists so we can return to that — the free lunch has always been
+> the goal.
 
 ## What Cluster G actually is
 
@@ -112,18 +121,21 @@ goal is **retention**: keep the data actually retrievable for as long as the
 sentinel can plausibly be referenced, ideally at ~zero added cost. Options, with
 trade-offs, ranked by how close they are to a free lunch:
 
-1. **Durable backend (net-new build — does NOT exist yet).** Today the only
-   concrete backend is `InMemoryBackend`; `CompressionStoreBackend` is a Protocol
-   with no shipped persistent implementation (no Sqlite/Redis CCR backend, and
-   the `furl_ctx.ccr_backend` entry point is registered nowhere). Building one
-   and spilling evicted entries to it would convert "evicted → gone" into
-   "evicted from RAM → still on disk." Closest to free in principle: bounded RAM,
-   near-unbounded retention, data actually present. But note the store is
-   currently single-tier — a durable backend alone changes WHERE entries live,
-   not the eviction window, so it would still be evicted-from unless paired with
-   a spill tier (durability != retention). Cost: the implementation itself, I/O
-   on the cold path, + a config/lifecycle story (when is the durable store
-   cleared?). **Most promising direction, but a feature build, not a wiring task.**
+1. **Durable backend (BUILT — Engine P1-7; the spill half remains open).**
+   `SqliteBackend` (`furl_ctx/cache/backends/sqlite.py`) now ships alongside
+   `InMemoryBackend`: WAL journal mode, 0600 file under the workspace dir
+   (`FURL_CCR_SQLITE_PATH` override), startup + opportunistic expired-row
+   purge, 10 000-row oldest-first cap (`FURL_CCR_SQLITE_MAX_ROWS`),
+   corruption→fail-open-to-memory with one loud ERROR, lock-contention→bounded
+   retry then per-op fail-open. It is the MCP server's DEFAULT backend and
+   selectable anywhere via `FURL_CCR_BACKEND=sqlite`. What it delivers today:
+   restart survival and cross-process retrieval for entries still inside the
+   window. What it does NOT deliver: the store is still single-tier — a durable
+   backend alone changes WHERE entries live, not the eviction window, so
+   capacity/TTL eviction still deletes the row outright (durability !=
+   retention). The remaining build is the SPILL TIER: divert evicted entries
+   to the durable store instead of deleting them, + a lifecycle story (when is
+   the durable store cleared?).
 
 2. **Session-scoped / conversation-lifetime retention.** Tie entry lifetime to
    the conversation that emitted the sentinel rather than a global FIFO+TTL. A
@@ -145,13 +157,14 @@ trade-offs, ranked by how close they are to a free lunch:
 5. **Raise the cap.** Trivial, buys headroom, but only *delays* eviction and
    grows RAM linearly — not a real solution, only a knob.
 
-**Recommended next step when we return:** build a durable backend (#1) and use
-it as the eviction spill target, keyed by session (#2) for cleanup — that
-combination gives bounded RAM *and* genuinely-retained data (the free lunch).
-This is net-new retention machinery, not a wiring task: no persistent CCR
-backend exists today, and the store is single-tier, so the spill path itself
-has to be built. The owner has **deliberately deferred** this epic; the current
-delivered behavior is the window + loud-miss guarantee documented at the top.
+**Recommended next step when we return:** the durable backend (#1) is now
+built (Engine P1-7); use it as the eviction spill target, keyed by session
+(#2) for cleanup — that combination gives bounded RAM *and* genuinely-retained
+data (the free lunch). The remaining machinery is the spill path itself: the
+store is still single-tier, so eviction deletes rather than demotes. The owner
+has **deliberately deferred** the retention epic; the delivered behavior is
+the window + loud-miss guarantee documented at the top, now durable within the
+window for the MCP deployment.
 
 ## Cross-references
 - `docs/audits/EVAL-break.md` — Cluster G original finding (row 6) + this reframe.
@@ -159,7 +172,9 @@ delivered behavior is the window + loud-miss guarantee documented at the top.
 - `archive/furl_ctx/ccr/response_handler.py` — `_execute_retrieval`; archived,
   no longer a live retrieval surface (kept for the historical loud-miss probe).
 - `furl_ctx/cache/compression_store.py` — `format_retrieval_miss_detail`,
-  `get_entry_status`, and the `CompressionStoreBackend` protocol. Only
-  `InMemoryBackend` (`furl_ctx/cache/backends/memory.py`) is implemented today;
-  there is no Sqlite/Redis CCR backend.
+  `get_entry_status`, and the `CompressionStoreBackend` protocol. Two concrete
+  backends ship: `InMemoryBackend` (`furl_ctx/cache/backends/memory.py`, the
+  library default) and the durable `SqliteBackend`
+  (`furl_ctx/cache/backends/sqlite.py`, the MCP server default — Engine P1-7;
+  locked by `tests/test_sqlite_backend.py` + `tests/test_mcp_sqlite_default.py`).
 - `tests/test_ccr_eviction_loud_miss.py` — the locking regression tests.

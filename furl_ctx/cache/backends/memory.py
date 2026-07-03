@@ -130,8 +130,13 @@ class InMemoryBackend:
             bytes_used = sys.getsizeof(self._store)
             for entry in self._store.values():
                 bytes_used += sys.getsizeof(entry)
-                bytes_used += len(entry.original_content.encode("utf-8"))
-                bytes_used += len(entry.compressed_content.encode("utf-8"))
+                # ``surrogatepass``: stored content may carry lone surrogates
+                # (the store accepts them — JSON delivers them via \uD800
+                # escapes), and a strict encode would make this stats read
+                # raise UnicodeEncodeError. Identical byte counts for all
+                # valid-UTF8 content.
+                bytes_used += len(entry.original_content.encode("utf-8", "surrogatepass"))
+                bytes_used += len(entry.compressed_content.encode("utf-8", "surrogatepass"))
 
             return {
                 "backend_type": "memory",

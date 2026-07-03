@@ -24,6 +24,7 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 
 FURL_WORKSPACE_DIR_ENV = "FURL_WORKSPACE_DIR"
+FURL_CCR_SQLITE_PATH_ENV = "FURL_CCR_SQLITE_PATH"
 
 # ---------------------------------------------------------------------------
 # Default sub-path fragments
@@ -33,6 +34,7 @@ _WORKSPACE_DIR_DEFAULT = ".furl"
 
 # Resource file/sub-dir names (kept here so nothing else has to hardcode them)
 _SESSION_STATS_FILE = "session_stats.jsonl"
+_CCR_SQLITE_FILE = "ccr.sqlite3"
 
 
 # ---------------------------------------------------------------------------
@@ -77,8 +79,29 @@ def session_stats_path() -> Path:
     return workspace_dir() / _SESSION_STATS_FILE
 
 
+def ccr_sqlite_path() -> Path:
+    """Return the path for the durable SQLite CCR store.
+
+    Resolution order:
+
+    1. ``$FURL_CCR_SQLITE_PATH`` (trimmed, tilde-expanded) if set.
+    2. ``<workspace>/ccr.sqlite3`` otherwise.
+
+    Never falls back to the current working directory: the workspace root
+    itself defaults to ``~/.furl``, so every process in a session (main agent
+    + sub-agents) converges on the same database file.
+    """
+
+    env_value = _env(FURL_CCR_SQLITE_PATH_ENV)
+    if env_value:
+        return Path(env_value).expanduser()
+    return workspace_dir() / _CCR_SQLITE_FILE
+
+
 __all__ = [
     "FURL_WORKSPACE_DIR_ENV",
+    "FURL_CCR_SQLITE_PATH_ENV",
     "workspace_dir",
     "session_stats_path",
+    "ccr_sqlite_path",
 ]

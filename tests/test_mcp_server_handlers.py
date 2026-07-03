@@ -368,6 +368,7 @@ def test_pipeline_marker_rows_carry_session_ttl(server, monkeypatch) -> None:
             tokens_before=100,
             tokens_after=10,
             transforms_applied=["smart_crusher"],
+            error=None,  # part of the CompressResult interface the stub mimics
         )
 
     monkeypatch.setattr(compress_mod, "compress", fake_compress)
