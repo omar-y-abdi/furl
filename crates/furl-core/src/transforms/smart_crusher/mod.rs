@@ -47,11 +47,14 @@ mod hashing;
 mod observer;
 mod orchestration;
 mod outliers;
+mod persist;
 mod planning;
+mod route;
 mod statistics;
 mod stats_math;
 mod traits;
 mod types;
+mod walk;
 
 pub use analyzer::SmartAnalyzer;
 pub use anchors::{extract_query_anchors, item_matches_anchors};
