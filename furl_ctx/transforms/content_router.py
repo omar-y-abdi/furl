@@ -283,6 +283,9 @@ class ContentRouterConfig:
     Attributes:
         enable_smart_crusher: Enable JSON array compression.
         enable_search_compressor: Enable search result compression.
+        enable_log_template: Enable lossless LogTemplate recode on the LOG
+            arm (tried before the lossy log compressor; stays live under
+            ``lossless_only``).
         enable_log_compressor: Enable build/test log compression.
         enable_text_crusher: Enable deterministic prose compression.
         mixed_content_threshold: Min distinct types to consider "mixed".
@@ -298,6 +301,16 @@ class ContentRouterConfig:
     # Enable/disable specific compressors
     enable_smart_crusher: bool = True
     enable_search_compressor: bool = True
+    # LogTemplate (NR2-3b): lossless template-mining recode of log-shaped
+    # BUILD_OUTPUT, tried on the LOG arm BEFORE the lossy LogCompressor.
+    # `encode_verified` self-checks its round-trip and yields None on no
+    # structure / no token win / verify failure, so it is lossless-or-None —
+    # the same guarantee as SmartCrusher, not the lossy log/search/diff
+    # compressors. It therefore stays LIVE under `lossless_only` (strict mode
+    # is lossless-OR-passthrough, not passthrough-only) and writes no CCR
+    # store (the wire is self-describing). When it declines, the LOG arm falls
+    # through byte-identically to the historical lossy path.
+    enable_log_template: bool = True
     enable_log_compressor: bool = True
     # TextCrusher (Engine P2-11): deterministic extractive prose
     # compression for PLAIN_TEXT. Size floors live in the crusher
