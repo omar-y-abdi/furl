@@ -140,7 +140,12 @@ pub struct SmartCrusherConfig {
     ///
     /// Default `true`. Opaque-string CCR substitutions (in
     /// `walker::process_value`) likewise always emit their pointer.
-    pub enable_ccr_marker: bool,
+    ///
+    /// Renamed from `enable_ccr_marker` (which invited reading it as a
+    /// marker/persist gate — it never was). The Python FFI kwarg
+    /// `enable_ccr_marker` is accepted as a deprecation alias for one
+    /// release (see `crates/furl-py/src/lib.rs`).
+    pub advertise_retrieval_tool: bool,
     /// How `crush_array` chooses between a lossless render and a
     /// lossy-recoverable render when BOTH are available (see
     /// [`RoutingPolicy`]). Default [`RoutingPolicy::MinTokens`] — the
@@ -209,7 +214,7 @@ impl Default for SmartCrusherConfig {
             last_fraction: 0.15,
             relevance_threshold: 0.3,
             lossless_min_savings_ratio: 0.30,
-            enable_ccr_marker: true,
+            advertise_retrieval_tool: true,
             routing_policy: RoutingPolicy::MinTokens,
             lossless_only: false,
             crush_unique_entities_when_recoverable: true,
@@ -237,7 +242,7 @@ mod tests {
         assert_eq!(c.last_fraction, 0.15);
         assert_eq!(c.relevance_threshold, 0.3);
         assert_eq!(c.lossless_min_savings_ratio, 0.30);
-        assert!(c.enable_ccr_marker);
+        assert!(c.advertise_retrieval_tool);
         // Route-by-min-tokens is the default max-compression policy.
         assert_eq!(c.routing_policy, RoutingPolicy::MinTokens);
         // Strict lossless-or-passthrough mode is OFF by default —

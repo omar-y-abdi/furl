@@ -41,6 +41,7 @@ use furl_core::transforms::{
     TextCrushResult as RustTextCrushResult, TextCrusher as RustTextCrusher,
     TextCrusherConfig as RustTextCrusherConfig, TextCrusherStats as RustTextCrusherStats,
 };
+use pyo3::exceptions::PyDeprecationWarning;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
@@ -529,7 +530,10 @@ impl PyDiffCompressor {
 /// plus two non-dataclass kwargs it injects explicitly:
 /// `relevance_threshold` (the reconciled 0.3 scoring threshold — the
 /// retired `RelevanceScorerConfig`'s 0.25 was never forwarded) and
-/// `enable_ccr_marker` (derived from the CCR config).
+/// `advertise_retrieval_tool` (derived from the CCR config). The old
+/// name `enable_ccr_marker` is accepted as a deprecation alias for one
+/// release: passing it emits `DeprecationWarning` and maps to the new
+/// kwarg; passing both raises `ValueError`.
 ///
 /// An unknown kwarg (including the four knobs deleted by SIMP-7:
 /// `enabled`, `uniqueness_threshold`, `similarity_threshold`,
@@ -554,12 +558,14 @@ impl PySmartCrusherConfig {
         last_fraction = 0.15,
         relevance_threshold = 0.3,
         lossless_min_savings_ratio = 0.30,
-        enable_ccr_marker = true,
+        advertise_retrieval_tool = None,
         routing_policy = "min-tokens",
         lossless_only = false,
+        enable_ccr_marker = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
+        py: Python<'_>,
         min_items_to_analyze: usize,
         min_tokens_to_crush: usize,
         variance_threshold: f64,
@@ -570,10 +576,37 @@ impl PySmartCrusherConfig {
         last_fraction: f64,
         relevance_threshold: f64,
         lossless_min_savings_ratio: f64,
-        enable_ccr_marker: bool,
+        advertise_retrieval_tool: Option<bool>,
         routing_policy: &str,
         lossless_only: bool,
+        enable_ccr_marker: Option<bool>,
     ) -> PyResult<Self> {
+        // `advertise_retrieval_tool` (renamed from `enable_ccr_marker`)
+        // gates ONLY the retrieval-tool advertisement — never the
+        // recovery pointer or store write. The old kwarg is a deprecation
+        // alias for one release: warn on use, ValueError if both are set,
+        // default `true` when neither is passed.
+        let advertise_retrieval_tool = match (advertise_retrieval_tool, enable_ccr_marker) {
+            (Some(_), Some(_)) => {
+                return Err(invalid_input(
+                    "pass only one of advertise_retrieval_tool or its deprecated \
+                     alias enable_ccr_marker, not both"
+                        .to_string(),
+                ));
+            }
+            (Some(value), None) => value,
+            (None, Some(value)) => {
+                PyErr::warn(
+                    py,
+                    py.get_type::<PyDeprecationWarning>().as_any(),
+                    c"enable_ccr_marker is deprecated, use advertise_retrieval_tool; \
+                      removed in the next minor release",
+                    1,
+                )?;
+                value
+            }
+            (None, None) => true,
+        };
         // Parse the kebab-case routing policy at the boundary so a typo
         // is a clear ValueError, not a silent default.
         let routing_policy = RustRoutingPolicy::from_str(routing_policy).ok_or_else(|| {
@@ -594,7 +627,7 @@ impl PySmartCrusherConfig {
                 last_fraction,
                 relevance_threshold,
                 lossless_min_savings_ratio,
-                enable_ccr_marker,
+                advertise_retrieval_tool,
                 routing_policy,
                 lossless_only,
                 // Entropy-floor crushability override: FORCED true here
@@ -654,8 +687,8 @@ impl PySmartCrusherConfig {
         self.inner.lossless_min_savings_ratio
     }
     #[getter]
-    fn enable_ccr_marker(&self) -> bool {
-        self.inner.enable_ccr_marker
+    fn advertise_retrieval_tool(&self) -> bool {
+        self.inner.advertise_retrieval_tool
     }
     #[getter]
     fn routing_policy(&self) -> &'static str {

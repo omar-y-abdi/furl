@@ -436,7 +436,7 @@ class ContentRouterConfig:
     # tests/test_ccr_recovery_invariant.py). What the flags actually do:
     #   * gate the reversible CCR-offload fallback (`_should_ccr_offload`
     #     — offload is optional, so "CCR off" honestly disables it);
-    #   * flow to `CCRConfig` / the Rust `enable_ccr_marker` field as the
+    #   * flow to `CCRConfig` / the Rust `advertise_retrieval_tool` field as the
     #     retrieval-tool advertisement preference, preserved for external
     #     embedders that read it back when deciding whether to inject the
     #     `furl_retrieve` tool.

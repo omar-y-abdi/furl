@@ -26,7 +26,7 @@ fallback. Build it locally with `scripts/build_rust_extension.sh`
   regardless of `ccr_config.enabled` / `inject_retrieval_marker`. The
   pointer is the retrieval key — a drop without it is silent loss, which
   the recovery invariant forbids (Defect 1). `enabled` /
-  `inject_retrieval_marker` flip the Rust `enable_ccr_marker` field,
+  `inject_retrieval_marker` flip the Rust `advertise_retrieval_tool` field,
   which the router reads back to decide whether to inject the
   heavier `furl_retrieve` TOOL into the request; they no longer gate
   the pointer or the store write. The Python store mirror consumes the
@@ -339,7 +339,7 @@ class SmartCrusher(Transform):
         # CCR config is preserved on `self` for callers that read it
         # back (external embedders rely on this). Both `enabled=False`
         # and `inject_retrieval_marker=False` collapse to the Rust
-        # crusher's `enable_ccr_marker=False` field.
+        # crusher's `advertise_retrieval_tool=False` field.
         #
         # That field does NOT skip the marker or the CCR store write
         # (Defect 1 corrected the prior comment, which claimed it did).
@@ -399,16 +399,18 @@ class SmartCrusher(Transform):
         #     `RelevanceScorerConfig` documented 0.25 but was never
         #     forwarded; 0.3 here is — and always was — the value the
         #     engine actually runs with (it matches the Rust default).
-        #   * `enable_ccr_marker` — derived from the CCR config, not a
-        #     crusher-config field. Falling through to the pyo3 default
+        #   * `advertise_retrieval_tool` — derived from the CCR config, not
+        #     a crusher-config field. Falling through to the pyo3 default
         #     (`true`) would ignore a caller's `CCRConfig(enabled=False)` /
         #     `inject_retrieval_marker=False`, so it MUST be passed here.
+        #     (Renamed from `enable_ccr_marker`, still accepted as a
+        #     deprecation alias for one release.)
         # Neither name collides with a dataclass field, so there is no
         # duplicate-kwarg conflict with `**asdict(cfg)`.
         rust_cfg = _RustSmartCrusherConfig(
             **asdict(cfg),
             relevance_threshold=0.3,
-            enable_ccr_marker=(
+            advertise_retrieval_tool=(
                 self._ccr_config.enabled and self._ccr_config.inject_retrieval_marker
             ),
         )
