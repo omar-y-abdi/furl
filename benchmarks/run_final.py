@@ -26,15 +26,24 @@ from pathlib import Path
 from benchmarks import datasets as ds_mod
 from benchmarks.imp2_ab import Imp2AB, measure_imp2_ab
 from benchmarks.metrics import BENCH_MODEL, CaseMetrics, measure_case, measure_conversation_case
-from benchmarks.needle_recall import NeedleResult, recall_rate, run_needle_recall
-from benchmarks.run_bench import git_commit, print_table, snapshot_provenance
+from benchmarks.needle_recall import NeedleResult, run_needle_recall
+from benchmarks.run_bench import _arm_summary, git_commit, print_table, snapshot_provenance
 
 HERE = Path(__file__).resolve().parent
 FINAL_JSON = HERE / "final_results.json"
 DATA_DIR = HERE / "data"
 
 # Datasets that must already have a committed snapshot for a deterministic run.
-_REQUIRED_SNAPSHOTS = ("code", "logs", "search", "repeated_logs")
+_REQUIRED_SNAPSHOTS = (
+    "code",
+    "logs",
+    "search",
+    "repeated_logs",
+    "ci_log",
+    "grep_raw",
+    "diff_raw",
+    "markdown_doc",
+)
 
 
 def run_datasets() -> list[CaseMetrics]:
@@ -72,18 +81,11 @@ def _print_ab(ab: Imp2AB) -> None:
 def build_payload(
     cases: list[CaseMetrics], needles: list[NeedleResult], ab: Imp2AB
 ) -> dict[str, object]:
-    overall = recall_rate(needles)
-    visible = sum(1 for r in needles if r.in_output) / len(needles) if needles else 1.0
-    needle_by_family: dict[str, dict[str, float]] = {}
-    for fam in ("search", "logs"):
-        sub = [r for r in needles if r.family == fam]
-        if not sub:
-            continue
-        needle_by_family[fam] = {
-            "recall_output_or_ccr": recall_rate(sub),
-            "recall_visible_only": sum(1 for r in sub if r.in_output) / len(sub),
-            "trials": len(sub),
-        }
+    """Top-level needle numbers are the NAMING arm (mirrors run_bench's
+    payload contract); the control arm is reported separately, never
+    blended."""
+    naming = [r for r in needles if r.arm == "naming"]
+    control = [r for r in needles if r.arm == "control"]
     return {
         "schema": "headroom.imp3.final.v1",
         "captured_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -95,9 +97,8 @@ def build_payload(
         "datasets": [asdict(c) for c in cases],
         "imp2_ab": asdict(ab),
         "needle_recall": {
-            "overall_output_or_ccr": overall,
-            "overall_visible_only": visible,
-            "by_family": needle_by_family,
+            **_arm_summary(naming),
+            "control": _arm_summary(control),
             "trials": [asdict(r) for r in needles],
         },
     }

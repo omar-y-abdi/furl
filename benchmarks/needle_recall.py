@@ -13,7 +13,22 @@ only the needle is constructed — and it is a realistic, distinct match row,
 NOT a synthetic low-entropy filler. The needle's purpose is to be a *known,
 locatable* item so recall is measurable; the surrounding array is 100% real.
 
-Reports needle-recall % overall and broken down by position and cardinality.
+Every trial runs in TWO query arms (EFF-7 / TEST-16a), reported separately
+and never blended:
+
+* ``naming``  — the query NAMES the needle's sentinel token. Query-aware
+  keep pins matching rows, so this arm is best-case recall BY CONSTRUCTION.
+* ``control`` — the query describes the information need WITHOUT any of the
+  needle's distinguishing literal tokens (no sentinel name, no marker path,
+  no sentinel field values). This is the honest number for a user who needs
+  the row but cannot quote it; it is EXPECTED to be lower on the lossy path.
+
+Each trial starts from cold engine state (store + pipeline reset): the
+router's result cache is keyed by content, NOT by query, so without the
+reset the second arm would be served the FIRST arm's compression — computed
+under the other arm's query context — and the A/B would be meaningless.
+
+Reports needle-recall % per arm, broken down by family/position/cardinality.
 """
 
 from __future__ import annotations
@@ -26,12 +41,13 @@ from benchmarks.datasets import build_logs_dataset, search_rows
 from benchmarks.metrics import (
     BENCH_MODEL,
     _decoded_row_signatures,
-    _emitted_ccr_hashes,
+    _emitted_recovery_hashes,
     _item_in_recovered,
     _item_present,
     _item_signature,
     _output_row_signatures,
     _recovered_originals,
+    _reset_engine_state,
     _stringify,
 )
 from furl_ctx import compress
@@ -67,14 +83,21 @@ NEEDLE = SEARCH_NEEDLE
 POSITIONS = ("start", "middle", "end")
 CARDINALITIES = (30, 90, 300)
 
+# Query arms (EFF-7): "naming" quotes the needle's sentinel token in the
+# query; "control" describes the need without ANY of the needle's literal
+# tokens. Reported separately — the committed floor gate reads the naming
+# number, the control number is the honest non-quoting-user figure.
+ARMS = ("naming", "control")
+
 
 @dataclass(frozen=True)
 class NeedleFamily:
-    """A base-row source + its matching needle + the query to use."""
+    """A base-row source + its matching needle + the two query arms."""
 
     name: str  # "search" or "logs"
     needle: dict[str, Any]
-    query: str
+    query: str  # naming arm: quotes the needle's sentinel token
+    control_query: str  # control arm: describes the need, no needle literals
 
     def base_rows(self, cardinality: int) -> list[dict[str, Any]]:
         if self.name == "search":
@@ -83,23 +106,42 @@ class NeedleFamily:
             return build_logs_dataset(limit=cardinality).items[:cardinality]
         raise ValueError(f"unknown needle family: {self.name}")
 
+    def query_for(self, arm: str) -> str:
+        if arm == "naming":
+            return self.query
+        if arm == "control":
+            return self.control_query
+        raise ValueError(f"unknown needle query arm: {arm!r}")
+
 
 SEARCH_FAMILY = NeedleFamily(
     name="search",
     needle=SEARCH_NEEDLE,
     query="Find the function named __FURL_NEEDLE_DO_NOT_DROP__.",
+    # Describes the need without ANY needle literal (not even sub-tokens of
+    # its code line, e.g. "return" — pinned by the routing tests).
+    control_query=(
+        "One of these search results is a planted probe that does nothing "
+        "but yield a fixed constant. Which result is it?"
+    ),
 )
 LOGS_FAMILY = NeedleFamily(
     name="logs",
     needle=LOGS_NEEDLE,
     query="Find the commit with subject __FURL_NEEDLE_DO_NOT_DROP__.",
+    # Avoids "commit"/"author"/"needle" — all literal tokens of the needle
+    # row's field values.
+    control_query=(
+        "One of these history entries is dated far in the future. Which "
+        "entry is it and what is its subject line?"
+    ),
 )
 FAMILIES = (SEARCH_FAMILY, LOGS_FAMILY)
 
 
 @dataclass(frozen=True)
 class NeedleResult:
-    """One needle trial: family, array size, position, recall outcome."""
+    """One needle trial: family, arm, array size, position, recall outcome."""
 
     family: str
     cardinality: int
@@ -108,6 +150,7 @@ class NeedleResult:
     in_output: bool
     ccr_recoverable: bool
     n_visible_rows: int  # how many distinct rows survived visibly
+    arm: str = "naming"  # query arm: "naming" | "control"
 
 
 def _inject(
@@ -130,15 +173,23 @@ def _trial(
     cardinality: int,
     position: str,
     *,
+    arm: str = "naming",
     model: str = BENCH_MODEL,
 ) -> NeedleResult:
-    """Run one needle-injection trial through the real ``compress()``."""
+    """Run one needle-injection trial through the real ``compress()``.
+
+    Cold engine state per trial: the router result cache is keyed by
+    content, not query, so without the reset the two arms of the same
+    (family, cardinality, position) cell would share one compression.
+    """
+    _reset_engine_state()
+    query = family.query_for(arm)
     base = family.base_rows(cardinality)
     # Use exactly ``cardinality`` real base rows; the needle makes it +1.
     array = _inject(base, family.needle, position)
     content = json.dumps(array, ensure_ascii=False)
     messages = [
-        {"role": "user", "content": family.query},
+        {"role": "user", "content": query},
         {"role": "tool", "content": content, "tool_call_id": "needle_call"},
     ]
     result = compress(messages, model=model)
@@ -148,8 +199,8 @@ def _trial(
     decoded_sigs = _decoded_row_signatures(output_text)
     in_output = _item_present(family.needle, output_text, row_sigs, decoded_sigs)
 
-    emitted = _emitted_ccr_hashes(output_text)
-    recovered = _recovered_originals(emitted, family.query)
+    emitted = _emitted_recovery_hashes(output_text)
+    recovered = _recovered_originals(emitted, query)
     ccr_recoverable = (not in_output) and _item_in_recovered(family.needle, recovered)
 
     n_visible = (
@@ -166,6 +217,7 @@ def _trial(
         in_output=in_output,
         ccr_recoverable=ccr_recoverable,
         n_visible_rows=n_visible,
+        arm=arm,
     )
 
 
@@ -196,24 +248,30 @@ def run_needle_recall(
     families: tuple[NeedleFamily, ...] = FAMILIES,
     cardinalities: tuple[int, ...] = CARDINALITIES,
     positions: tuple[str, ...] = POSITIONS,
+    arms: tuple[str, ...] = ARMS,
     model: str = BENCH_MODEL,
 ) -> list[NeedleResult]:
-    """Run the full needle grid (family x cardinality x position).
+    """Run the full needle grid (arm x family x cardinality x position).
 
     Deterministic. Covers both regimes: ``search`` (lossless columnar — keeps
     all rows) and ``logs`` (varying-field — lossy drop path), so recall is
     measured where the audited needle-loss is actually expected to surface.
+    Both query arms run over the identical injected arrays; only the user
+    query differs. Consumers MUST aggregate per arm (``r.arm``) — blending
+    naming and control trials into one rate would hide exactly the gap the
+    control arm exists to expose.
     """
     results: list[NeedleResult] = []
-    for fam in families:
-        for n in cardinalities:
-            for pos in positions:
-                results.append(_trial(fam, n, pos, model=model))
+    for arm in arms:
+        for fam in families:
+            for n in cardinalities:
+                for pos in positions:
+                    results.append(_trial(fam, n, pos, arm=arm, model=model))
     return results
 
 
 def recall_rate(results: list[NeedleResult]) -> float:
-    """Overall needle-recall fraction across all trials."""
+    """Needle-recall fraction across the given trials (filter by arm first)."""
     if not results:
         return 1.0
     return sum(1 for r in results if r.recalled) / len(results)

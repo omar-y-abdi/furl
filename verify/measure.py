@@ -26,6 +26,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -259,7 +260,17 @@ def _recovered_row_sigs(recovered: dict[str, str]) -> set[str]:
 
 @dataclass(frozen=True)
 class HashCompare:
-    """Per-case byte-exactness proof for the reconstruction."""
+    """Per-case exactness proof for the reconstruction.
+
+    ``byte_exact`` is a CANONICAL-MULTISET equality (order-independent
+    sha256 over sorted canonical row signatures) — CCR-retrieved rows carry
+    no position, so a sequence claim is impossible in general. Label-honesty
+    (TEST-16d): whenever the output alone yields a FULL ORDERED
+    reconstruction (a visible JSON array or a decoded CSV-schema table
+    covering the entire multiset with no CCR fill), the original row ORDER
+    is additionally checked (``order_checked``/``order_exact``) and a
+    reordered reconstruction flips ``byte_exact`` to False.
+    """
 
     original_sha: str
     reconstructed_sha: str
@@ -268,12 +279,35 @@ class HashCompare:
     n_reconstructed: int  # rows the output alone reproduces (visible+decoded+CCR)
     n_missing: int  # items neither visible/decoded nor CCR-recoverable
     missing_examples: tuple[str, ...]
+    order_checked: bool = False  # an ordered full-surface reconstruction existed
+    order_exact: bool = False  # ...and it reproduced the original sequence
 
 
 def _multiset_sha(sigs: list[str]) -> str:
     """Order-independent multiset hash: sha256 over sorted canonical sigs."""
     joined = "\n".join(sorted(sigs))
     return _sha(joined)
+
+
+def _ordered_surface_sigs(output_text: str) -> list[str] | None:
+    """Canonical sigs of the output's rows IN OUTPUT ORDER, when the output
+    has an ordered row surface: a visible JSON array (sentinel row excluded)
+    or a decodable CSV-schema table. ``None`` for any other rendering."""
+    try:
+        parsed = json.loads(output_text)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if isinstance(parsed, list):
+        return [
+            _canonical(row)
+            for row in parsed
+            if not (isinstance(row, dict) and CCR_SENTINEL_KEY in row and len(row) == 1)
+        ]
+    if isinstance(parsed, str):
+        rows = decode_csv_schema_rows(parsed)
+        if rows is not None:
+            return [_canonical(r) for r in rows]
+    return None
 
 
 def hash_compare_structured(
@@ -293,7 +327,10 @@ def hash_compare_structured(
     measurement the same strict round-trip ``strict_recheck.py`` performs.
 
     byte_exact is True ONLY when the reconstructed multiset hashes identically
-    to the original — the strict "recoverable=100%" proof.
+    to the original — AND, when the output alone provides a full ORDERED
+    reconstruction (no CCR fill needed), the row sequence matches the original
+    too (TEST-16d): a multiset-identical but REORDERED visible/decoded output
+    is not byte-exact and fails here.
     """
     original_sigs = [_canonical(it) for it in items]
     original_sha = _multiset_sha(original_sigs)
@@ -319,8 +356,16 @@ def hash_compare_structured(
         else:
             missing.append(sig)
 
+    # Ordering check (TEST-16d): only claimable when the ordered surface
+    # alone reproduces the ENTIRE multiset (CCR-retrieved rows carry no
+    # position, so partial surfaces stay multiset-only).
+    ordered = _ordered_surface_sigs(output_text)
+    order_checked = ordered is not None and Counter(ordered) == Counter(original_sigs)
+    order_exact = order_checked and ordered == original_sigs
+
     reconstructed_sha = _multiset_sha(recon_sigs)
-    byte_exact = reconstructed_sha == original_sha and not missing
+    multiset_exact = reconstructed_sha == original_sha and not missing
+    byte_exact = multiset_exact and (order_exact if order_checked else True)
     return HashCompare(
         original_sha=original_sha,
         reconstructed_sha=reconstructed_sha,
@@ -329,6 +374,8 @@ def hash_compare_structured(
         n_reconstructed=len(recon_sigs),
         n_missing=len(missing),
         missing_examples=tuple(missing[:3]),
+        order_checked=order_checked,
+        order_exact=order_exact,
     )
 
 

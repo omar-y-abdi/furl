@@ -28,6 +28,7 @@ import tempfile
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any, cast
 
 from benchmarks import datasets as ds_mod
 from benchmarks.metrics import (
@@ -134,51 +135,78 @@ def print_table(cases: list[CaseMetrics], needles: list[NeedleResult]) -> None:
             f"{path:>9s}"
         )
 
-    print("\n=== NEEDLE-RECALL (current engine) ===")
+    print("\n=== NEEDLE-RECALL (current engine; naming vs control query arms) ===")
     print(
-        f"{'family':8s} {'card':>4s} {'position':9s} {'in_output':>9s} "
+        f"{'arm':8s} {'family':8s} {'card':>4s} {'position':9s} {'in_output':>9s} "
         f"{'ccr_recov':>9s} {'recalled':>8s}"
     )
     for r in needles:
         print(
-            f"{r.family:8s} {r.cardinality:4d} {r.position:9s} "
+            f"{r.arm:8s} {r.family:8s} {r.cardinality:4d} {r.position:9s} "
             f"{str(r.in_output):>9s} {str(r.ccr_recoverable):>9s} "
             f"{str(r.recalled):>8s}"
         )
 
-    overall = recall_rate(needles)
-    visible = sum(1 for r in needles if r.in_output) / len(needles) if needles else 1.0
-    print(
-        f"\nNEEDLE-RECALL overall (output OR CCR): {_pct(overall)}   "
-        f"visible-in-output only: {_pct(visible)}"
-    )
+    # Per-arm summaries — NEVER blended (the control arm exists to expose
+    # the gap the naming arm hides).
+    for arm in ("naming", "control"):
+        arm_trials = [r for r in needles if r.arm == arm]
+        if not arm_trials:
+            continue
+        overall = recall_rate(arm_trials)
+        visible = sum(1 for r in arm_trials if r.in_output) / len(arm_trials)
+        print(
+            f"\nNEEDLE-RECALL [{arm}] overall (output OR CCR): {_pct(overall)}   "
+            f"visible-in-output only: {_pct(visible)}"
+        )
+        for fam in ("search", "logs"):
+            sub = [r for r in arm_trials if r.family == fam]
+            if not sub:
+                continue
+            fam_recall = recall_rate(sub)
+            fam_visible = sum(1 for r in sub if r.in_output) / len(sub)
+            print(
+                f"  {fam:7s}: recall(output|CCR)={_pct(fam_recall)}  "
+                f"visible-only={_pct(fam_visible)}"
+            )
+
+
+def _arm_summary(trials: list[NeedleResult]) -> dict[str, object]:
+    """Recall summary (overall + by family) for ONE query arm's trials."""
+    overall = recall_rate(trials)
+    visible = sum(1 for r in trials if r.in_output) / len(trials) if trials else 1.0
+    by_family: dict[str, dict[str, float]] = {}
     for fam in ("search", "logs"):
-        sub = [r for r in needles if r.family == fam]
+        sub = [r for r in trials if r.family == fam]
         if not sub:
             continue
-        fam_recall = recall_rate(sub)
-        fam_visible = sum(1 for r in sub if r.in_output) / len(sub)
-        print(
-            f"  {fam:7s}: recall(output|CCR)={_pct(fam_recall)}  visible-only={_pct(fam_visible)}"
-        )
+        by_family[fam] = {
+            "recall_output_or_ccr": recall_rate(sub),
+            "recall_visible_only": sum(1 for r in sub if r.in_output) / len(sub),
+            "trials": len(sub),
+        }
+    return {
+        "overall_output_or_ccr": overall,
+        "overall_visible_only": visible,
+        "by_family": by_family,
+    }
 
 
 def build_results_payload(
     cases: list[CaseMetrics], needles: list[NeedleResult]
 ) -> dict[str, object]:
-    """Assemble the machine-readable results envelope."""
-    overall = recall_rate(needles)
-    visible = sum(1 for r in needles if r.in_output) / len(needles) if needles else 1.0
-    needle_by_family: dict[str, dict[str, float]] = {}
-    for fam in ("search", "logs"):
-        sub = [r for r in needles if r.family == fam]
-        if not sub:
-            continue
-        needle_by_family[fam] = {
-            "recall_output_or_ccr": recall_rate(sub),
-            "recall_visible_only": sum(1 for r in sub if r.in_output) / len(sub),
-            "trials": len(sub),
-        }
+    """Assemble the machine-readable results envelope.
+
+    The top-level ``needle_recall`` numbers are the NAMING arm — the same
+    best-case-by-construction semantics the committed floor was captured
+    with, and what ``floor_check.py`` gates on (== 100%). The honest
+    non-quoting-user numbers live SEPARATELY under ``needle_recall.control``
+    (EFF-7): the control arm is expected to be lower on the lossy path and
+    is deliberately NOT part of the 100% gate.
+    """
+    naming = [r for r in needles if r.arm == "naming"]
+    control = [r for r in needles if r.arm == "control"]
+    summary = _arm_summary(naming)
 
     return {
         "schema": "furl_ctx.imp3.baseline.v1",
@@ -190,9 +218,8 @@ def build_results_payload(
         "provenance": snapshot_provenance(),
         "datasets": [asdict(c) for c in cases],
         "needle_recall": {
-            "overall_output_or_ccr": overall,
-            "overall_visible_only": visible,
-            "by_family": needle_by_family,
+            **summary,
+            "control": _arm_summary(control),
             "trials": [asdict(r) for r in needles],
         },
     }
@@ -205,9 +232,11 @@ def build_results_payload(
 
 def render_baseline_md(payload: dict[str, object]) -> str:
     """Render the human BASELINE.md from the results payload."""
-    cases = payload["datasets"]  # type: ignore[index]
-    needle = payload["needle_recall"]  # type: ignore[index]
-    prov = payload["provenance"]  # type: ignore[index]
+    # Runtime no-ops: the payload is a JSON-shaped dict[str, object]; these
+    # casts state the concrete shapes build_results_payload assembles.
+    cases = cast("list[dict[str, Any]]", payload["datasets"])
+    needle = cast("dict[str, Any]", payload["needle_recall"])
+    prov = cast("list[dict[str, Any]]", payload["provenance"])
 
     lines: list[str] = []
     a = lines.append
@@ -240,7 +269,7 @@ def render_baseline_md(payload: dict[str, object]) -> str:
         "| dataset | items | tok before | tok after | lossless reduction | lossy drop ratio | info retention | path |"
     )
     a("|---|---:|---:|---:|---:|---:|---:|---|")
-    for c in cases:  # type: ignore[union-attr]
+    for c in cases:
         path = "LOSSY" if c["took_lossy_path"] else "lossless"
         a(
             f"| {c['name']} | {c['n_input_items']} | {c['tokens_before']} | "
@@ -257,27 +286,42 @@ def render_baseline_md(payload: dict[str, object]) -> str:
     a("- **search** — rg --json rows (lossless columnar path keeps all rows).")
     a("- **logs** — git-log rows (varying-field -> lossy drop path fires).")
     a("")
-    a(
-        f"- Overall recall (visible OR CCR-recoverable): **{needle['overall_output_or_ccr'] * 100:.1f}%**"
-    )  # type: ignore[index]
-    a(f"- Overall *visible-in-output* recall: **{needle['overall_visible_only'] * 100:.1f}%**")  # type: ignore[index]
+    a("Two query arms per trial, reported separately (EFF-7): **naming**")
+    a("(the query quotes the needle's sentinel token — best-case recall BY")
+    a("CONSTRUCTION; this is the number the floor gate checks) and")
+    a("**control** (the query describes the need without any of the needle's")
+    a("literal tokens — the honest non-quoting-user number).")
     a("")
-    a("| family | recall (output\\|CCR) | recall (visible-only) | trials |")
-    a("|---|---:|---:|---:|")
-    for fam, stats in needle["by_family"].items():  # type: ignore[index]
+    a(
+        f"- Naming-arm recall (visible OR CCR-recoverable): **{needle['overall_output_or_ccr'] * 100:.1f}%**"
+    )
+    a(f"- Naming-arm *visible-in-output* recall: **{needle['overall_visible_only'] * 100:.1f}%**")
+    control = needle.get("control", {})
+    if control:
         a(
-            f"| {fam} | {stats['recall_output_or_ccr'] * 100:.1f}% | "
-            f"{stats['recall_visible_only'] * 100:.1f}% | {stats['trials']} |"
+            f"- Control-arm recall (visible OR CCR-recoverable): **{control['overall_output_or_ccr'] * 100:.1f}%**"
         )
+        a(
+            f"- Control-arm *visible-in-output* recall: **{control['overall_visible_only'] * 100:.1f}%**"
+        )
+    a("")
+    a("| arm | family | recall (output\\|CCR) | recall (visible-only) | trials |")
+    a("|---|---|---:|---:|---:|")
+    for arm_name, arm_stats in (("naming", needle), ("control", control)):
+        for fam, stats in arm_stats.get("by_family", {}).items():
+            a(
+                f"| {arm_name} | {fam} | {stats['recall_output_or_ccr'] * 100:.1f}% | "
+                f"{stats['recall_visible_only'] * 100:.1f}% | {stats['trials']} |"
+            )
     a("")
     a("### Per-trial needle outcomes")
     a("")
-    a("| family | card | position | in_output | ccr_recoverable | recalled |")
-    a("|---|---:|---|---|---|---|")
-    for r in needle["trials"]:  # type: ignore[index]
+    a("| arm | family | card | position | in_output | ccr_recoverable | recalled |")
+    a("|---|---|---:|---|---|---|---|")
+    for r in needle["trials"]:
         a(
-            f"| {r['family']} | {r['cardinality']} | {r['position']} | "
-            f"{r['in_output']} | {r['ccr_recoverable']} | {r['recalled']} |"
+            f"| {r.get('arm', 'naming')} | {r['family']} | {r['cardinality']} | "
+            f"{r['position']} | {r['in_output']} | {r['ccr_recoverable']} | {r['recalled']} |"
         )
     a("")
     a("## Data provenance")
@@ -285,7 +329,7 @@ def render_baseline_md(payload: dict[str, object]) -> str:
     a("Raw captures are committed under `benchmarks/data/` so every number is")
     a("auditable and re-derivable. Capture commands:")
     a("")
-    for p in prov:  # type: ignore[union-attr]
+    for p in prov:
         a(
             f"- **{p['dataset']}** ({p['n_items_default']} items, snapshot "
             f"`{p['snapshot']}` = {p['snapshot_bytes']} bytes): {p['provenance']}"
@@ -293,22 +337,36 @@ def render_baseline_md(payload: dict[str, object]) -> str:
     a("")
     a("## Honest read")
     a("")
-    a("- **search** takes the *lossless columnar* path: all rows survive, no")
-    a("  drop, needle-recall is 100% visible. The audited 90->24 needle drop")
-    a("  does NOT reproduce on real ripgrep search results through `compress()`.")
-    a("- **logs** (varying commit-hash/date) takes the *lossy* path: ~83% of")
-    a("  rows are dropped from the visible output and the mid/high-cardinality")
-    a("  needle is silently removed from what the LLM sees — but every dropped")
-    a("  row is CCR-recoverable, so information retention is 100% *while the")
-    a("  marker/store path is on*.")
-    a("- **code** (large distinct source files) is a passthrough: no crush,")
-    a("  0% reduction, 100% retention.")
-    a("")
-    a("Net: the audited *needle-loss* reproduces on log-shaped varying-field")
-    a("data at the *visible-output* level (the LLM loses sight of mid-array")
-    a("needles), recoverable only via CCR. The audited *~30% real savings*")
-    a("reproduces as the lossless figure on search (~40%) and code (0%); the")
-    a("high log 'savings' (84%+) are inflated by deletion, not free.")
+    # Derived from the CAPTURED numbers above (not a hand-written story that
+    # can rot when the engine changes).
+    lossy_names = [c["name"] for c in cases if c["took_lossy_path"]]
+    lossless_names = [c["name"] for c in cases if not c["took_lossy_path"]]
+    min_retention = min((c["information_retention"] for c in cases), default=1.0)
+    if lossy_names:
+        a(
+            f"- **Deletion-backed savings**: {len(lossy_names)}/{len(cases)} datasets "
+            f"({', '.join(lossy_names)}) ship with rows dropped from the visible"
+        )
+        a("  output — their savings are NOT free; every drop must be (and is)")
+        a("  covered by a CCR recovery pointer.")
+    if lossless_names:
+        a(
+            f"- **True zero-loss savings**: {', '.join(lossless_names)} "
+            "(drop ratio 0.0% — the only rows where the reduction is free)."
+        )
+    a(f"- **Retention floor**: {min_retention * 100:.1f}% — every dataset's dropped rows")
+    a("  resolve through the emitted recovery pointers (sentinel `<<ccr:HASH>>`")
+    a("  or the raw-text `Retrieve …: hash=…` marker) against the live store.")
+    a("- **Needle honesty (EFF-7)**: the naming arm is best-case BY")
+    a("  CONSTRUCTION (the query quotes the sentinel, query-aware keep pins")
+    a("  it). The control arm is what a user who cannot quote the row gets:")
+    if control:
+        a(
+            f"  visible-in-output recall {control['overall_visible_only'] * 100:.1f}% vs "
+            f"{needle['overall_visible_only'] * 100:.1f}% naming — the gap is the retrieval"
+        )
+        a("  cost a non-quoting user pays on the lossy path (CCR round-trip,")
+        a("  not silent loss, while recall-output-or-CCR holds).")
     a("")
     return "\n".join(lines)
 
@@ -337,9 +395,16 @@ def main(argv: list[str] | None = None) -> int:
         out_dir = Path(args[idx + 1])
 
     # Fail loudly if any snapshot is missing — never silently re-capture.
-    missing = [
-        name for name in ("code", "logs", "search") if not (DATA_DIR / f"{name}.raw.json").exists()
-    ]
+    required_snapshots = (
+        "code",
+        "logs",
+        "search",
+        "ci_log",
+        "grep_raw",
+        "diff_raw",
+        "markdown_doc",
+    )
+    missing = [name for name in required_snapshots if not (DATA_DIR / f"{name}.raw.json").exists()]
     if missing and not refresh:
         print(
             f"ERROR: committed snapshots missing: {missing}\n"

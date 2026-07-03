@@ -13,8 +13,25 @@ Reported separately (never blended):
 
 3. ``information_retention`` — fraction of distinct input items that are
    either present in the visible output OR recoverable from the CCR store
-   via the ``<<ccr:HASH>>`` sentinel. A dropped-but-recoverable item counts
-   as retained; a dropped-and-unrecoverable item is LOST.
+   via an engine-emitted recovery pointer: the ``{"_ccr_dropped":
+   "<<ccr:HASH>>"}`` sentinel (SmartCrusher) or the ``[N … compressed to M.
+   Retrieve …: hash=H]`` marker line (the raw-text log/search/diff/text
+   compressors, whose store entry backs the FULL original). A
+   dropped-but-recoverable item counts as retained; a
+   dropped-and-unrecoverable item is LOST.
+
+Presence uses the STRICT ladder (ported from ``verify/measure.py``): exact
+canonical-signature membership on JSON-array renderings, decode-and-compare
+on CSV-schema renderings, verbatim whole-item membership for STRING items in
+text renderings — and nothing else. A structured row whose scalar values
+merely appear scattered in the text is NOT present (the lenient
+scalar-substring fallback the verify harness removed is gone here too).
+
+Every case is measured COLD (``_reset_engine_state``): the CCR store is
+cleared and the pipeline singleton (router result caches + the Rust-side
+CCR store on its SmartCrusher) is rebuilt per case, matching the verify
+harness's fresh-process-per-case semantics instead of accumulating warm
+state across cases.
 
 All token counts go through the engine's own tokenizer selection
 (``furl_ctx.tokenizers.get_tokenizer`` wrapped in ``furl_ctx.tokenizer.Tokenizer``)
@@ -23,12 +40,16 @@ so the numbers match what the engine itself measures.
 
 from __future__ import annotations
 
+import importlib
 import json
 from dataclasses import dataclass
 from typing import Any
 
 from furl_ctx import compress
-from furl_ctx.cache.compression_store import get_compression_store
+from furl_ctx.cache.compression_store import (
+    get_compression_store,
+    reset_compression_store,
+)
 from furl_ctx.ccr import marker_grammar
 from furl_ctx.tokenizer import Tokenizer
 from furl_ctx.tokenizers import get_tokenizer
@@ -69,6 +90,29 @@ class CaseMetrics:
 def _make_tokenizer(model: str = BENCH_MODEL) -> Tokenizer:
     """Build the SAME tokenizer the engine uses for ``model``."""
     return Tokenizer(get_tokenizer(model), model)
+
+
+def _reset_engine_state() -> None:
+    """Cold-start the engine before a measurement (TEST-16c).
+
+    Two layers of warm state would otherwise leak between cases:
+
+    * the Python ``CompressionStore`` singleton (CCR mirror) —
+      ``reset_compression_store()`` clears it;
+    * the pipeline singleton, which owns the ContentRouter's result cache
+      (keyed by content+bias but NOT by query — a second case with the same
+      tool bytes would be served the FIRST case's compression, computed
+      under the first case's query context) and the SmartCrusher's
+      process-local Rust CCR store (no direct reset surface) — rebuilding
+      the singleton gives fresh instances of both.
+
+    This is the in-process equivalent of ``verify/worker.py``'s
+    fresh-process-per-case guarantee (same rationale documented there).
+    """
+    reset_compression_store()
+    compress_module = importlib.import_module("furl_ctx.compress")
+    with compress_module._pipeline_lock:
+        setattr(compress_module, "_pipeline", None)  # noqa: B010 — module attr, mypy-visible
 
 
 def _stringify(content: Any) -> str:
@@ -145,6 +189,32 @@ def _emitted_ccr_hashes(output_text: str) -> set[str]:
             if isinstance(value, str):
                 hashes |= collect_ccr_hashes(value)
     return hashes
+
+
+def _bracket_marker_hashes(output_text: str) -> set[str]:
+    """Hashes from the raw-text compressors' bracket retrieval markers.
+
+    The log/search/diff/text compressors signal their elisions with a
+    ``[N <unit> compressed to M. Retrieve …: hash=HEX24]`` marker line whose
+    store entry backs the FULL original (``_ccr_persist``). The pattern is
+    sourced from :mod:`furl_ctx.ccr.marker_grammar` (shapes G/H — the owner).
+    A hash that did not come from a real engine emission simply fails to
+    resolve in the store, so false positives cannot inflate recovery.
+    """
+    return {
+        match.group(match.lastindex or 1).lower()
+        for match in marker_grammar.GENERIC_BRACKET_PATTERN.finditer(output_text)
+    }
+
+
+def _emitted_recovery_hashes(output_text: str) -> set[str]:
+    """Every engine-emitted recovery pointer in ``output_text``.
+
+    Union of the two documented drop-signal grammars: the SmartCrusher
+    ``{"_ccr_dropped": "<<ccr:HASH>>"}`` sentinel and the raw-text
+    compressors' bracket ``Retrieve …: hash=H`` marker lines.
+    """
+    return _emitted_ccr_hashes(output_text) | _bracket_marker_hashes(output_text)
 
 
 def _recovered_originals(hashes: set[str], query: str | None) -> list[str]:
@@ -228,59 +298,44 @@ def _item_present(
     row_sigs: set[str] | None,
     decoded_sigs: set[str] | None = None,
 ) -> bool:
-    """Is ``item`` represented in the visible output?
+    """Is ``item`` represented in the visible output? STRICT ladder only.
 
-    Three renderings, strictest applicable test first:
+    Ported from the verify harness (TEST-16b — the lenient scalar-substring
+    fallback is gone):
+
     - JSON array of rows -> exact canonical-signature membership (``row_sigs``).
     - CSV-schema rendering -> DECODE-AND-COMPARE: the row must be exactly
       reconstructible from the output alone (``decoded_sigs``). Verbatim
       string presence does NOT count — reversible encodings are judged by
       reconstruction, and an unreconstructible row is NOT present.
-    - Any other text rendering -> every scalar field value must appear
-      verbatim in the output text (conservative fallback).
+    - Any other text rendering -> a STRING item counts only when it appears
+      verbatim (whole item) in the output text — the raw-text dataset unit.
+      A structured item is NOT present: scattered scalar values are not a
+      reconstruction, so they no longer count.
     """
     if row_sigs is not None:
         return _item_signature(item) in row_sigs
     if decoded_sigs is not None:
         return _item_signature(item) in decoded_sigs
-    values = _scalar_values(item)
-    if not values:
-        return _item_signature(item) in output_text
-    return all(v in output_text for v in values)
-
-
-def _scalar_values(item: Any) -> list[str]:
-    """Collect every scalar field value of ``item`` as strings."""
-    out: list[str] = []
-    if isinstance(item, dict):
-        for v in item.values():
-            out.extend(_scalar_values(v))
-    elif isinstance(item, list):
-        for v in item:
-            out.extend(_scalar_values(v))
-    elif isinstance(item, bool):
-        out.append("true" if item else "false")
-    elif item is None:
-        pass
-    else:
-        out.append(str(item))
-    return out
+    if isinstance(item, str):
+        return item in output_text
+    return False
 
 
 def _item_in_recovered(item: Any, recovered_blobs: list[str]) -> bool:
-    """Is ``item`` recoverable from any CCR-retrieved original blob?
+    """Is ``item`` recoverable from a CCR-retrieved original blob? STRICT.
 
-    Each blob is the original JSON the engine stashed before dropping. We
-    parse it and look for an exactly-matching row (canonical-JSON equality)
-    — that is the strict "this distinct item is recoverable" test.
+    A JSON blob must contain an exactly-matching row (canonical-JSON
+    equality). A non-JSON blob (the raw-text compressors store the FULL
+    original text) recovers a STRING item only when the item appears
+    verbatim; structured items get no scalar-scatter fallback (TEST-16b).
     """
     target = _item_signature(item)
     for blob in recovered_blobs:
         try:
             parsed = json.loads(blob)
         except json.JSONDecodeError:
-            # Non-JSON original (e.g. plain text) — substring fallback.
-            if all(v in blob for v in _scalar_values(item)):
+            if isinstance(item, str) and item in blob:
                 return True
             continue
         rows = parsed if isinstance(parsed, list) else [parsed]
@@ -307,6 +362,7 @@ def measure_case(
         messages: The payload to compress.
         model: Token-counting model (default gpt-4o -> real tiktoken).
     """
+    _reset_engine_state()  # cold per case (TEST-16c) — matches verify
     tok = _make_tokenizer(model)
     result = compress(messages, model=model)
 
@@ -319,12 +375,13 @@ def measure_case(
         (tokens_before - tokens_after) / tokens_before if tokens_before > 0 else 0.0
     )
 
-    # CCR markers that the ENGINE emitted: only those carried by a
-    # ``{"_ccr_dropped": "<<ccr:HASH ...>>"}`` sentinel row in the output.
-    # Markers that merely appear inside an input row's value (e.g. this repo's
-    # own source code documents the ``<<ccr:HASH>>`` grammar) are NOT drops
-    # and must not be counted.
-    emitted_hashes = _emitted_ccr_hashes(output_text)
+    # Recovery pointers that the ENGINE emitted: the ``{"_ccr_dropped":
+    # "<<ccr:HASH ...>>"}`` sentinel rows plus the raw-text compressors'
+    # bracket ``Retrieve …: hash=H`` marker lines. Markers that merely appear
+    # inside an input row's value (e.g. this repo's own source code documents
+    # the ``<<ccr:HASH>>`` grammar) are NOT drops: the sentinel scan is
+    # key-gated and a non-emitted bracket hash cannot resolve in the store.
+    emitted_hashes = _emitted_recovery_hashes(output_text)
     recovered = _recovered_originals(emitted_hashes, query)
 
     row_sigs = _output_row_signatures(output_text)
@@ -381,6 +438,7 @@ def measure_conversation_case(
     surfaced in SOME message carries a ``<<ccr:HASH>>`` pointer that resolves
     in the CCR store to an original containing the item.
     """
+    _reset_engine_state()  # cold per case (TEST-16c) — matches verify
     tok = _make_tokenizer(model)
     result = compress(messages, model=model)
 
@@ -394,7 +452,7 @@ def measure_conversation_case(
 
     emitted_hashes: set[str] = set()
     for text in texts:
-        emitted_hashes |= _emitted_ccr_hashes(text)
+        emitted_hashes |= _emitted_recovery_hashes(text)
     recovered = _recovered_originals(emitted_hashes, query)
 
     views = [(text, _output_row_signatures(text), _decoded_row_signatures(text)) for text in texts]

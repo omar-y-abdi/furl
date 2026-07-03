@@ -17,6 +17,17 @@ real coding-agent use case the engine targets:
                 whole-item dedup, field-aware dedup collapses it" case that
                 Improvement 2 targets).
 
+Four RAW-TEXT datasets (EFF-6) exercise the non-JSON compressors that the
+pre-parsed arrays above never reach. Their ``items`` are the distinct
+non-blank LINES of the raw text (the honest retention unit for text):
+
+5. ``ci_log``       — CI build+test log text → LogCompressor (deterministic
+                synthesis, seed committed: ``rawtext_sources.synth_ci_log``).
+6. ``grep_raw``     — real ``grep -rn`` output → SearchCompressor.
+7. ``diff_raw``     — real ``git diff`` between two committed refs
+                (multi-file, 20+ hunks, Cargo.lock churn) → DiffCompressor.
+8. ``markdown_doc`` — README-shaped markdown/prose → TextCrusher.
+
 Raw captures are snapshotted under ``benchmarks/data/`` so a run is
 reproducible and the numbers are auditable. The capture commands are
 recorded in each snapshot's ``provenance`` field.
@@ -621,8 +632,150 @@ def build_multiturn_dataset(*, refresh: bool = False) -> Dataset:
     )
 
 
+# ---------------------------------------------------------------------------
+# Datasets 7-10 — RAW TEXT (EFF-6): the four non-JSON compressor routes.
+# Items are the distinct non-blank lines of the raw text; retention and
+# recovery are scored per line (visible verbatim OR CCR-recoverable from the
+# compressor's `Retrieve …: hash=…` marker, which backs the FULL original).
+# ---------------------------------------------------------------------------
+
+_GREP_CMD: tuple[str, ...] = ("grep", "-rn", "--include=*.py", "def ", "furl_ctx/transforms/")
+
+# Two real refs from this repo's history: the dependency-bump window
+# (thiserror 2.0.18 → merge #11), restricted to the manifests so the diff is
+# multi-file with heavy Cargo.lock churn (19+ hunks in one file exercises the
+# max_hunks_per_file cap) and stays PURE diff for the detector (code/docs
+# churn carries prose + brace-led context lines, which trips the
+# mixed-content gate).
+_DIFF_CMD: tuple[str, ...] = (
+    "git",
+    "diff",
+    "3154e766~1",
+    "c8d5e41b",
+    "--",
+    "Cargo.lock",
+    "Cargo.toml",
+    "crates/furl-core/Cargo.toml",
+)
+
+
+def _distinct_lines(raw: str) -> list[str]:
+    """Distinct non-blank lines in first-seen order — the raw-text item unit."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for line in raw.splitlines():
+        if not line.strip() or line in seen:
+            continue
+        seen.add(line)
+        out.append(line)
+    return out
+
+
+def _raw_text_dataset(name: str, raw: str, query: str, provenance: str) -> Dataset:
+    """Assemble a raw-TEXT Dataset: one tool message carrying the text verbatim."""
+    messages = [
+        {"role": "user", "content": query},
+        {"role": "tool", "content": raw, "tool_call_id": f"{name}_call"},
+    ]
+    return Dataset(
+        name=name,
+        query=query,
+        items=list(_distinct_lines(raw)),
+        messages=messages,
+        provenance=provenance,
+    )
+
+
+def build_ci_log_dataset(*, refresh: bool = False) -> Dataset:
+    """CI build+test log TEXT (npm + cargo + pytest) → LogCompressor.
+
+    Synthesized deterministically (the one non-captured dataset — a real CI
+    run is not reproducibly capturable locally; the generator + seed are the
+    provenance) and snapshotted like every capture. ≥200 lines: install
+    warnings, a cargo warning block, timestamped INFO/WARNING app lines, one
+    native-style traceback, and the run summary.
+    """
+    from benchmarks.rawtext_sources import CI_LOG_SEED, synth_ci_log
+
+    name = "ci_log"
+    provenance = (
+        f"Synthesized CI log (rawtext_sources.synth_ci_log, seed={CI_LOG_SEED}): "
+        "npm ci warnings + cargo build warning block + pytest run with "
+        "python-logging timestamped INFO/WARNING lines, one native traceback "
+        "failure, and the summary line. Deterministic: same seed ⇒ same bytes."
+    )
+    cached = None if refresh else _load_snapshot(name)
+    raw = cached[0] if cached is not None else synth_ci_log()
+    if cached is None:
+        _snapshot(name, raw, provenance)
+    return _raw_text_dataset(name, raw, "Why did the CI run fail?", provenance)
+
+
+def build_grep_raw_dataset(*, refresh: bool = False) -> Dataset:
+    """Raw ``grep -rn`` TEXT output (``file:line:content``) → SearchCompressor.
+
+    The same real search the JSON ``search`` dataset captures via
+    ``rg --json``, but in the raw text shape agents actually receive from
+    plain grep — many matches concentrated in few files.
+    """
+    name = "grep_raw"
+    provenance = (
+        f"`{' '.join(_GREP_CMD)}` — raw file:line:content matches over this "
+        "repo's own transforms package (real tool output, verbatim)."
+    )
+    raw = _capture(name, list(_GREP_CMD), provenance, refresh=refresh)
+    return _raw_text_dataset(
+        name, raw, "Where are functions defined in the transforms package?", provenance
+    )
+
+
+def build_diff_raw_dataset(*, refresh: bool = False) -> Dataset:
+    """A real multi-file unified diff with lockfile churn → DiffCompressor.
+
+    Pinned between two real commits of this repo (the dependency-bump
+    window), manifests only: Cargo.lock alone carries 19+ hunks, so the
+    ``max_hunks_per_file`` cap does real work.
+    """
+    name = "diff_raw"
+    provenance = (
+        f"`{' '.join(_DIFF_CMD)}` — real unified diff between two committed "
+        "refs of this repo (multi-file; Cargo.lock churn dominates)."
+    )
+    raw = _capture(name, list(_DIFF_CMD), provenance, refresh=refresh)
+    return _raw_text_dataset(name, raw, "What changed in the dependency bumps?", provenance)
+
+
+def build_markdown_doc_dataset(*, refresh: bool = False) -> Dataset:
+    """README-shaped markdown/prose document → TextCrusher.
+
+    Headers, lists, indented code blocks, paragraphs (≥600 chars — the
+    TextCrusher ``min_chars`` floor). Indented code blocks instead of ```
+    fences: a fence plus prose trips ``is_mixed_content`` and routes MIXED
+    (see ``rawtext_sources`` for the full rationale; the fence variant is
+    pinned in the routing tests).
+    """
+    from benchmarks.rawtext_sources import MARKDOWN_DOC
+
+    name = "markdown_doc"
+    provenance = (
+        "README-shaped markdown/prose document (rawtext_sources.MARKDOWN_DOC): "
+        "headers, lists, indented code blocks, paragraphs. Static committed "
+        "text, snapshotted verbatim."
+    )
+    cached = None if refresh else _load_snapshot(name)
+    raw = cached[0] if cached is not None else MARKDOWN_DOC
+    if cached is None:
+        _snapshot(name, raw, provenance)
+    return _raw_text_dataset(
+        name, raw, "What does this project do and how do I install it?", provenance
+    )
+
+
 def all_datasets(*, refresh: bool = False) -> list[Dataset]:
-    """Build the six real datasets. Deterministic from committed snapshots."""
+    """Build all real datasets (6 structured + 4 raw-text).
+
+    Deterministic from committed snapshots.
+    """
     return [
         build_code_dataset(refresh=refresh),
         build_logs_dataset(refresh=refresh),
@@ -630,6 +783,10 @@ def all_datasets(*, refresh: bool = False) -> list[Dataset]:
         build_repeated_logs_dataset(refresh=refresh),
         build_disk_dataset(refresh=refresh),
         build_multiturn_dataset(refresh=refresh),
+        build_ci_log_dataset(refresh=refresh),
+        build_grep_raw_dataset(refresh=refresh),
+        build_diff_raw_dataset(refresh=refresh),
+        build_markdown_doc_dataset(refresh=refresh),
     ]
 
 
