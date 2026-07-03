@@ -72,8 +72,9 @@ const TOMBSTONE_K: usize = 2;
 /// In-memory CCR store backed by [`DashMap`] for sharded concurrent
 /// access.
 ///
-/// - **TTL**: 5 minutes by default. Entries past their TTL are dropped
-///   on the next `get` (lazy expiry — no background reaper thread).
+/// - **TTL**: 30 minutes by default (session-scale — see `DEFAULT_TTL`).
+///   Entries past their TTL are dropped on the next `get` (lazy expiry —
+///   no background reaper thread).
 /// - **Capacity**: 1000 entries by default. When `put` would push us
 ///   past capacity, the oldest entry (per insertion order) is evicted.
 /// - **Concurrency**: gets and puts on distinct keys do not contend.
@@ -105,7 +106,7 @@ struct Entry {
 }
 
 impl InMemoryCcrStore {
-    /// Default: 1000 entries, 5-minute TTL.
+    /// Default: 1000 entries, 30-minute TTL.
     pub fn new() -> Self {
         Self::with_capacity_and_ttl(DEFAULT_CAPACITY, DEFAULT_TTL)
     }
@@ -296,6 +297,17 @@ impl CcrStore for InMemoryCcrStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_ttl_is_session_scale() {
+        // Engine P0-3: agentic sessions outlive 5 minutes — an entry that
+        // expires mid-session silently converts "lossless + retrieval"
+        // into lossy. The default is session-scale (30 minutes) and must
+        // agree with Python's `DEFAULT_CCR_TTL_SECONDS`
+        // (furl_ctx/cache/compression_store.py) — the two stores back the
+        // same markers.
+        assert_eq!(DEFAULT_TTL, Duration::from_secs(1800));
+    }
 
     #[test]
     fn put_then_get_returns_payload() {

@@ -343,9 +343,9 @@ def test_local_store_singleton_carries_session_ttl(server) -> None:
 def test_pipeline_marker_rows_carry_session_ttl(server, monkeypatch) -> None:
     """COR-51: the pipeline inside ``_compress_content`` persists dropped rows
     under the marker hash embedded in the compressed text WITHOUT an explicit
-    ttl. Those rows must inherit MCP_SESSION_TTL, not the stock 300 s default
-    — otherwise granular retrieval via the embedded marker missed after five
-    minutes while the wrapper hash advertised session persistence. This also
+    ttl. Those rows must inherit MCP_SESSION_TTL, not the stock 1800 s default
+    — otherwise granular retrieval via the embedded marker missed mid-session
+    while the wrapper hash advertised session persistence. This also
     pins ordering: the singleton must be configured BEFORE compress() runs its
     own config-on-first-init ``get_compression_store()`` call."""
     # furl_ctx/__init__.py re-exports the compress FUNCTION, shadowing the

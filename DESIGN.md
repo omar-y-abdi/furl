@@ -79,7 +79,7 @@ Benchmark the CURRENT engine first (baseline), then after each change. Regressio
 ## Open questions to resolve by measurement (not by guessing)
 1. Empirical needle-recall today (needle-injection harness).
 2. VARYING-IDENTITY `unique_ratio` cutoff + shape patterns that separate identity-noise from content.
-3. CCR TTL (~300s) vs retrieval latency under unconditional persist (1A).
+3. CCR TTL (~1800s since Engine P0-3) vs retrieval latency under unconditional persist (1A).
 4. Store/TTL pressure under unconditional persist.
 5. Budget blow-up from singleton pinning (1B) past `max_items_after_crush=15`.
 6. Is there a legitimate caller of the silent-loss path (`enable_ccr_marker=false`)? If not → remove it.

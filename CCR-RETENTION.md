@@ -1,8 +1,9 @@
 # CCR Retention — Cluster G reframe + the "free lunch" we want back
 
 > **Delivered guarantee:** retrieval is byte-exact ONLY within the in-memory
-> window — at most 1000 live entries (`max_entries`) and at most 300s old
-> (`default_ttl`). After capacity eviction (oldest-created-first) or TTL expiry
+> window — at most 1000 live entries (`max_entries`) and at most 1800s old
+> (`default_ttl`, session-scale since Engine P0-3; env-overridable via
+> `FURL_CCR_TTL_SECONDS`). After capacity eviction (oldest-created-first) or TTL expiry
 > the entry's payload is deleted from the single-tier store and is gone; a later
 > retrieve returns a **loud, cause-honest miss** (never a silent `None`). So the
 > invariant — **no silent loss** — holds, but it was never "never evict."
@@ -93,13 +94,12 @@ TTL). Fixed to be **cause-honest** (`format_retrieval_miss_detail`,
 
 ```
 Entry no longer retrievable from the CCR store: it was evicted under capacity
-pressure (store capacity: 1000 entries), expired (TTL 300s), or was never
-stored. Recompute the source content, or configure a durable CCR backend
-(Sqlite/Redis) for longer retention.
+pressure (store capacity: 1000 entries), expired (TTL 1800s), or was never
+stored. Recompute the source content.
 ```
 
 A genuinely TTL-*expired* entry keeps its exact wording (`status="expired"` →
-`"Entry expired (CCR TTL: 300 seconds; age: N seconds)"`) — that cause is known.
+`"Entry expired (CCR TTL: 1800 seconds; age: N seconds)"`) — that cause is known.
 
 Locked by `tests/test_ccr_eviction_loud_miss.py` (loudness for bulk + granular,
 cause-honesty, and that real expiry keeps its precise cause).

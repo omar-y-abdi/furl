@@ -65,8 +65,11 @@ pub trait CcrStore: Send + Sync {
 /// Default capacity — matches Python's `CompressionStore` default.
 pub const DEFAULT_CAPACITY: usize = 1000;
 
-/// Default TTL — 5 minutes, matching Python.
-pub const DEFAULT_TTL: Duration = Duration::from_secs(300);
+/// Default TTL — 30 minutes, matching Python's `DEFAULT_CCR_TTL_SECONDS`
+/// (`furl_ctx/cache/compression_store.py`). Session-scale (Engine P0-3):
+/// agentic sessions routinely outlive 5 minutes, and an entry that expires
+/// mid-session silently converts "lossless + retrieval" into lossy.
+pub const DEFAULT_TTL: Duration = Duration::from_secs(1800);
 
 // CCR marker construction lives in `markers.rs` — the single
 // construction point every Rust producer routes through. CCR *keys* are

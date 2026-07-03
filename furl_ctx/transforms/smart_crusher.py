@@ -912,7 +912,7 @@ class SmartCrusher(Transform):
                 f"CCR mirror: cannot get compression_store ({e}); "
                 f"hash {ccr_hash} would be unrecoverable"
             ) from e
-        # The TTL on the Python store defaults to 5 minutes — same as
+        # The TTL on the Python store defaults to 30 minutes — same as
         # the Rust store's `DEFAULT_TTL` (see crates/furl-core/src/
         # ccr/mod.rs). No need to override.
         try:

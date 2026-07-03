@@ -72,10 +72,11 @@ class CcrMirror:
         output and recompute instead.
 
         Why this is needed: the Tier-2 result cache (30-min TTL) and BOTH CCR
-        stores (Rust + Python, each 300-s TTL) have INDEPENDENT lifetimes. A
+        stores (Rust + Python, each 1800-s TTL by default) have INDEPENDENT
+        lifetimes — and the CCR stores also evict under capacity pressure. A
         result-cache HIT short-circuits ``smart_crush_content``, so the normal
-        Rust->Python mirror never runs. After ~5 minutes BOTH CCR stores expire
-        while the result cache still holds the crushed output: serving it would
+        Rust->Python mirror never runs. Once BOTH CCR stores expire (or evict)
+        while the result cache still holds the crushed output, serving it would
         emit a ``<<ccr:HASH>>`` pointing to nothing — a signalled-but-
         unrecoverable drop (silent data loss).
 

@@ -159,8 +159,9 @@ _READ_ENABLED = os.environ.get("FURL_MCP_READ", "off").lower().strip() in (
     "enabled",
 )
 
-# Session-scoped TTL: content persists for the session (1 hour), not 5 minutes.
-# The MCP server process lives as long as the coding session.
+# Session-scoped TTL: content persists for the session (1 hour), outlasting
+# the library's own 30-minute default. The MCP server process lives as long
+# as the coding session.
 MCP_SESSION_TTL = 3600
 
 # Shared stats file: all MCP instances (main + sub-agents) append here.
@@ -335,12 +336,13 @@ class FurlMCPServer:
         FIRST init, so this passes ``default_ttl=MCP_SESSION_TTL``: the
         pipeline run inside ``_compress_content`` persists dropped rows under
         the marker hash embedded in the compressed text WITHOUT an explicit
-        ttl, and under the store's stock 300 s default those rows expired
-        after 5 minutes while the wrapper hash (stored with
-        ``ttl=MCP_SESSION_TTL``) advertised session persistence. Sharing the
-        session TTL as the store default keeps both retrieval surfaces alive
-        for the same window. The compress path still passes its own
-        per-entry ``ttl`` at store time.
+        ttl, and under the store's stock default (1800 s since Engine P0-3;
+        300 s when this fix landed) those rows expired mid-session while the
+        wrapper hash (stored with ``ttl=MCP_SESSION_TTL``) advertised session
+        persistence. Sharing the session TTL as the store default keeps both
+        retrieval surfaces alive for the same window — and at 3600 s the MCP
+        store stays at least as durable as the library default. The compress
+        path still passes its own per-entry ``ttl`` at store time.
         """
         if self._local_store is None:
             from furl_ctx.cache.compression_store import get_compression_store
@@ -360,8 +362,8 @@ class FurlMCPServer:
         # its own no-arg get_compression_store() call, and the singleton's
         # default TTL is fixed on first init. Initializing here first
         # guarantees those embedded-marker entries carry MCP_SESSION_TTL
-        # rather than the 300 s pipeline default, which would silently expire
-        # granular retrieval 5 minutes into a session-long window.
+        # rather than the 1800 s pipeline default, which would silently
+        # expire granular retrieval 30 minutes into a session-long window.
         store = self._get_local_store()
 
         # Wrap content as a tool message (most common compression target)

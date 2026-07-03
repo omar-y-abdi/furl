@@ -4,7 +4,7 @@ The bug: the router's Tier-2 result cache (in ``apply()``) stores the crushed
 output (including its ``{"_ccr_dropped": "<<ccr:HASH>>"}`` sentinel) keyed by
 content hash.  On a result-cache HIT no fresh compression runs, so the
 Rust→Python CCR mirror (``SmartCrusher._mirror_ccr_to_python_store``) was
-skipped.  The CCR store has an independent ~300 s TTL.  After that TTL expires
+skipped.  The CCR store has an independent ~1800 s TTL.  After that TTL expires
 the result cache still returns the sentinel-bearing output, but the Python
 compression_store no longer has the entry — a SIGNALLED but UNRECOVERABLE drop
 (silent data loss).
@@ -29,9 +29,11 @@ Without the fix, step 5 fails: the sentinel is served but unbacked.
 With the fix, step 5 passes: ``_ensure_ccr_backed`` re-mirrored on the hit.
 
 BOTH-EXPIRED hardening (``test_both_stores_expired_*``): the Rust CCR store
-ALSO has a 300 s TTL (``crates/furl-core/src/ccr/mod.rs`` DEFAULT_TTL),
+ALSO has an 1800 s TTL (``crates/furl-core/src/ccr/mod.rs`` DEFAULT_TTL),
 same as the Python store, while the result cache (CompressionCache) has a
-30-min TTL. After ~5 minutes BOTH CCR stores expire but the result cache still
+30-min TTL. The lifetimes stay INDEPENDENT (capacity eviction, or a shorter
+env-configured TTL, can still outpace the result cache), so BOTH CCR stores
+can be gone while the result cache still
 serves the crushed output → re-mirror finds nothing in the Rust store either →
 the served sentinel would be UNBACKED. The strengthened fix detects this and
 REFUSES to serve the stale output: it evicts the cache entry and recomputes
@@ -164,7 +166,7 @@ class _ExpiringRustShim:
     """Wraps the Rust SmartCrusher to simulate the Rust CCR store's TTL expiry.
 
     ``ccr_get`` returns ``None`` (entry expired) UNTIL a fresh ``crush()`` runs
-    — modelling "the original entry's 300 s TTL lapsed, but a recompute
+    — modelling "the original entry's 1800 s TTL lapsed, but a recompute
     re-creates and re-stores it". This is the faithful both-expired state: a
     naive cache-hit serve cannot recover, only a recompute can.
 
@@ -367,7 +369,7 @@ class TestResultCacheCCRDivergence:
         )
 
     # ------------------------------------------------------------------ #
-    # BOTH-EXPIRED hardening: Rust + Python CCR stores both gone (300 s TTL)
+    # BOTH-EXPIRED hardening: Rust + Python CCR stores both gone (1800 s TTL)
     # while the result cache (30-min TTL) still holds the crushed output.
     # The strengthened fix must NOT serve a dead pointer — it recomputes.
     # ------------------------------------------------------------------ #

@@ -13,9 +13,7 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 
 use furl_core::ccr::{CcrStore, InMemoryCcrStore};
-use furl_core::transforms::smart_crusher::{
-    SmartCrusher, SmartCrusherBuilder, SmartCrusherConfig,
-};
+use furl_core::transforms::smart_crusher::{SmartCrusher, SmartCrusherBuilder, SmartCrusherConfig};
 
 /// Force the lossy path: set the lossless savings threshold above 1.0
 /// so no tabular rendering can ever clear it.

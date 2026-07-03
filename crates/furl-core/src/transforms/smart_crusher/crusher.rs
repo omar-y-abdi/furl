@@ -149,11 +149,47 @@ fn build_ccr_sentinel(persisted: &DroppedPersist) -> Value {
     ))
 }
 
+/// One deferred CCR store write (`key` → `payload`). Captured by
+/// [`SmartCrusher::persist_dropped`] under [`PersistMode::Collect`] in
+/// commit order (granular chunks → row index → whole-blob, the same
+/// eviction-friendly order the direct writes use) and replayed by
+/// [`SmartCrusher::commit_ccr_writes`] iff the lossy render ships.
+struct CcrWrite {
+    key: String,
+    payload: String,
+}
+
+/// How [`SmartCrusher::persist_dropped`] treats the CCR store writes for
+/// a drop. The hash, whole-blob marker and granular row-index marker are
+/// computed IDENTICALLY in every mode (COR-28 byte-parity: routing built
+/// on them cannot shift) — the modes differ ONLY in what happens to the
+/// store writes.
+#[derive(Clone, Copy)]
+enum PersistMode {
+    /// Write through to the configured store immediately. For paths
+    /// whose render ALWAYS ships (the non-dict string/number/mixed
+    /// sentinel path) — there is no later routing decision to wait for.
+    Commit,
+    /// Compute the writes but DEFER them: they are returned on
+    /// [`DroppedPersist::pending_writes`] and committed by the routing
+    /// layer only if the lossy render is actually chosen to ship. This
+    /// is the P0-4 fix: committing at build time left orphan
+    /// blob + chunks + index entries behind whenever the LOSSLESS render
+    /// won the MinTokens/LosslessFirst arbitration — wasted
+    /// COR-4-bounded capacity under hashes no surfaced marker names.
+    Collect,
+    /// Never write (COR-28, mixed dict arm): the caller surfaces no
+    /// marker naming this hash, so any write would be an orphan.
+    Skip,
+}
+
 /// Result of [`SmartCrusher::persist_dropped`] — the CCR hash that keys
 /// the stored full-original array plus the prompt-visible recovery
-/// pointer text. `Some(_)` only when rows were actually dropped; the
-/// store write (when a store is configured) has already happened by the
-/// time this is returned.
+/// pointer text. `Some(_)` only when rows were actually dropped. Under
+/// [`PersistMode::Commit`] the store write (when a store is configured)
+/// has already happened by the time this is returned; under
+/// [`PersistMode::Collect`] the writes ride in `pending_writes` for the
+/// caller to commit iff the render ships.
 struct DroppedPersist {
     /// 12-char SHA-256 hex prefix of the canonical full-original array.
     /// Always returned when something was dropped — callers may mirror
@@ -162,7 +198,9 @@ struct DroppedPersist {
     /// `<<ccr:HASH N_rows_offloaded>>` recovery pointer. ALWAYS
     /// non-empty when rows were dropped (Defect 1): the pointer is the
     /// recovery key, not a UX flag, so it is surfaced unconditionally on
-    /// every drop. The store write is likewise unconditional.
+    /// every drop. The store write backing a SHIPPED render is likewise
+    /// unconditional (immediate under `Commit`, at ship-time under
+    /// `Collect`).
     marker: String,
     /// Compact GRANULAR-retrieval marker, e.g.
     /// `<<ccr:9f3a2b#rows 50_chunks>>`. ONE short string (not a list), so
@@ -175,6 +213,13 @@ struct DroppedPersist {
     /// `None` when no store is configured to chunk into (the array hash +
     /// whole-blob `marker` still cover recovery in that case).
     row_index_marker: Option<String>,
+    /// Deferred store writes, populated ONLY under
+    /// [`PersistMode::Collect`] (empty under `Commit` — already written —
+    /// and `Skip` — never written). Commit order is preserved: granular
+    /// chunks first, then the row index, the whole-blob LAST, so the
+    /// bounded-store eviction rationale documented in `persist_dropped`
+    /// holds identically for deferred replay.
+    pending_writes: Vec<CcrWrite>,
 }
 
 /// One row-drop surfaced typed from a single `crush()` call, collected by
@@ -201,15 +246,23 @@ struct DroppedRef {
 /// [`SmartCrusher::crush_array_lossy`].
 ///
 /// The routing layer needs to tell two cases apart:
-/// - **Crushed** — a real DROP render exists (rows offloaded to CCR + a
-///   surfaced `<<ccr:HASH>>` pointer). This is the candidate the
+/// - **Crushed** — a real DROP render exists (a surfaced `<<ccr:HASH>>`
+///   pointer naming the offloadable rows). This is the candidate the
 ///   `MinTokens` policy sizes against the lossless render.
+///   `pending_ccr_writes` carries the deferred store writes backing its
+///   markers ([`PersistMode::Collect`]); the routing layer commits them
+///   IFF this render ships — a discarded candidate's writes are dropped
+///   with it, so the store never holds entries no surfaced marker names
+///   (P0-4). Empty under [`PersistMode::Skip`] (mixed dict arm).
 /// - **Skip** — the analyzer refused to crush the array (e.g. all-unique
 ///   entities with no signal). There is NO drop alternative; the carried
 ///   `CrushArrayResult` is the `skip:<reason>` passthrough, shipped only
 ///   when there's also no lossless render.
 enum LossyOutcome {
-    Crushed(CrushArrayResult),
+    Crushed {
+        result: CrushArrayResult,
+        pending_ccr_writes: Vec<CcrWrite>,
+    },
     Skip(CrushArrayResult),
 }
 
@@ -1020,13 +1073,30 @@ impl SmartCrusher {
         // `lossless_uses_opaque` is derived from the SAME Compaction value
         // produced by the single stage.run call above (U8 dedup).
 
+        // P0-4: build the lossy candidate with its CCR store writes
+        // DEFERRED (collect-only). Committing at build time orphaned the
+        // blob + chunks + index in the store whenever the routing below
+        // chose the lossless render — wasted COR-4-bounded capacity and
+        // misleading store stats under hashes no surfaced marker names.
+        // The deferred writes are committed exactly when the lossy render
+        // ships (the two ship-lossy arms below), so persistence for
+        // SHIPPED lossy output remains UNCONDITIONAL — the recovery
+        // invariant is timing-shifted, never weakened. Hash/marker
+        // computation is mode-independent, so routing cannot shift.
+        // `persist = false` (COR-28, mixed dict arm) still means NO
+        // writes ever: Skip mode.
+        let persist_mode = if persist {
+            PersistMode::Collect
+        } else {
+            PersistMode::Skip
+        };
         let lossy = self.crush_array_lossy(
             items,
             query_context,
             &item_strings,
             adaptive_k,
             !lossless_uses_opaque,
-            persist,
+            persist_mode,
         );
 
         // ── Route between the recoverable renders ──
@@ -1040,7 +1110,15 @@ impl SmartCrusher {
         // visible). Under `LosslessFirst` keep the legacy behavior:
         // lossless wins whenever it cleared its gate.
         match (lossless_candidate, lossy) {
-            (Some(lossless), LossyOutcome::Crushed(lossy)) => match self.config.routing_policy {
+            (
+                Some(lossless),
+                LossyOutcome::Crushed {
+                    result: lossy,
+                    pending_ccr_writes,
+                },
+            ) => match self.config.routing_policy {
+                // Lossless ships → the lossy candidate is discarded and
+                // its deferred writes drop with it (no orphans, P0-4).
                 RoutingPolicy::LosslessFirst => lossless,
                 RoutingPolicy::MinTokens => {
                     let lossless_tokens = self.render_token_count(&lossless);
@@ -1049,8 +1127,13 @@ impl SmartCrusher {
                     // lossless-fewer) → lossless: more rows visible at no
                     // extra token cost.
                     if lossy_tokens < lossless_tokens {
+                        // Lossy SHIPS → commit its recovery entries now
+                        // (unconditional persist for shipped output).
+                        self.commit_ccr_writes(pending_ccr_writes);
                         lossy
                     } else {
+                        // Lossless ships → discarded candidate's deferred
+                        // writes are dropped (no orphans, P0-4).
                         lossless
                     }
                 }
@@ -1059,11 +1142,39 @@ impl SmartCrusher {
             // ship lossless — it shows every row losslessly. (A non-
             // droppable array should never drop, and lossless never drops.)
             (Some(lossless), LossyOutcome::Skip(_)) => lossless,
-            // Only the lossy DROP render is valid → ship it (unchanged).
-            (None, LossyOutcome::Crushed(lossy)) => lossy,
+            // Only the lossy DROP render is valid → ship it. Its recovery
+            // entries are committed on the way out (same unconditional
+            // guarantee as before the deferral; only the timing moved).
+            (
+                None,
+                LossyOutcome::Crushed {
+                    result: lossy,
+                    pending_ccr_writes,
+                },
+            ) => {
+                self.commit_ccr_writes(pending_ccr_writes);
+                lossy
+            }
             // No lossless render and the array isn't droppable → the
             // `skip:<reason>` passthrough (preserves pre-routing behavior).
             (None, LossyOutcome::Skip(passthrough)) => passthrough,
+        }
+    }
+
+    /// Replay deferred CCR writes captured under [`PersistMode::Collect`],
+    /// in capture order (granular chunks → row index → whole-blob — the
+    /// same eviction-friendly order `persist_dropped` writes directly).
+    /// Called by the routing layer EXACTLY when the lossy render ships;
+    /// a discarded candidate's writes are simply dropped, so the store
+    /// never carries entries no surfaced marker names (P0-4).
+    fn commit_ccr_writes(&self, pending: Vec<CcrWrite>) {
+        if pending.is_empty() {
+            return;
+        }
+        if let Some(store) = &self.ccr_store {
+            for write in &pending {
+                store.put(&write.key, &write.payload);
+            }
         }
     }
 
@@ -1072,14 +1183,15 @@ impl SmartCrusher {
     /// `skip:<reason>` passthrough) when the array is not safe to crush
     /// (the analyzer's `Skip` gate) — there is no DROP render in that
     /// case. Otherwise returns [`LossyOutcome::Crushed`] with the
-    /// row-dropped render. The store write + recovery pointer are emitted
-    /// exactly as before via [`SmartCrusher::persist_dropped`]: a chosen
-    /// lossy render is ALWAYS recoverable.
+    /// row-dropped render plus its deferred store writes: a chosen lossy
+    /// render is ALWAYS recoverable — the routing layer commits the
+    /// writes iff this render ships (P0-4).
     ///
     /// Factored out of `crush_array` so the routing layer can size this
     /// candidate against the lossless one before deciding which to ship.
-    /// Behavior is byte-identical to the pre-routing lossy path — only
-    /// the place it is *called from* changed.
+    /// The rendered bytes are byte-identical to the pre-routing lossy
+    /// path — only the place it is *called from* (and, since P0-4, the
+    /// store-write timing) changed.
     fn crush_array_lossy(
         &self,
         items: &[Value],
@@ -1090,10 +1202,12 @@ impl SmartCrusher {
         // (a better-suited lossless render — e.g. opaque-blob substitution
         // — exists for this array, so we must not hijack it into a drop).
         allow_skip_override: bool,
-        // When false (COR-28, mixed dict arm), the drop's hash + marker
-        // are computed as usual — routing stays byte-identical — but no
-        // store write happens. See `crush_array_inner` for the contract.
-        persist: bool,
+        // How the drop's store writes are handled (hash + markers are
+        // computed identically in every mode — routing stays
+        // byte-identical). `Collect` defers them into the returned
+        // outcome for commit-on-ship (P0-4); `Skip` (COR-28, mixed dict
+        // arm) never writes. See `crush_array_inner` for the contract.
+        persist_mode: PersistMode,
     ) -> LossyOutcome {
         // CCR-BACKED AGGRESSIVE BUDGET: when a CCR store is configured,
         // every dropped row is guaranteed recoverable (unconditional
@@ -1222,14 +1336,15 @@ impl SmartCrusher {
         // set — threaded through so only dropped rows get granular
         // chunks (COR-4: kept rows must never flood the bounded store).
         let dropped_indices = dropped_indices_from_kept(&plan.keep_indices, items.len());
-        let (ccr_hash, dropped_summary, row_index_marker) =
-            match self.persist_dropped(items, dropped_count, &dropped_indices, persist) {
+        let (ccr_hash, dropped_summary, row_index_marker, pending_ccr_writes) =
+            match self.persist_dropped(items, dropped_count, &dropped_indices, persist_mode) {
                 Some(persisted) => (
                     Some(persisted.hash),
                     persisted.marker,
                     persisted.row_index_marker,
+                    persisted.pending_writes,
                 ),
-                None => (None, String::new(), None),
+                None => (None, String::new(), None, Vec::new()),
             };
 
         // ── Survivor compaction: lossless re-encoding of the kept rows ──
@@ -1268,32 +1383,38 @@ impl SmartCrusher {
                         let kind = compaction_kind_str(&c);
                         let rendered_with_sentinel =
                             format!("{}\n{sentinel_line}", rendered.trim_end_matches('\n'));
-                        return LossyOutcome::Crushed(CrushArrayResult {
-                            items: result,
-                            strategy_info: format!(
-                                "{}+compact:{kind}",
-                                analysis.recommended_strategy.as_str()
-                            ),
-                            ccr_hash,
-                            dropped_summary,
-                            compacted: Some(rendered_with_sentinel),
-                            compaction_kind: Some(kind),
-                            row_index_marker,
-                        });
+                        return LossyOutcome::Crushed {
+                            result: CrushArrayResult {
+                                items: result,
+                                strategy_info: format!(
+                                    "{}+compact:{kind}",
+                                    analysis.recommended_strategy.as_str()
+                                ),
+                                ccr_hash,
+                                dropped_summary,
+                                compacted: Some(rendered_with_sentinel),
+                                compaction_kind: Some(kind),
+                                row_index_marker,
+                            },
+                            pending_ccr_writes,
+                        };
                     }
                 }
             }
         }
 
-        LossyOutcome::Crushed(CrushArrayResult {
-            items: result,
-            strategy_info: analysis.recommended_strategy.as_str().to_string(),
-            ccr_hash,
-            dropped_summary,
-            compacted: None,
-            compaction_kind: None,
-            row_index_marker,
-        })
+        LossyOutcome::Crushed {
+            result: CrushArrayResult {
+                items: result,
+                strategy_info: analysis.recommended_strategy.as_str().to_string(),
+                ccr_hash,
+                dropped_summary,
+                compacted: None,
+                compaction_kind: None,
+                row_index_marker,
+            },
+            pending_ccr_writes,
+        }
     }
 
     /// Count the tokens of the FINAL model-visible string a
@@ -1362,23 +1483,48 @@ impl SmartCrusher {
     /// summaries), in which case the index simply covers every original
     /// row not visible verbatim — a safe superset for recovery.
     ///
-    /// `persist = false` (COR-28, via `crush_array_inner`) computes the
-    /// hash, marker and granular-index decision EXACTLY as above — the
-    /// returned [`DroppedPersist`] is byte-identical, so token routing
-    /// built on it cannot shift — but performs NO store write: the
+    /// `mode` selects what happens to the store writes ([`PersistMode`]):
+    /// `Commit` writes through immediately (always-ships paths);
+    /// `Collect` (P0-4, the dict arbitration path) defers them into
+    /// [`DroppedPersist::pending_writes`] for commit-on-ship; `Skip`
+    /// (COR-28, via `crush_array_inner`) performs NO store write — the
     /// caller surfaces no marker naming this hash, so any write would be
-    /// an orphan entry burning COR-4-bounded capacity. The COR-4
-    /// store-flood gate still decides `row_index_marker` the same way in
-    /// both modes.
+    /// an orphan entry burning COR-4-bounded capacity. In EVERY mode the
+    /// hash, marker and granular-index decision are computed EXACTLY the
+    /// same — the returned markers are byte-identical, so token routing
+    /// built on them cannot shift. The COR-4 store-flood gate still
+    /// decides `row_index_marker` the same way in all modes.
     fn persist_dropped(
         &self,
         original_items: &[Value],
         dropped_count: usize,
         dropped_indices: &[usize],
-        persist: bool,
+        mode: PersistMode,
     ) -> Option<DroppedPersist> {
         if dropped_count == 0 {
             return None;
+        }
+
+        // Deferred-write sink (populated only under `Collect`). Routing a
+        // write: through to the store (Commit), into the sink (Collect),
+        // or nowhere (Skip). Total over `PersistMode` so a new mode is a
+        // compile error here, not a silent write-nothing.
+        let mut pending_writes: Vec<CcrWrite> = Vec::new();
+        fn route_write(
+            mode: PersistMode,
+            store: &Arc<dyn CcrStore>,
+            pending: &mut Vec<CcrWrite>,
+            key: &str,
+            payload: String,
+        ) {
+            match mode {
+                PersistMode::Commit => store.put(key, &payload),
+                PersistMode::Collect => pending.push(CcrWrite {
+                    key: key.to_string(),
+                    payload,
+                }),
+                PersistMode::Skip => {}
+            }
         }
 
         // Serialize the original array exactly ONCE. The hash is taken
@@ -1446,12 +1592,12 @@ impl SmartCrusher {
                     .iter()
                     .filter_map(|&idx| original_items.get(idx))
                     .collect();
-                if persist {
+                if !matches!(mode, PersistMode::Skip) {
                     let mut row_hashes: Vec<String> = Vec::with_capacity(chunk_rows.len());
                     for item in &chunk_rows {
                         let row_canonical = canonical_array_json(std::slice::from_ref(*item));
                         let row_hash = hash_canonical(&row_canonical);
-                        store.put(&row_hash, &row_canonical);
+                        route_write(mode, store, &mut pending_writes, &row_hash, row_canonical);
                         row_hashes.push(row_hash);
                     }
                     // Row index: `{hash}#rows` → ["rowhash0", "rowhash1", ...].
@@ -1462,7 +1608,7 @@ impl SmartCrusher {
                     // `dropped_count` chunks over an every-original-row index).
                     let index_key = format!("{hash}#rows");
                     let index_payload = serde_json::to_string(&row_hashes).unwrap_or_default();
-                    store.put(&index_key, &index_payload);
+                    route_write(mode, store, &mut pending_writes, &index_key, index_payload);
                 }
                 row_index_marker = Some(marker_for_row_index(&hash, chunk_rows.len()));
             }
@@ -1470,12 +1616,11 @@ impl SmartCrusher {
 
         // ── Whole-blob persist (1A) — written LAST ──
         // The byte-stable recovery key the invariant + parity depend on.
-        // Unconditional on every persisting path; skipped ONLY for the
-        // surfaced-nowhere mixed-arm inner call (COR-28, persist=false).
-        if persist {
-            if let Some(store) = &self.ccr_store {
-                store.put(&hash, &canonical);
-            }
+        // Unconditional on every persisting path (immediate under Commit,
+        // deferred-to-ship under Collect); skipped ONLY for the
+        // surfaced-nowhere mixed-arm inner call (COR-28, Skip).
+        if let Some(store) = &self.ccr_store {
+            route_write(mode, store, &mut pending_writes, &hash, canonical);
         }
 
         // ── Unconditional recovery pointer (Defect 1) ──
@@ -1502,6 +1647,7 @@ impl SmartCrusher {
             hash,
             marker,
             row_index_marker,
+            pending_writes,
         })
     }
 
@@ -1534,8 +1680,15 @@ impl SmartCrusher {
     ) -> Option<Value> {
         let dropped_count = original_items.len().saturating_sub(kept_items.len());
         let dropped_indices = dropped_indices_by_multiset_diff(original_items, kept_items);
-        let persisted =
-            self.persist_dropped(original_items, dropped_count, &dropped_indices, true)?;
+        // Commit mode: the non-dict paths never arbitrate against a
+        // lossless candidate — this render always ships, so the write
+        // happens now (no deferral needed).
+        let persisted = self.persist_dropped(
+            original_items,
+            dropped_count,
+            &dropped_indices,
+            PersistMode::Commit,
+        )?;
         dropped.push(DroppedRef {
             hash: persisted.hash.clone(),
             row_index_marker: persisted.row_index_marker.clone(),
@@ -3459,7 +3612,7 @@ mod tests {
         let (c, _store) = crusher_with_store();
         let items: Vec<Value> = (0..30).map(|i| json!({"id": i})).collect();
         let persisted = c
-            .persist_dropped(&items, 5, &[25, 26, 27, 28, 29], true)
+            .persist_dropped(&items, 5, &[25, 26, 27, 28, 29], PersistMode::Commit)
             .expect("dropped_count>0 → Some");
         let expected = hash_canonical(&canonical_array_json(&items));
         assert_eq!(persisted.hash, expected, "hash scheme must be unchanged");
@@ -3468,7 +3621,9 @@ mod tests {
             .marker
             .contains(&format!("<<ccr:{expected} 5_rows_offloaded>>")));
         // Zero dropped → None (no hash, no marker, no store write).
-        assert!(c.persist_dropped(&items, 0, &[], true).is_none());
+        assert!(c
+            .persist_dropped(&items, 0, &[], PersistMode::Commit)
+            .is_none());
     }
 
     // ---------- COR-4 / COR-20: dropped-rows-only granular persist ----------
@@ -3486,7 +3641,7 @@ mod tests {
         // Keep rows 0..7, drop rows 7, 8, 9.
         let dropped_indices = [7usize, 8, 9];
         let persisted = c
-            .persist_dropped(&items, 3, &dropped_indices, true)
+            .persist_dropped(&items, 3, &dropped_indices, PersistMode::Commit)
             .expect("drop → Some");
 
         // Marker advertises exactly the chunks the index holds (COR-20).
@@ -3543,7 +3698,12 @@ mod tests {
         let items: Vec<Value> = (0..n_over).map(|i| json!({"id": i})).collect();
         let dropped_indices: Vec<usize> = (0..=budget).collect(); // budget+1 dropped
         let persisted = c
-            .persist_dropped(&items, dropped_indices.len(), &dropped_indices, true)
+            .persist_dropped(
+                &items,
+                dropped_indices.len(),
+                &dropped_indices,
+                PersistMode::Commit,
+            )
             .expect("drop → Some");
         assert!(
             persisted.row_index_marker.is_none(),
@@ -3561,7 +3721,7 @@ mod tests {
         let (c2, store2) = crusher_with_store();
         let at_budget: Vec<usize> = (0..budget).collect();
         let persisted2 = c2
-            .persist_dropped(&items, at_budget.len(), &at_budget, true)
+            .persist_dropped(&items, at_budget.len(), &at_budget, PersistMode::Commit)
             .expect("drop → Some");
         assert!(
             persisted2.row_index_marker.is_some(),
@@ -3576,32 +3736,104 @@ mod tests {
 
     #[test]
     fn persist_dropped_skip_mode_is_marker_identical_and_writes_nothing() {
-        // COR-28 persist-skip contract: `persist = false` must return a
+        // COR-28 persist-skip contract: `PersistMode::Skip` must return a
         // BYTE-IDENTICAL DroppedPersist (hash, whole-blob marker, and
         // granular row-index marker — the inputs to MinTokens routing)
-        // while writing NOTHING to the store. If the marker text could
-        // shift, the mixed arm's inner routing would shift with it and
-        // the skip would no longer be behavior-invisible.
+        // while writing NOTHING to the store (and deferring nothing —
+        // there is no later commit for the mixed arm). If the marker text
+        // could shift, the mixed arm's inner routing would shift with it
+        // and the skip would no longer be behavior-invisible.
         let (c, store) = crusher_with_store();
         let items: Vec<Value> = (0..10).map(|i| json!({"id": i})).collect();
         let dropped_indices = [7usize, 8, 9];
 
         let skipped = c
-            .persist_dropped(&items, 3, &dropped_indices, false)
+            .persist_dropped(&items, 3, &dropped_indices, PersistMode::Skip)
             .expect("drop → Some regardless of persist mode");
-        assert_eq!(store.len(), 0, "persist=false must write nothing");
+        assert_eq!(store.len(), 0, "Skip mode must write nothing");
+        assert!(
+            skipped.pending_writes.is_empty(),
+            "Skip mode must defer nothing either (no later commit exists)"
+        );
 
         let persisted = c
-            .persist_dropped(&items, 3, &dropped_indices, true)
+            .persist_dropped(&items, 3, &dropped_indices, PersistMode::Commit)
             .expect("drop → Some");
         assert_eq!(skipped.hash, persisted.hash);
         assert_eq!(skipped.marker, persisted.marker);
         assert_eq!(skipped.row_index_marker, persisted.row_index_marker);
+        assert!(
+            persisted.pending_writes.is_empty(),
+            "Commit mode writes through — nothing rides back deferred"
+        );
         assert_eq!(
             store.len(),
             5,
-            "persist=true still writes 3 chunks + index + whole-blob"
+            "Commit mode still writes 3 chunks + index + whole-blob"
         );
+    }
+
+    #[test]
+    fn persist_dropped_collect_mode_defers_writes_and_replay_matches_commit() {
+        // P0-4 Collect contract: hash + markers byte-identical to Commit
+        // (routing built on them cannot shift), NOTHING written until the
+        // caller commits — and replaying the deferred writes reproduces
+        // Commit-mode store state exactly (same keys, same payloads, same
+        // chunks → index → whole-blob order).
+        let (c, store) = crusher_with_store();
+        let items: Vec<Value> = (0..10).map(|i| json!({"id": i})).collect();
+        let dropped_indices = [7usize, 8, 9];
+
+        let collected = c
+            .persist_dropped(&items, 3, &dropped_indices, PersistMode::Collect)
+            .expect("drop → Some");
+        assert_eq!(store.len(), 0, "Collect must write nothing before commit");
+        assert_eq!(
+            collected.pending_writes.len(),
+            5,
+            "3 chunks + index + whole-blob ride back deferred"
+        );
+
+        let (c2, store2) = crusher_with_store();
+        let committed = c2
+            .persist_dropped(&items, 3, &dropped_indices, PersistMode::Commit)
+            .expect("drop → Some");
+        assert_eq!(collected.hash, committed.hash, "hash is mode-independent");
+        assert_eq!(collected.marker, committed.marker);
+        assert_eq!(collected.row_index_marker, committed.row_index_marker);
+
+        // The whole-blob write is LAST (bounded-store eviction rationale
+        // — redundant chunks shed before the recovery backstop).
+        assert_eq!(
+            collected.pending_writes.last().map(|w| w.key.as_str()),
+            Some(committed.hash.as_str()),
+            "whole-blob must be the final deferred write"
+        );
+
+        // Replaying the deferred writes reproduces Commit-mode state.
+        c.commit_ccr_writes(collected.pending_writes);
+        assert_eq!(store.len(), store2.len());
+        assert_eq!(store.len(), 5, "3 chunks + index + whole-blob exactly");
+        assert_eq!(
+            store.get(&committed.hash),
+            store2.get(&committed.hash),
+            "whole-blob payload identical across modes"
+        );
+        let index_key = format!("{}#rows", committed.hash);
+        assert_eq!(
+            store.get(&index_key),
+            store2.get(&index_key),
+            "row index identical across modes"
+        );
+        let row_hashes: Vec<String> =
+            serde_json::from_str(&store.get(&index_key).expect("index present")).unwrap();
+        for rh in &row_hashes {
+            assert_eq!(
+                store.get(rh),
+                store2.get(rh),
+                "per-row chunk {rh} identical across modes"
+            );
+        }
     }
 
     #[test]
@@ -3852,6 +4084,146 @@ mod tests {
             min_tokens_count <= lossless_tokens,
             "MinTokens must never ship more tokens than lossless \
              (chosen={min_tokens_count}, lossless={lossless_tokens})"
+        );
+    }
+
+    // ---------- P0-4: no orphan store-writes for a non-shipped lossy candidate ----------
+    //
+    // The defect these pin: `crush_array_inner` builds the lossy candidate
+    // for MinTokens/LosslessFirst arbitration, and `persist_dropped` used
+    // to COMMIT its store writes (whole-blob + granular chunks + row
+    // index) at build time — before the routing decision. When the
+    // LOSSLESS render won and shipped, those writes stayed behind as
+    // orphans: entries no surfaced marker names, burning COR-4-bounded
+    // capacity and inflating store stats. The fix defers the candidate's
+    // writes (collect-only) and commits them exactly when the lossy
+    // render ships — persistence for SHIPPED lossy output stays
+    // unconditional (the recovery invariant is timing-shifted, never
+    // weakened), and hashes/markers are computed identically either way.
+
+    #[test]
+    fn lossless_first_win_writes_nothing_for_discarded_lossy_candidate() {
+        use crate::ccr::InMemoryCcrStore;
+        use crate::transforms::smart_crusher::SmartCrusherBuilder;
+        use std::sync::Arc;
+
+        let store = Arc::new(InMemoryCcrStore::new());
+        let store_dyn: Arc<dyn CcrStore> = Arc::clone(&store) as Arc<dyn CcrStore>;
+        let cfg = SmartCrusherConfig {
+            routing_policy: RoutingPolicy::LosslessFirst,
+            ..SmartCrusherConfig::default()
+        };
+        let c = SmartCrusherBuilder::new(cfg)
+            .with_default_oss_setup()
+            .with_default_compaction()
+            .with_ccr_store(store_dyn)
+            .build();
+        // Low-uniqueness (analyzer willing to crush → a real lossy DROP
+        // candidate is built) AND cleanly tabular (lossless clears the
+        // 0.30 gate) → both candidates exist; LosslessFirst ships lossless.
+        let items: Vec<Value> = (0..50).map(|i| json!({"status": "ok", "seq": i})).collect();
+
+        let result = c.crush_array(&items, "", 1.0);
+
+        // Precondition (asserted, not if-guarded): lossless shipped.
+        assert!(
+            result.compacted.is_some() && result.ccr_hash.is_none(),
+            "precondition: lossless render must ship under LosslessFirst, got {}",
+            result.strategy_info
+        );
+        assert_eq!(result.items.len(), items.len(), "lossless drops nothing");
+        // The discarded lossy candidate must leave NO entries behind.
+        assert_eq!(
+            store.len(),
+            0,
+            "discarded lossy candidate must not commit store writes (orphan entries)"
+        );
+    }
+
+    #[test]
+    fn min_tokens_lossless_win_writes_nothing_for_discarded_lossy_candidate() {
+        use crate::ccr::InMemoryCcrStore;
+        use crate::transforms::smart_crusher::SmartCrusherBuilder;
+        use std::sync::Arc;
+
+        let store = Arc::new(InMemoryCcrStore::new());
+        let store_dyn: Arc<dyn CcrStore> = Arc::clone(&store) as Arc<dyn CcrStore>;
+        // Default policy IS MinTokens; spelled out because the test is
+        // specifically about the MinTokens arbitration arm.
+        let cfg = SmartCrusherConfig {
+            routing_policy: RoutingPolicy::MinTokens,
+            ..SmartCrusherConfig::default()
+        };
+        let c = SmartCrusherBuilder::new(cfg)
+            .with_default_oss_setup()
+            .with_default_compaction()
+            .with_ccr_store(store_dyn)
+            .build();
+        // The pinned MinTokens lossless-win shape (see
+        // `min_tokens_ships_lossless_when_it_is_fewer_tokens`): identical
+        // low-cardinality rows dedup so hard that the lossless table is
+        // ≤ tokens vs the drop render — ties go to lossless. The lossy
+        // candidate is still BUILT for arbitration; it must not write.
+        let items: Vec<Value> = (0..12).map(|_| json!({"a": 1, "b": 2})).collect();
+
+        let result = c.crush_array(&items, "", 1.0);
+
+        assert!(
+            result.compacted.is_some() && result.ccr_hash.is_none(),
+            "precondition: lossless render must win under MinTokens here, got {}",
+            result.strategy_info
+        );
+        assert_eq!(
+            store.len(),
+            0,
+            "MinTokens lossless win must leave no orphan lossy store writes"
+        );
+    }
+
+    #[test]
+    fn min_tokens_lossy_win_still_commits_store_writes_unconditionally() {
+        // The P0-4 deferral must NOT weaken the recovery invariant: when
+        // the lossy render SHIPS out of the arbitration arm (both
+        // candidates existed, lossy strictly fewer tokens), its store
+        // writes are committed exactly as before — whole-blob under the
+        // surfaced hash, plus the granular row index when in budget. Only
+        // the write TIMING moved (build → ship decision).
+        let (min_tokens, _lossless_first, store) = min_tokens_and_lossless_first();
+        let items: Vec<Value> = (0..90).map(log_shaped_row).collect();
+
+        let r = min_tokens.crush_array(&items, "", 1.0);
+
+        let h = r
+            .ccr_hash
+            .as_ref()
+            .expect("lossy is the pinned winner for logs-shaped data");
+        let dropped = items.len() - r.items.len();
+        assert!(dropped > 0, "lossy must actually drop rows");
+        // Whole-blob committed under the surfaced hash.
+        assert_eq!(
+            store.get(h).as_deref(),
+            Some(canonical_array_json(&items).as_str()),
+            "shipped lossy render must persist the whole-blob (unconditional)"
+        );
+        // Granular index + one chunk per dropped row committed too (this
+        // drop is well inside the capacity/4 budget).
+        let idx_marker = r
+            .row_index_marker
+            .as_ref()
+            .expect("store-backed in-budget drop advertises the row index");
+        let index_raw = store
+            .get(&format!("{h}#rows"))
+            .expect("row index must be committed when the lossy render ships");
+        let row_hashes: Vec<String> = serde_json::from_str(&index_raw).unwrap();
+        assert_eq!(row_hashes.len(), dropped, "one chunk per dropped row");
+        assert!(
+            idx_marker.contains(&format!("#rows {}_chunks>>", row_hashes.len())),
+            "marker advertises exactly the committed chunk count, got: {idx_marker}"
+        );
+        assert_eq!(
+            store.len(),
+            dropped + 2,
+            "chunks + index + whole-blob — nothing more, nothing less"
         );
     }
 

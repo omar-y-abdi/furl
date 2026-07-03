@@ -5,7 +5,7 @@ tool outputs, the original data is cached here for on-demand retrieval.
 
 Key insight from research: REVERSIBLE compression beats irreversible compression.
 If the LLM needs data that was compressed away, it can retrieve it — byte-exact,
-but only within the in-memory window (<=1000 entries, <=300s TTL). After eviction
+but only within the in-memory window (<=1000 entries, <=1800s TTL). After eviction
 or expiry the entry is gone and retrieval is a loud, cause-honest miss (never a
 silent None). See CCR-RETENTION.md for the delivered guarantee vs. the open
 durable-retention epic.
@@ -58,7 +58,13 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_CCR_TTL_SECONDS = 300
+# Session-scale default (Engine P0-3): agentic sessions routinely outlive
+# 5 minutes, and an entry that expires mid-session silently converts
+# "lossless + retrieval" into lossy. 1800 s (30 min) matches the Rust
+# store's `DEFAULT_TTL` (crates/furl-core/src/ccr/mod.rs) — the two stores
+# back the same markers, so their defaults must agree. Override via
+# FURL_CCR_TTL_SECONDS (validated in `_get_env_default_ttl_seconds`).
+DEFAULT_CCR_TTL_SECONDS = 1800
 CCR_TTL_SECONDS_ENV = "FURL_CCR_TTL_SECONDS"
 
 # Minimum length for a caller-supplied ``explicit_hash``. This is the LOOSE
@@ -245,7 +251,7 @@ class CompressionStore:
     Design principles:
     - Zero external dependencies (pure Python)
     - Thread-safe for concurrent access
-    - TTL-based expiration (default 300 seconds, env-configurable)
+    - TTL-based expiration (default 1800 seconds, env-configurable)
     - FIFO-by-creation eviction when capacity is reached (the oldest
       ``created_at`` is evicted first via a min-heap, NOT least-recently-used)
     - Built-in BM25 search for filtering
@@ -253,7 +259,7 @@ class CompressionStore:
     Recovery scope (read this before relying on retrieval):
         Stored content is recoverable byte-exact only WITHIN the in-memory
         window: at most ``max_entries`` live entries (default 1000) and at most
-        ``default_ttl`` seconds old (default 300s). The store is single-tier —
+        ``default_ttl`` seconds old (default 1800s). The store is single-tier —
         on capacity or TTL eviction the entry's payload is deleted outright
         (there is no spill to a durable tier), so a later ``retrieve()`` of an
         evicted/expired hash returns ``None``. That miss is never silent: the
@@ -1214,7 +1220,7 @@ def get_compression_store(
     Args:
         max_entries: Maximum entries (only used on first call for global store).
         default_ttl: Default TTL (only used on first call for global store).
-            When omitted, FURL_CCR_TTL_SECONDS overrides the 300-second default.
+            When omitted, FURL_CCR_TTL_SECONDS overrides the 1800-second default.
         backend: Custom storage backend (only used on first call for global store).
                  Defaults to InMemoryBackend if not provided; env backend used if backend is None.
 
