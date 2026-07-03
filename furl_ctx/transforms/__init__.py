@@ -38,6 +38,11 @@ if TYPE_CHECKING:
         SearchCompressorConfig,
     )
     from furl_ctx.transforms.smart_crusher import SmartCrusher, SmartCrusherConfig  # noqa: F401
+    from furl_ctx.transforms.text_crusher import (  # noqa: F401
+        TextCrusher,
+        TextCrusherConfig,
+        TextCrushResult,
+    )
 
 __all__ = [
     # Base
@@ -59,6 +64,9 @@ __all__ = [
     "DiffCompressor",
     "DiffCompressorConfig",
     "DiffCompressionResult",
+    "TextCrusher",
+    "TextCrusherConfig",
+    "TextCrushResult",
     # Content routing
     "ContentRouter",
     "ContentRouterConfig",
@@ -99,6 +107,9 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
         "furl_ctx.transforms.diff_compressor",
         "DiffCompressionResult",
     ),
+    "TextCrusher": ("furl_ctx.transforms.text_crusher", "TextCrusher"),
+    "TextCrusherConfig": ("furl_ctx.transforms.text_crusher", "TextCrusherConfig"),
+    "TextCrushResult": ("furl_ctx.transforms.text_crusher", "TextCrushResult"),
     # Content routing
     "ContentRouter": ("furl_ctx.transforms.content_router", "ContentRouter"),
     "ContentRouterConfig": ("furl_ctx.transforms.content_router", "ContentRouterConfig"),

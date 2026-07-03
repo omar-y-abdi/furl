@@ -3,8 +3,11 @@
 Owns the body of :meth:`ContentRouter._apply_strategy_to_content`: the
 per-strategy compressor dispatch (SMART_CRUSHER / SEARCH / LOG / DIFF /
 TEXT / PASSTHROUGH) and the no-savings fallback chain (SMART_CRUSHER -> LOG,
-then passthrough). Strategies with no compressor (TEXT — the ML text
-compressor was excised) resolve to passthrough, so the dispatch stays total.
+then passthrough). The TEXT arm dispatches to the deterministic
+TextCrusher (Engine P2-11 — the passthrough that replaced the excised ML
+text compressor is itself replaced); when the arm is gated off
+(``enable_text_crusher=False`` or ``lossless_only``) it resolves to
+passthrough, so the dispatch stays total.
 
 This is a TRUE leaf module: it imports nothing from ``content_router`` (so there
 is no import cycle) and never receives the router. Every dependency is injected
@@ -73,6 +76,7 @@ class StrategyDispatcher:
         get_search_compressor: _GetCompressor,
         get_log_compressor: _GetCompressor,
         get_diff_compressor: _GetCompressor,
+        get_text_crusher: _GetCompressor,
         token_counter: Callable[[str], int] | None = None,
     ) -> tuple[str, int, list[str]]:
         """Apply a compression strategy to content.
@@ -88,6 +92,7 @@ class StrategyDispatcher:
             get_search_compressor: Router getter for the SearchCompressor.
             get_log_compressor: Router getter for the LogCompressor.
             get_diff_compressor: Router getter for the DiffCompressor.
+            get_text_crusher: Router getter for the TextCrusher (P2-11).
             token_counter: Optional real token counter (COR-17). When set,
                 every token count in this dispatch — original, per-strategy
                 compressed, and the fallback-chain comparisons — is measured
@@ -183,15 +188,27 @@ class StrategyDispatcher:
                 decision_reason = "diff_compressor"
 
         elif strategy == CompressionStrategy.TEXT:
-            # Plain text has no compressor (the ML text compressor was
-            # excised; when it was merely not installed this path already
-            # passed through unchanged — that behavior is preserved).
-            # Large uncompressible text still gets the router's reversible
-            # CCR offload downstream.
-            compressed = content
-            compressed_tokens = original_tokens
-            compressor_name = "Passthrough"
-            decision_reason = "text_passthrough"
+            # Deterministic extractive prose compression (Engine P2-11).
+            # Gated like the other line-dropping compressors: never under
+            # `lossless_only` (the crusher drops segments). Below its size
+            # floors (600 chars / 15 segments) the crusher returns the
+            # original bytes, which the no-savings fallback below turns
+            # into an honest passthrough chain entry. When the arm is
+            # gated off, `compressed` stays None and the generic
+            # passthrough fallback at the bottom fires (same shape as
+            # `enable_search_compressor=False`) — large uncompressible
+            # text still gets the router's reversible CCR offload
+            # downstream.
+            if self.config.enable_text_crusher and not self.config.lossless_only:
+                compressor = get_text_crusher()
+                if compressor:
+                    compressor_name = type(compressor).__name__
+                    result = compressor.compress(content, context=context, bias=bias)
+                    compressed, compressed_tokens = (
+                        result.compressed,
+                        count(result.compressed),
+                    )
+                    decision_reason = "text_crusher"
 
         elif strategy == CompressionStrategy.PASSTHROUGH:
             compressed = content

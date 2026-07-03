@@ -91,11 +91,18 @@ class TestCompressFailOpen:
 
     def test_compress_passes_set_x_trace_through_without_crash(self) -> None:
         """A tool output full of orphaned ``+++`` lines must ride through
-        ``compress()`` untouched: routed PlainText → passthrough. Pre-fix
-        this tripped the outermost BaseException fail-open — the whole
-        request reverted and ``result.error`` carried the panic text; the
-        assertion on ``result.error is None`` pins the difference between
-        "survived via fail-open" and "processed normally"."""
+        ``compress()`` normally. Pre-fix this tripped the outermost
+        BaseException fail-open — the whole request reverted and
+        ``result.error`` carried the panic text; the assertion on
+        ``result.error is None`` pins the difference between "survived
+        via fail-open" and "processed normally".
+
+        Routing note (P2-11): the trace detects as PlainText, which used
+        to mean byte-identical passthrough. The TEXT route now dispatches
+        to the deterministic TextCrusher, so "processed normally" means
+        either untouched (below floors) or crushed WITH a resolvable
+        retrieval marker backing the byte-exact original — never a
+        fail-open revert and never an unmarked rewrite."""
         trace = _set_x_trace()
         messages = [
             {"role": "user", "content": "run the deploy and show the trace"},
@@ -108,6 +115,18 @@ class TestCompressFailOpen:
             "detect-bridge panic reached the fail-open boundary instead of "
             f"being contained at is_diff: {result.error!r}"
         )
-        assert result.messages[1]["content"] == trace, (
-            "set -x trace did not pass through byte-identically"
-        )
+        shipped = result.messages[1]["content"]
+        if shipped != trace:
+            # TextCrusher took the TEXT route: the rewrite must carry a
+            # retrieval marker whose hash resolves to the exact original.
+            import re
+
+            from furl_ctx.cache.compression_store import get_compression_store
+
+            match = re.search(r"Retrieve more: hash=([0-9a-f]{24})\]", shipped)
+            assert match is not None, (
+                f"set -x trace was rewritten without a retrieval marker: {shipped[-200:]!r}"
+            )
+            entry = get_compression_store().retrieve(match.group(1))
+            assert entry is not None, "marker hash does not resolve in the store"
+            assert entry.original_content == trace, "recovery is not byte-exact"

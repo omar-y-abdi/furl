@@ -30,6 +30,7 @@ from furl_ctx.cache.compression_store import (
 from furl_ctx.transforms.diff_compressor import DiffCompressor, DiffCompressorConfig
 from furl_ctx.transforms.log_compressor import LogCompressor, LogCompressorConfig
 from furl_ctx.transforms.search_compressor import SearchCompressor, SearchCompressorConfig
+from furl_ctx.transforms.text_crusher import TextCrusher, TextCrusherConfig
 
 
 class _FailingStore:
@@ -108,10 +109,31 @@ def _search_case() -> tuple[str, Callable[[], Any]]:
     return content, lambda: c.compress(content)
 
 
+def _text_case() -> tuple[str, Callable[[], Any]]:
+    # Lexically varied prose (counter-only variation would collapse in
+    # the crusher's digit-masked dedup tier and shrink the crush).
+    subjects = ["The scheduler", "Our ingester", "The billing worker", "A daemon"]
+    verbs = ["processed", "archived", "replicated", "throttled", "validated"]
+    objects = ["customer records", "audit events", "payment batches", "trace spans"]
+    tails = [
+        "before the morning deadline without operator intervention",
+        "while the standby region absorbed the overflow traffic",
+        "although the retry queue kept growing steadily",
+    ]
+    sentences = [
+        f"{subjects[i % 4]} {verbs[(i * 2 + 1) % 5]} {objects[(i * 3 + 2) % 4]} {tails[i % 3]}."
+        for i in range(40)
+    ]
+    content = " ".join(sentences)
+    c = TextCrusher(config=TextCrusherConfig(enable_ccr=True))
+    return content, lambda: c.compress(content)
+
+
 _CASES: dict[str, Callable[[], tuple[str, Callable[[], Any]]]] = {
     "diff": _diff_case,
     "log": _log_case,
     "search": _search_case,
+    "text": _text_case,
 }
 
 

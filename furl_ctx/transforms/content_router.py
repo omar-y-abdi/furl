@@ -474,6 +474,7 @@ class ContentRouterConfig:
         enable_smart_crusher: Enable JSON array compression.
         enable_search_compressor: Enable search result compression.
         enable_log_compressor: Enable build/test log compression.
+        enable_text_crusher: Enable deterministic prose compression.
         mixed_content_threshold: Min distinct types to consider "mixed".
         min_section_tokens: Minimum tokens for a section to compress.
         fallback_strategy: Strategy when no compressor matches.
@@ -486,6 +487,13 @@ class ContentRouterConfig:
     enable_smart_crusher: bool = True
     enable_search_compressor: bool = True
     enable_log_compressor: bool = True
+    # TextCrusher (Engine P2-11): deterministic extractive prose
+    # compression for PLAIN_TEXT. Size floors live in the crusher
+    # itself (600 chars / 15 segments → passthrough); every crush is
+    # CCR-backed with a retrieval marker, and the compressor refuses
+    # unmarked drops (store-failure vetoes to passthrough). Gated off
+    # by `lossless_only` like the other line-dropping compressors.
+    enable_text_crusher: bool = True
 
     # Routing preferences
     mixed_content_threshold: int = 2  # Min types to consider mixed
@@ -1289,6 +1297,7 @@ class ContentRouter(Transform):
             get_search_compressor=self._get_search_compressor,
             get_log_compressor=self._get_log_compressor,
             get_diff_compressor=self._get_diff_compressor,
+            get_text_crusher=self._get_text_crusher,
             token_counter=token_counter,
         )
 
@@ -1362,6 +1371,13 @@ class ContentRouter(Transform):
         Thin delegator to :meth:`CompressorRegistry.get_diff_compressor`.
         """
         return self._registry.get_diff_compressor()
+
+    def _get_text_crusher(self) -> Any:
+        """Get TextCrusher (lazy load).
+
+        Thin delegator to :meth:`CompressorRegistry.get_text_crusher`.
+        """
+        return self._registry.get_text_crusher()
 
     # Transform interface
 

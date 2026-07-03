@@ -62,6 +62,7 @@ def _apply_dispatch(dispatcher, content, strategy, *, crusher=None, token_counte
         get_search_compressor=lambda: None,
         get_log_compressor=lambda: None,
         get_diff_compressor=lambda: None,
+        get_text_crusher=lambda: None,
         token_counter=token_counter,
     )
 

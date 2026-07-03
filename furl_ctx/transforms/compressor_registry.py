@@ -1,8 +1,9 @@
 """Lazy compressor registry for the content router.
 
-Owns the four SELF-CONTAINED lazy compressor factories that the
+Owns the five SELF-CONTAINED lazy compressor factories that the
 :class:`~furl_ctx.transforms.content_router.ContentRouter` dispatches to:
-SmartCrusher, SearchCompressor, LogCompressor, and DiffCompressor.
+SmartCrusher, SearchCompressor, LogCompressor, DiffCompressor, and
+TextCrusher.
 
 Each factory is a plain lazy-init-and-cache: it reads only from the router's
 ``ContentRouterConfig`` and memoizes the constructed compressor in a private
@@ -23,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 
 class CompressorRegistry:
-    """Lazy-init + cache for the four self-contained compressors.
+    """Lazy-init + cache for the five self-contained compressors.
 
     Construct with the router's :class:`ContentRouterConfig`; each ``get_*``
     method lazy-imports and instantiates its compressor on first call and
@@ -38,6 +39,7 @@ class CompressorRegistry:
         self._search_compressor: Any = None
         self._log_compressor: Any = None
         self._diff_compressor: Any = None
+        self._text_crusher: Any = None
 
     def get_smart_crusher(self) -> Any:
         """Get SmartCrusher (lazy load) with CCR config."""
@@ -100,3 +102,16 @@ class CompressorRegistry:
 
             self._diff_compressor = DiffCompressor()
         return self._diff_compressor
+
+    def get_text_crusher(self) -> Any:
+        """Get TextCrusher (lazy load). Rust-only (Engine P2-11) — the
+        wheel (`furl_ctx._core`) is a hard import. Size floors and the
+        CCR-or-passthrough discipline live in the compressor itself;
+        `enable_text_crusher` / `lossless_only` gating happens in the
+        dispatcher, matching the search/log arms.
+        """
+        if self._text_crusher is None:
+            from .text_crusher import TextCrusher
+
+            self._text_crusher = TextCrusher()
+        return self._text_crusher

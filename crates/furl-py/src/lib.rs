@@ -26,6 +26,10 @@ use furl_core::transforms::smart_crusher::{
     CrushResult as RustCrushResult, RoutingPolicy as RustRoutingPolicy,
     SmartCrusher as RustSmartCrusher, SmartCrusherConfig as RustSmartCrusherConfig,
 };
+use furl_core::transforms::tag_protector::{
+    is_known_html_tag as rust_is_known_html_tag, known_html_tag_names as rust_known_html_tag_names,
+    protect_tags as rust_protect_tags, restore_tags as rust_restore_tags,
+};
 use furl_core::transforms::{
     detect as rust_detect_chain, DetectionResult as RustDetectionResult, DiffCompressionResult,
     DiffCompressor, DiffCompressorConfig, DiffCompressorStats,
@@ -34,6 +38,8 @@ use furl_core::transforms::{
     LogFormat as RustLogFormat, LogLevel as RustLogLevel,
     SearchCompressionResult as RustSearchResult, SearchCompressor as RustSearchCompressor,
     SearchCompressorConfig as RustSearchConfig, SearchCompressorStats as RustSearchStats,
+    TextCrushResult as RustTextCrushResult, TextCrusher as RustTextCrusher,
+    TextCrusherConfig as RustTextCrusherConfig, TextCrusherStats as RustTextCrusherStats,
 };
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -1630,6 +1636,253 @@ const _: fn() = || {
     let _ = RustLogLevel::Unknown;
 };
 
+// ─── text_crusher bridge (Engine P2-11) ───────────────────────────────
+//
+// Mirrors `furl_ctx.transforms.text_crusher.TextCrusher`. Same CCR
+// pattern as the log/search bridges: Rust emits a `cache_key` after
+// backing the crush in a per-call in-memory store; the Python shim
+// re-persists the original into the production `CompressionStore` and
+// VETOES the compression (serves the original) if that write fails —
+// the marker never ships dangling.
+
+#[pyclass(name = "TextCrusherConfig", module = "furl_ctx._core")]
+#[derive(Clone)]
+struct PyTextCrusherConfig {
+    inner: RustTextCrusherConfig,
+}
+
+#[pymethods]
+impl PyTextCrusherConfig {
+    #[new]
+    #[pyo3(signature = (
+        target_ratio = 0.35,
+        min_chars = 600,
+        min_segments = 15,
+        min_kept_segments = 5,
+        always_keep_first = 2,
+        always_keep_last = 2,
+        shingle_size = 4,
+        dedup_threshold = 0.9,
+        max_pairwise_dedup_segments = 2000,
+        enable_ccr = true,
+        max_shippable_ratio = 0.9,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        target_ratio: f64,
+        min_chars: usize,
+        min_segments: usize,
+        min_kept_segments: usize,
+        always_keep_first: usize,
+        always_keep_last: usize,
+        shingle_size: usize,
+        dedup_threshold: f64,
+        max_pairwise_dedup_segments: usize,
+        enable_ccr: bool,
+        max_shippable_ratio: f64,
+    ) -> Self {
+        Self {
+            inner: RustTextCrusherConfig {
+                target_ratio,
+                min_chars,
+                min_segments,
+                min_kept_segments,
+                always_keep_first,
+                always_keep_last,
+                shingle_size,
+                dedup_threshold,
+                max_pairwise_dedup_segments,
+                enable_ccr,
+                max_shippable_ratio,
+            },
+        }
+    }
+}
+
+#[pyclass(name = "TextCrushResult", module = "furl_ctx._core")]
+struct PyTextCrushResult {
+    inner: RustTextCrushResult,
+    stats: RustTextCrusherStats,
+}
+
+#[pymethods]
+impl PyTextCrushResult {
+    #[getter]
+    fn compressed(&self) -> &str {
+        &self.inner.compressed
+    }
+    #[getter]
+    fn original(&self) -> &str {
+        &self.inner.original
+    }
+    #[getter]
+    fn original_segment_count(&self) -> usize {
+        self.inner.original_segment_count
+    }
+    #[getter]
+    fn compressed_segment_count(&self) -> usize {
+        self.inner.compressed_segment_count
+    }
+    #[getter]
+    fn compression_ratio(&self) -> f64 {
+        self.inner.compression_ratio
+    }
+    #[getter]
+    fn cache_key(&self) -> Option<&str> {
+        self.inner.cache_key.as_deref()
+    }
+    // Sidecar diagnostics — same shape every Rust transform uses.
+    #[getter]
+    fn segments_total(&self) -> usize {
+        self.stats.segments_total
+    }
+    #[getter]
+    fn segments_kept(&self) -> usize {
+        self.stats.segments_kept
+    }
+    #[getter]
+    fn segments_dropped_by_dedup(&self) -> usize {
+        self.stats.segments_dropped_by_dedup
+    }
+    #[getter]
+    fn segments_dropped_by_budget(&self) -> usize {
+        self.stats.segments_dropped_by_budget
+    }
+    #[getter]
+    fn protected_tag_blocks(&self) -> usize {
+        self.stats.protected_tag_blocks
+    }
+    #[getter]
+    fn mandatory_keeps(&self) -> usize {
+        self.stats.mandatory_keeps
+    }
+    #[getter]
+    fn ccr_emitted(&self) -> bool {
+        self.stats.ccr_emitted
+    }
+    #[getter]
+    fn ccr_skip_reason(&self) -> Option<&str> {
+        self.stats.ccr_skip_reason
+    }
+    #[getter]
+    fn passthrough_reason(&self) -> Option<&str> {
+        self.stats.passthrough_reason
+    }
+}
+
+#[pyclass(name = "TextCrusher", module = "furl_ctx._core")]
+struct PyTextCrusher {
+    inner: RustTextCrusher,
+}
+
+#[pymethods]
+impl PyTextCrusher {
+    #[new]
+    #[pyo3(signature = (config = None))]
+    fn new(config: Option<PyTextCrusherConfig>) -> Self {
+        let cfg = config.map(|c| c.inner).unwrap_or_default();
+        Self {
+            inner: RustTextCrusher::new(cfg),
+        }
+    }
+
+    /// Compress `content`. Same CCR pattern as the log/search bridges:
+    /// the Rust side backs the crush in a per-call in-memory store and
+    /// emits `cache_key`; the Python shim persists the original to the
+    /// production `CompressionStore` and vetoes (serves the original)
+    /// on write failure.
+    #[pyo3(signature = (content, context = "", bias = 1.0))]
+    fn compress(
+        &self,
+        py: Python<'_>,
+        content: &str,
+        context: &str,
+        bias: f64,
+    ) -> PyResult<PyTextCrushResult> {
+        let owned = content.to_string();
+        let owned_ctx = context.to_string();
+        // catch_unwind inside allow_threads (see `panic_to_pyerr`): COR-7.
+        let (result, stats) = py
+            .allow_threads(move || {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let store = furl_core::ccr::InMemoryCcrStore::new();
+                    let (r, s) =
+                        self.inner
+                            .compress_with_store(&owned, &owned_ctx, bias, Some(&store));
+                    (r, s)
+                }))
+            })
+            .map_err(panic_to_pyerr)?;
+        Ok(PyTextCrushResult {
+            inner: result,
+            stats,
+        })
+    }
+}
+
+// ─── tag_protector bridge (restored in Engine P2-11) ──────────────────
+//
+// Mirrors `furl_ctx.transforms.tag_protector.{protect_tags,restore_tags,
+// is_html_tag,KNOWN_HTML_TAGS}`. The Rust walker is single-pass and
+// fixes five real bugs the Python original carried (see crate-level
+// docs in `tag_protector.rs`); `restore_tags` additionally carries the
+// PERF-15 single-scan fix. The GIL is released during the walk because
+// the algorithm holds no Python references.
+
+/// Replace custom workflow tags in `text` with opaque placeholders so
+/// downstream lossy compressors can't accidentally drop them.
+///
+/// Returns `(cleaned_text, blocks)` where `blocks` is a list of
+/// `(placeholder, original)` tuples for `restore_tags`.
+#[pyfunction]
+#[pyo3(signature = (text, compress_tagged_content = false))]
+fn protect_tags(
+    py: Python<'_>,
+    text: &str,
+    compress_tagged_content: bool,
+) -> PyResult<(String, Vec<(String, String)>)> {
+    let owned = text.to_string();
+    // catch_unwind inside allow_threads (see `panic_to_pyerr`): COR-7.
+    py.allow_threads(move || {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let (cleaned, blocks, _stats) = rust_protect_tags(&owned, compress_tagged_content);
+            (cleaned, blocks)
+        }))
+    })
+    .map_err(panic_to_pyerr)
+}
+
+/// Splice protected blocks back into `text`. Missing placeholders are
+/// DISCARDED (Hotfix-A9 — no orphan-tag append); each placeholder
+/// substitutes at most once (PERF-15 single left-to-right scan).
+#[pyfunction]
+fn restore_tags(py: Python<'_>, text: &str, blocks: Vec<(String, String)>) -> PyResult<String> {
+    let owned = text.to_string();
+    // catch_unwind inside allow_threads (see `panic_to_pyerr`): COR-7.
+    py.allow_threads(move || {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            rust_restore_tags(&owned, &blocks)
+        }))
+    })
+    .map_err(panic_to_pyerr)
+}
+
+/// Case-insensitive HTML5 tag check. The Python shim uses this to
+/// preserve the legacy private `_is_html_tag` import surface for tests.
+#[pyfunction]
+fn is_html_tag(name: &str) -> bool {
+    rust_is_known_html_tag(name)
+}
+
+/// Return the canonical HTML5 tag name list. The Python shim
+/// reconstructs `KNOWN_HTML_TAGS` from this so callers that import the
+/// frozenset continue to work without re-declaring the set in two
+/// languages.
+#[pyfunction]
+fn known_html_tag_names() -> Vec<&'static str> {
+    rust_known_html_tag_names().to_vec()
+}
+
 // ─── Module init ───────────────────────────────────────────────────────────
 
 #[pymodule]
@@ -1650,7 +1903,14 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyLogCompressorConfig>()?;
     m.add_class::<PyLogCompressionResult>()?;
     m.add_class::<PyLogCompressor>()?;
+    m.add_class::<PyTextCrusherConfig>()?;
+    m.add_class::<PyTextCrushResult>()?;
+    m.add_class::<PyTextCrusher>()?;
     m.add_function(wrap_pyfunction!(detect_log_format, m)?)?;
+    m.add_function(wrap_pyfunction!(protect_tags, m)?)?;
+    m.add_function(wrap_pyfunction!(restore_tags, m)?)?;
+    m.add_function(wrap_pyfunction!(is_html_tag, m)?)?;
+    m.add_function(wrap_pyfunction!(known_html_tag_names, m)?)?;
     m.add_function(wrap_pyfunction!(detect_content_type, m)?)?;
     m.add_function(wrap_pyfunction!(score_line, m)?)?;
     m.add_function(wrap_pyfunction!(content_has_error_indicators, m)?)?;
