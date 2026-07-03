@@ -1043,9 +1043,7 @@ def create_ccr_mcp_server() -> FurlMCPServer:
 
 async def main() -> None:
     """Run the Furl MCP server."""
-    parser = argparse.ArgumentParser(
-        description="Furl MCP Server — Context engineering toolkit"
-    )
+    parser = argparse.ArgumentParser(description="Furl MCP Server — Context engineering toolkit")
     parser.add_argument(
         "--debug",
         action="store_true",
