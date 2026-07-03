@@ -1,61 +1,43 @@
-"""Package version metadata."""
+"""Package version metadata — lazy, subprocess-free (PERF-13 / API-8).
+
+``__version__`` resolves through PEP 562 module ``__getattr__`` on FIRST
+access, never at import: the old eager path spawned ``git tag`` + ``git
+log`` subprocesses (~90 ms) on every ``import furl_ctx`` in a checkout and
+made imports non-hermetic. The git-derived "next release" computation moved
+out of the package entirely (``scripts/release_version.py`` — CI-only
+tooling that no longer ships in the wheel); the runtime version is now
+always the installed distribution metadata via ``importlib.metadata``, with
+``"unknown"`` as the not-installed fallback.
+"""
 
 from __future__ import annotations
 
 from importlib.metadata import PackageNotFoundError, version
-from pathlib import Path
 
 UNKNOWN_VERSION = "unknown"
 
 
-def _source_root() -> Path | None:
-    """Return the repository root when imported from a git checkout."""
-    root = Path(__file__).resolve().parents[1]
-    if (root / ".git").exists() and (root / "pyproject.toml").exists():
-        return root
-    return None
-
-
-def _source_tree_version(root: Path) -> str | None:
-    """Compute the version release automation would assign to this checkout."""
-    try:
-        from furl_ctx.release_version import (
-            compute_release_version,
-            determine_bump_level,
-            get_canonical_version,
-            list_release_commits,
-            list_release_tags,
-        )
-
-        tags = list_release_tags(root)
-        previous_tag = compute_release_version(
-            canonical_version=get_canonical_version(root),
-            level="patch",
-            tags=tags,
-        ).previous_tag
-        commits = list_release_commits(root, previous_tag)
-        level = determine_bump_level(commits)
-        return compute_release_version(
-            canonical_version=get_canonical_version(root),
-            level=level,
-            tags=tags,
-        ).version
-    except Exception:
-        return None
-
-
 def get_version() -> str:
-    """Return Furl's runtime version."""
-    root = _source_root()
-    if root is not None:
-        source_version = _source_tree_version(root)
-        if source_version:
-            return source_version
+    """Return Furl's runtime version from installed package metadata.
 
+    Total: never raises — an uninstalled source tree (no ``furl-ctx``
+    distribution visible) resolves to :data:`UNKNOWN_VERSION`.
+    """
     try:
         return version("furl-ctx")
     except PackageNotFoundError:
         return UNKNOWN_VERSION
 
 
-__version__ = get_version()
+def __getattr__(name: str) -> str:
+    """Resolve ``__version__`` lazily (PEP 562) and cache it in module
+    globals so the metadata read happens at most once per process."""
+    if name == "__version__":
+        resolved = get_version()
+        globals()["__version__"] = resolved
+        return resolved
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__() -> list[str]:
+    return sorted({*globals(), "__version__"})

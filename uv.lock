@@ -468,7 +468,6 @@ version = "0.26.0"
 source = { editable = "." }
 dependencies = [
     { name = "tiktoken" },
-    { name = "tomli", marker = "python_full_version < '3.11'" },
 ]
 
 [package.optional-dependencies]
@@ -508,7 +507,6 @@ requires-dist = [
     { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=4.0.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.15.19" },
     { name = "tiktoken", specifier = ">=0.7.0" },
-    { name = "tomli", marker = "python_full_version < '3.11'", specifier = ">=2.0.0" },
     { name = "tree-sitter", marker = "extra == 'code'", specifier = ">=0.23.0" },
     { name = "tree-sitter-language-pack", marker = "extra == 'code'", specifier = ">=0.7.0" },
 ]

@@ -66,6 +66,21 @@ logger = logging.getLogger(__name__)
 _SUPPORTED_COMPACTION_FORMATS = ("csv-schema", "json", "markdown-kv")
 
 
+# ─── PERF-12: relevance-context extraction caps ───────────────────────────
+#
+# `_extract_context_from_messages` walks the conversation NEWEST-first to
+# build the BM25 query context. The historical sole bound — "stop after 5
+# user messages" — degenerated to the FULL history exactly on the common
+# agentic shape (long single-prompt sessions where every other turn is
+# `role:"tool"`): a 200-turn session pushed hundreds of KB of query context
+# into Rust BM25 on every crushed message. These caps bound the scan
+# independently of the user-turn count; because the walk is newest-first,
+# capping drops the OLDEST (least relevant) signal first.
+_CONTEXT_MAX_USER_MESSAGES = 5  # historical user-turn cap, unchanged
+_CONTEXT_MAX_ASSISTANT_MESSAGES = 10  # assistant tool-call-argument scans
+_CONTEXT_MAX_TOTAL_CHARS = 8000  # hard bound on collected query-context chars
+
+
 # ─── §4.2 R5: typed-refs union safety net ─────────────────────────────────
 #
 # All six mirror sites consume TYPED refs (``dropped_refs`` /
@@ -1083,40 +1098,73 @@ class SmartCrusher(Transform):
             )
 
     def _extract_context_from_messages(self, messages: list[dict[str, Any]]) -> str:
-        """Build a query string from the last 5 user messages + recent
-        assistant tool-call arguments. Used by `apply()` to derive the
-        relevance context per-request.
+        """Build a query string from recent user messages + recent assistant
+        tool-call arguments. Used by `apply()` to derive the relevance
+        context per-request.
 
         Pure Python because it walks the message envelope, not the
-        compressed payload. The retired implementation lived inline on
-        `SmartCrusher`; preserved here unchanged.
+        compressed payload.
+
+        Caps (PERF-12): the scan walks NEWEST-first and stops at the first
+        cap hit, so the caps keep the most recent (most relevant) signal:
+
+        * ``_CONTEXT_MAX_USER_MESSAGES`` user messages (historical cap);
+        * ``_CONTEXT_MAX_ASSISTANT_MESSAGES`` assistant tool-call scans —
+          previously unbounded until the user-turn cap broke the loop, so
+          a 200-turn single-prompt agent session (tool results are
+          ``role:"tool"``) swept EVERY assistant turn's arguments;
+        * ``_CONTEXT_MAX_TOTAL_CHARS`` total collected chars — the hard
+          bound that keeps hundreds of KB of history out of the Rust BM25
+          query regardless of turn shape. The part that crosses the cap
+          is truncated at the boundary, then the scan stops.
         """
         context_parts: list[str] = []
+        total_chars = 0
         user_message_count = 0
+        assistant_message_count = 0
+
+        def _append_capped(text: str) -> bool:
+            """Collect ``text`` up to the total-chars cap; False = cap hit."""
+            nonlocal total_chars
+            remaining = _CONTEXT_MAX_TOTAL_CHARS - total_chars
+            if remaining <= 0:
+                return False
+            clipped = text[:remaining]
+            context_parts.append(clipped)
+            total_chars += len(clipped)
+            return len(clipped) == len(text)
 
         for msg in reversed(messages):
+            if total_chars >= _CONTEXT_MAX_TOTAL_CHARS:
+                break
+
             if msg.get("role") == "user":
                 content = msg.get("content")
                 if isinstance(content, str):
-                    context_parts.append(content)
+                    _append_capped(content)
                 elif isinstance(content, list):
                     for block in content:
                         if isinstance(block, dict) and block.get("type") == "text":
                             text = block.get("text", "")
-                            if text:
-                                context_parts.append(text)
+                            if text and not _append_capped(text):
+                                break
 
                 user_message_count += 1
-                if user_message_count >= 5:
+                if user_message_count >= _CONTEXT_MAX_USER_MESSAGES:
                     break
 
-            if msg.get("role") == "assistant" and msg.get("tool_calls"):
+            if (
+                msg.get("role") == "assistant"
+                and msg.get("tool_calls")
+                and assistant_message_count < _CONTEXT_MAX_ASSISTANT_MESSAGES
+            ):
+                assistant_message_count += 1
                 for tc in msg.get("tool_calls", []):
                     if isinstance(tc, dict):
                         func = tc.get("function", {})
                         args = func.get("arguments", "")
-                        if isinstance(args, str) and args:
-                            context_parts.append(args)
+                        if isinstance(args, str) and args and not _append_capped(args):
+                            break
 
         return " ".join(context_parts)
 

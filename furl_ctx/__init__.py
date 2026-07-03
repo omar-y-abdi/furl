@@ -47,7 +47,6 @@ from __future__ import annotations
 from importlib import import_module
 from typing import Any
 
-from ._version import __version__  # noqa: F401
 from .compress import CompressConfig, CompressResult, compress
 
 # Keep a real callable bound for the one-function compression API so
@@ -107,7 +106,10 @@ __all__ = [
 
 # Keep package-level imports lightweight so `import furl_ctx` does not eagerly
 # load provider SDKs, ML stacks, or optional runtime integrations.
+# ``__version__`` is lazy too (PERF-13): resolving it reads installed
+# distribution metadata — never at import time, never via git subprocesses.
 _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
+    "__version__": ("furl_ctx._version", "__version__"),
     # Exceptions
     "FurlError": ("furl_ctx.exceptions", "FurlError"),
     "ConfigurationError": ("furl_ctx.exceptions", "ConfigurationError"),
@@ -171,4 +173,4 @@ def __getattr__(name: str) -> Any:
 
 
 def __dir__() -> list[str]:
-    return sorted(set(globals()) | set(__all__))
+    return sorted(set(globals()) | set(__all__) | {"__version__"})

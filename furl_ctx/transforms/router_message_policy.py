@@ -7,12 +7,17 @@ cache lookup, which stays on the router facade) — plus the message-shape
 helpers ``build_tool_name_map`` / ``get_tool_bias`` / ``detect_analysis_intent``
 and the classification predicates they lean on.
 
-GATE-CHAIN ORDER IS BEHAVIOR and moved verbatim: frozen prefix → content-block
-dispatch (with its own excluded-tool window) → non-string → excluded-tool
-window → user-skip → system-skip → size floor → error protection → detection →
-recent-code → analysis-context → already-compressed pinning →
-retrieval-feedback → bias merge. The route_counts whole-dict matrix in
-``test_router_decomposition_pins.py`` pins the observable outcome per lane.
+GATE-CHAIN ORDER IS BEHAVIOR: frozen prefix → content-block dispatch (with its
+own excluded-tool window) → non-string → excluded-tool window → user-skip →
+system-skip → size floor → error protection → already-compressed pinning →
+detection (lazy) → recent-code → analysis-context → retrieval-feedback → bias
+merge. PERF-2 hoisted the pinning gate above detection (a pinned message ships
+verbatim either way — paying the detect round-trip for it bought nothing) and
+made detection LAZY: it runs only when a gate that consumes it is live (the
+recent-code window covers this message, analysis protection is armed, or the
+retrieval-feedback lane needs the content-type tag). The route_counts
+whole-dict matrix in ``test_router_decomposition_pins.py`` pins the observable
+outcome per lane.
 
 This is a TRUE leaf module: it never imports ``content_router`` (no cycle).
 Everything is a pure function of its arguments; the impure edges come in as
@@ -218,10 +223,17 @@ class AlreadyCompressed:
 class Compressible:
     """Every gate passed: proceed to the two-tier cache with the merged
     per-message *bias* (tool profile × hook × retrieval-feedback) and the
-    option-aware *content_key* built from it (COR-18)."""
+    option-aware *content_key* built from it (COR-18).
+
+    ``detection`` carries the classify-time content detection when a live
+    gate already paid for it (PERF-2c) — ``None`` when every detection
+    consumer was inert. The facade threads it into ``compress()`` so the
+    engine never re-runs the Rust detect round-trip on the same bytes.
+    """
 
     bias: float
     content_key: CacheKey
+    detection: DetectionResult | None = None
 
 
 # The gate chain resolves every message to exactly one of seven dispositions.
@@ -262,14 +274,18 @@ def classify_message(
     get_feedback_hints: Callable[..., FeedbackHintsLike],
     result_cache_key: Callable[[str, float], CacheKey],
 ) -> MessageDisposition:
-    """Resolve one message to its :class:`MessageDisposition` — the verbatim
-    Pass-1 gate chain. Returns WHAT to do; the facade owns the HOW (slot
+    """Resolve one message to its :class:`MessageDisposition` — the Pass-1
+    gate chain. Returns WHAT to do; the facade owns the HOW (slot
     assignment, transform bookkeeping, the cache gate, and Pass-2 deferral).
 
     Effects are injection-only: this function touches no router state and no
-    module singletons; ``detect_content`` (a Rust FFI round-trip) runs at the
-    exact historical point in the chain — after the size/error gates, before
-    the code protections — and exactly once.
+    module singletons. ``detect_content`` (a Rust FFI round-trip) is LAZY
+    (PERF-2): it runs after the size/error/pinning gates, at most once, and
+    only when a live gate consumes the result — the recent-code window
+    covers this message, analysis protection is armed, or the
+    retrieval-feedback lane needs the content-type tag. When it ran, the
+    result rides out on ``Compressible.detection`` so the engine can skip
+    its own detect (PERF-2c).
     """
     # Skip frozen messages (in provider's prefix cache).
     # Modifying these would invalidate the cache, replacing a 90%
@@ -362,18 +378,6 @@ def classify_message(
     ):
         return ProtectedMsg("router:protected:error_output", "error_protected")
 
-    # Detect content type for protection decisions
-    detection = detect_content(content)
-    is_code = detection.content_type == ContentType.SOURCE_CODE
-
-    # Protection 2: Don't compress recent CODE
-    if protect_recent > 0 and messages_from_end <= protect_recent and is_code:
-        return ProtectedMsg("router:protected:recent_code", "recent_code")
-
-    # Protection 3: Don't compress CODE when analysis intent detected
-    if protect_analysis and analysis_intent and is_code:
-        return ProtectedMsg("router:protected:analysis_context", "analysis_ctx")
-
     # Compression pinning: if this message was already compressed
     # (carries a real engine-emitted CCR retrieval marker), skip
     # recompression. Recompressing would change byte content and
@@ -381,9 +385,31 @@ def classify_message(
     # reduction. Strict grammar match — raw content that merely
     # MENTIONS the marker text (docs, or this engine's own source
     # read back as a tool output) is not pinned and stays
-    # compressible.
+    # compressible. Checked BEFORE detection (PERF-2a): a pinned
+    # message ships verbatim regardless of its content type, so the
+    # detect round-trip for it bought nothing.
     if _looks_like_ccr_output(content):
         return _ALREADY_COMPRESSED
+
+    # Detect content type for protection decisions — LAZY (PERF-2b):
+    # the Rust FFI round-trip runs only when a live gate consumes the
+    # result. With the recent-code window not covering this message,
+    # analysis protection unarmed, AND the feedback lane inert, no gate
+    # reads it — the engine detects once inside compress() instead.
+    detection: DetectionResult | None = None
+    recent_code_live = protect_recent > 0 and messages_from_end <= protect_recent
+    analysis_live = protect_analysis and analysis_intent
+    if recent_code_live or analysis_live:
+        detection = detect_content(content)
+        is_code = detection.content_type == ContentType.SOURCE_CODE
+
+        # Protection 2: Don't compress recent CODE
+        if recent_code_live and is_code:
+            return ProtectedMsg("router:protected:recent_code", "recent_code")
+
+        # Protection 3: Don't compress CODE when analysis intent detected
+        if analysis_live and is_code:
+            return ProtectedMsg("router:protected:analysis_context", "analysis_ctx")
 
     # Retrieval-feedback protection (Engine P2-13, opt-in): a shape
     # the model keeps retrieving from the CCR store gets gentler
@@ -392,6 +418,8 @@ def classify_message(
     # (default) never consults the aggregator: byte-identical routing.
     feedback_multiplier = 1.0
     if config.enable_retrieval_feedback and role in _TOOL_ROLES:
+        if detection is None:
+            detection = detect_content(content)
         hints = get_feedback_hints(
             msg_tool_name, content, content_type_tag=detection.content_type.value
         )
@@ -408,8 +436,13 @@ def classify_message(
         msg_bias *= feedback_multiplier
 
     # The key carries the per-request bias and a length guard — see
-    # ``_result_cache_key`` (COR-18).
-    return Compressible(bias=msg_bias, content_key=result_cache_key(content, msg_bias))
+    # ``_result_cache_key`` (COR-18). Any detection a live gate already
+    # paid for rides along so compress() never re-detects (PERF-2c).
+    return Compressible(
+        bias=msg_bias,
+        content_key=result_cache_key(content, msg_bias),
+        detection=detection,
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -263,9 +263,11 @@ class CacheAligner(Transform):
     ) -> TransformResult:
         """Detect volatile content; emit warnings; never mutate messages.
 
-        Invariant: ``result.messages`` is byte-equal to the input
-        ``messages`` (modulo a deep copy for downstream isolation). The
-        prompt is never rewritten.
+        Invariant: ``result.messages`` IS the input ``messages`` list — the
+        detector never rewrites the prompt, so no isolation copy is taken
+        here (PERF-1). The pipeline already deep-copies at its entry
+        boundary; direct callers wanting an isolated list use the public
+        :func:`align_for_cache` wrapper, which keeps the copy.
 
         Optional kwarg ``previous_prefix_hash``: the prior turn's
         ``cache_metrics.stable_prefix_hash``. When supplied, the result's
@@ -273,11 +275,12 @@ class CacheAligner(Transform):
         omitted (the pipeline default) they are ``False`` / ``None`` — the
         aligner keeps no cross-call state of its own.
         """
+        # Count ONCE (PERF-1): the aligner never mutates messages, so
+        # ``tokens_after`` is ``tokens_before`` by construction — the second
+        # full-conversation count and the isolation deep copy were pure
+        # overhead on the hottest fixed path.
         tokens_before = tokenizer.count_messages(messages)
-        # Deep copy so callers receive a stable list they can further
-        # transform without aliasing back into the input. The COPY is
-        # not modified — invariant I2.
-        result_messages = deep_copy_messages(messages)
+        result_messages = messages
         warnings: list[str] = []
         all_findings: list[VolatileFinding] = []
         frozen_message_count = kwargs.get("frozen_message_count", 0)
@@ -346,11 +349,10 @@ class CacheAligner(Transform):
             previous_hash=previous_hash,
         )
 
-        tokens_after = tokenizer.count_messages(result_messages)
         result = TransformResult(
             messages=result_messages,
             tokens_before=tokens_before,
-            tokens_after=tokens_after,
+            tokens_after=tokens_before,  # Never mutates — no recount (PERF-1).
             transforms_applied=[],  # Never applies a rewrite.
             warnings=warnings,
             cache_metrics=cache_metrics,
@@ -384,7 +386,10 @@ def align_for_cache(
     """Convenience wrapper that runs detection and returns the unchanged messages.
 
     Kept as a stable public API; the second tuple element is the stable
-    prefix hash for callers that want to track cache prefix drift.
+    prefix hash for callers that want to track cache prefix drift. The
+    returned list is a deep copy — direct callers keep an isolated list
+    they can mutate freely (``CacheAligner.apply`` itself returns the
+    input list unchanged, PERF-1).
     """
     cfg = config or CacheAlignerConfig()
     aligner = CacheAligner(cfg)
@@ -398,4 +403,4 @@ def align_for_cache(
             stable_hash = marker.split(":", 1)[1]
             break
 
-    return result.messages, stable_hash
+    return deep_copy_messages(result.messages), stable_hash

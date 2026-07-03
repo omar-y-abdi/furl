@@ -13,6 +13,23 @@ from typing import Any
 
 from .base import BaseTokenizer
 
+# PERF-14: ratio detection and special-pattern overhead scanning operate on
+# a bounded PREFIX SAMPLE of the text. Auto-mode previously json.loads-parsed
+# multi-MB strings and regex-scanned the full text on EVERY count_text call
+# just to pick 3.2 vs 4.0 chars/token — on large tool outputs the "cheap
+# estimator" cost more than the content it was approximating. Texts at or
+# under the sample size keep the exact historical behavior.
+_DETECTION_SAMPLE_CHARS = 4096
+
+# JSON-ness heuristic for texts LARGER than the sample (a truncated prefix
+# never json.loads-parses): after the ``[``/``{`` head check, classify as
+# JSON when the sample's structural-character density clears this floor.
+# Object arrays run >20% structural chars, bare numeric arrays ~8%, English
+# prose and bracketed log lines ("[INFO] ...") 2-3% — 1/16 (6.25%) splits
+# the classes cleanly.
+_JSON_STRUCTURAL_CHARS = frozenset(',:"{}[]')
+_JSON_STRUCTURAL_DENSITY = 1 / 16
+
 
 class EstimatingTokenCounter(BaseTokenizer):
     """Token counter using estimation heuristics.
@@ -94,32 +111,65 @@ class EstimatingTokenCounter(BaseTokenizer):
     def _detect_ratio(self, text: str) -> float:
         """Detect optimal chars-per-token ratio based on content.
 
+        Detection runs on a ``_DETECTION_SAMPLE_CHARS`` prefix sample
+        (PERF-14): a multi-MB tool output was previously fully
+        ``json.loads``-parsed and regex-scanned per call just to pick the
+        ratio. Texts at or under the sample size keep the exact historical
+        behavior (the sample IS the text); larger JSON candidates classify
+        via a structural-density heuristic on the prefix, since a truncated
+        prefix never parses.
+
         Args:
             text: Text to analyze.
 
         Returns:
             Chars per token ratio.
         """
-        # Check for JSON
-        if self.JSON_PATTERN.match(text):
-            try:
-                json.loads(text)
-                return self.CHARS_PER_TOKEN_JSON
-            except (json.JSONDecodeError, ValueError):
-                pass
+        sample = text[:_DETECTION_SAMPLE_CHARS]
 
-        # Check for code
-        code_matches = len(self.CODE_PATTERN.findall(text))
-        if code_matches > len(text) / 500:  # ~2 matches per KB
+        # Check for JSON
+        if self.JSON_PATTERN.match(sample):
+            if len(text) <= _DETECTION_SAMPLE_CHARS:
+                try:
+                    json.loads(text)
+                    return self.CHARS_PER_TOKEN_JSON
+                except (json.JSONDecodeError, ValueError):
+                    pass
+            elif self._sample_is_json_like(sample):
+                return self.CHARS_PER_TOKEN_JSON
+
+        # Check for code — match density over the sampled window.
+        code_matches = len(self.CODE_PATTERN.findall(sample))
+        if code_matches > len(sample) / 500:  # ~2 matches per KB
             return self.CHARS_PER_TOKEN_CODE
 
         return self.CHARS_PER_TOKEN
+
+    @staticmethod
+    def _sample_is_json_like(sample: str) -> bool:
+        """Structural-density JSON check for a prefix sample (PERF-14).
+
+        Used only when the full text exceeds the sample window, so
+        ``json.loads`` on the (truncated) prefix cannot decide. Counts the
+        JSON structural characters and compares their density against
+        ``_JSON_STRUCTURAL_DENSITY``.
+        """
+        if not sample:
+            return False
+        structural = sum(1 for ch in sample if ch in _JSON_STRUCTURAL_CHARS)
+        return structural >= len(sample) * _JSON_STRUCTURAL_DENSITY
 
     def _count_special_overhead(self, text: str) -> int:
         """Count additional tokens for special patterns.
 
         URLs and UUIDs often tokenize into more tokens than
-        character count would suggest.
+        character count would suggest. The scan is bounded to the same
+        ``_DETECTION_SAMPLE_CHARS`` prefix sample as ratio detection
+        (PERF-14) — two full-text regex passes per count_text call were
+        the other half of the multi-MB auto-mode cost. The overhead is a
+        small correction term on top of the length-based estimate; for
+        texts at or under the sample size the behavior is exactly the
+        historical one.
 
         Args:
             text: Text to analyze.
@@ -127,16 +177,17 @@ class EstimatingTokenCounter(BaseTokenizer):
         Returns:
             Additional token overhead.
         """
+        sample = text[:_DETECTION_SAMPLE_CHARS]
         overhead = 0
 
         # URLs typically tokenize to more tokens
-        urls = self.URL_PATTERN.findall(text)
+        urls = self.URL_PATTERN.findall(sample)
         for url in urls:
             # Each URL component adds overhead
             overhead += url.count("/") + url.count("?") + url.count("&")
 
         # UUIDs are typically 8-10 tokens despite being 36 chars
-        uuids = self.UUID_PATTERN.findall(text)
+        uuids = self.UUID_PATTERN.findall(sample)
         overhead += len(uuids) * 2  # Each UUID adds ~2 extra tokens
 
         return overhead

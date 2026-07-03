@@ -51,7 +51,10 @@ dependencies = [
     # every count degraded to chars/4 estimation via
     # "ValueError: Unknown encoding o200k_base" (TEST-32b).
     "tiktoken>=0.7.0",            # Tokenizer for all compressors
-    "tomli>=2.0.0; python_version < '3.11'",  # tomllib backport for helper scripts
+    # tomli backport dropped (API-8/PERF-13): it existed solely for
+    # release_version.py's tomllib fallback, which no longer ships in the
+    # wheel (moved to scripts/) and is no longer reached from
+    # `import furl_ctx` (the checkout git-version computation is gone).
 ]
 
 [project.urls]

@@ -203,7 +203,11 @@ def _apply_with_bias_capture(config: ContentRouterConfig, messages: list[dict]) 
     router = ContentRouter(config)
     captured: list[float] = []
 
-    def _fake_compress(content, context="", question=None, bias=1.0, *, token_counter=None):
+    def _fake_compress(
+        content, context="", question=None, bias=1.0, *, token_counter=None, **kwargs
+    ):
+        # ``**kwargs`` absorbs apply()'s ``detection=`` threading (PERF-2c),
+        # matching every other compress stub in the suite.
         captured.append(bias)
         return RouterCompressionResult(
             compressed=content,

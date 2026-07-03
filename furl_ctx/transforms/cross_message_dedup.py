@@ -254,7 +254,15 @@ class CrossMessageDeduper(Transform):
         it is the router's per-content lossy-compression gate, while dedup is
         gated per-unit by ``MIN_DEDUP_CHARS`` and every replacement is
         pointer-recoverable, so it stays net-positive on small requests too.
+
+        Token accounting (PERF-1): the full conversation is counted exactly
+        ONCE, at entry. ``tokens_after`` is derived from per-message deltas
+        of the replaced messages only — untouched messages pass through by
+        reference (``new is orig``), so their counts cancel exactly under
+        the additive ``count_messages`` contract (Σ per-message + constant
+        reply overhead, see ``tokenizers.base.BaseTokenizer``).
         """
+        tokens_before = tokenizer.count_messages(messages)
         frozen_count = int(kwargs.get("frozen_message_count", 0) or 0)
         protect_recent = int(kwargs.get("protect_recent", 0) or 0)
         query_context = str(kwargs.get("context", "") or "")
@@ -274,11 +282,10 @@ class CrossMessageDeduper(Transform):
             new_messages.append(new_message)
 
         if state.exact_replaced == 0 and state.near_replaced == 0:
-            tokens = tokenizer.count_messages(messages)
             return TransformResult(
                 messages=messages,
-                tokens_before=tokens,
-                tokens_after=tokens,
+                tokens_before=tokens_before,
+                tokens_after=tokens_before,
                 transforms_applied=[],
             )
 
@@ -288,8 +295,16 @@ class CrossMessageDeduper(Transform):
         if state.near_replaced:
             applied.append(f"cross_message_dedup:near:{state.near_replaced}")
 
-        tokens_before = tokenizer.count_messages(messages)
-        tokens_after = tokenizer.count_messages(new_messages)
+        # Per-message delta instead of a second full-conversation recount
+        # (PERF-1): only replaced messages differ, and ``_process_message``
+        # returns the SAME object for untouched ones, so identity picks out
+        # exactly the replacements.
+        token_delta = sum(
+            tokenizer.count_message(new) - tokenizer.count_message(orig)
+            for orig, new in zip(messages, new_messages)
+            if new is not orig
+        )
+        tokens_after = tokens_before + token_delta
         return TransformResult(
             messages=new_messages,
             tokens_before=tokens_before,

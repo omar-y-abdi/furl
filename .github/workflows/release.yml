@@ -103,7 +103,7 @@ jobs:
       - name: Compute semantic version from canonical + release history
         id: ver
         run: |
-          python furl_ctx/release_version.py
+          python scripts/release_version.py
         env:
           MANUAL_VER: ${{ steps.manualver.outputs.value }}
 

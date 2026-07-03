@@ -50,6 +50,7 @@ if TYPE_CHECKING:
 
     from .base import CompressionObserver
     from .code_aware_compressor import CodeAwareCompressor
+    from .content_detector import DetectionResult
     from .content_router import ContentRouterConfig
     from .diff_compressor import DiffCompressor
     from .log_compressor import LogCompressor
@@ -277,6 +278,7 @@ class ContentCompressionEngine:
         bias: float = 1.0,
         *,
         token_counter: Callable[[str], int] | None = None,
+        detection: DetectionResult | None = None,
         hooks: RouterHooks,
     ) -> RouterCompressionResult:
         """Compress content using optimal strategy based on content detection.
@@ -284,6 +286,13 @@ class ContentCompressionEngine:
         The body of ``ContentRouter.compress`` (a pure move); see the facade
         docstring for the public contract. ``hooks`` is the router facade —
         strategy selection and the pure/mixed paths resolve through it.
+
+        ``detection`` (PERF-2c) is an optional PRECOMPUTED detection of
+        exactly these content bytes — the facade threads the classify-time
+        result in so the Rust detect round-trip is never paid twice for one
+        message. ``None`` (every direct caller) keeps the historical path:
+        strategy resolution through ``hooks._determine_strategy``, so
+        monkeypatches on that facade method keep biting.
         """
         cr = _cr()
         debug_enabled = cr.logger.isEnabledFor(logging.DEBUG)
@@ -321,17 +330,26 @@ class ContentCompressionEngine:
             # Determine strategy from content analysis. ``_determine_strategy``
             # already runs ``is_mixed_content`` + ``_detect_content`` (a Rust
             # FFI round-trip) internally — on the hot path (debug off) we do NOT
-            # recompute them here. The detection locals below are built only for
-            # the debug log, so the per-call detection cost is paid once.
-            strategy = hooks._determine_strategy(content)
+            # recompute them here. With a PRECOMPUTED ``detection`` (PERF-2c)
+            # the engine resolves strategy itself and skips the re-detect; the
+            # ``detection is None`` path is byte-identical to before and keeps
+            # ``hooks._determine_strategy`` monkeypatches biting. The detection
+            # locals below are built only for the debug log, so the per-call
+            # detection cost is paid at most once.
+            if detection is None:
+                strategy = hooks._determine_strategy(content)
+            else:
+                strategy = self._determine_strategy(content, hooks=hooks, detection=detection)
             if debug_enabled:
                 mixed = cr.is_mixed_content(content)
-                detection = cr._detect_content(content)
+                debug_detection = (
+                    detection if detection is not None else cr._detect_content(content)
+                )
                 cr._log_router_debug(
                     "content_router_input",
                     **request_debug,
-                    detected_content_type=detection.content_type.value,
-                    detection_confidence=detection.confidence,
+                    detected_content_type=debug_detection.content_type.value,
+                    detection_confidence=debug_detection.confidence,
                     selected_strategy=strategy.value,
                     selection_reason=("mixed_content" if mixed else "content_detection"),
                 )
@@ -589,12 +607,20 @@ class ContentCompressionEngine:
             1,
         )
 
-    def _determine_strategy(self, content: str, *, hooks: RouterHooks) -> CompressionStrategy:
+    def _determine_strategy(
+        self,
+        content: str,
+        *,
+        hooks: RouterHooks,
+        detection: DetectionResult | None = None,
+    ) -> CompressionStrategy:
         """Determine the compression strategy from content analysis.
 
         ``is_mixed_content`` and ``_detect_content`` are resolved through the
         ``content_router`` module globals AT CALL TIME — the parity tests
-        rebind both there.
+        rebind both there. A precomputed ``detection`` (PERF-2c) skips only
+        the ``_detect_content`` round-trip; the mixed-content check and the
+        strategy mapping still resolve through the same rebindable seams.
         """
         cr = _cr()
         # 1. Check for mixed content
@@ -602,7 +628,8 @@ class ContentCompressionEngine:
             return CompressionStrategy.MIXED
 
         # 2. Detect content type from content itself
-        detection = cr._detect_content(content)
+        if detection is None:
+            detection = cr._detect_content(content)
         return hooks._strategy_from_detection(detection)
 
     def _compress_mixed(

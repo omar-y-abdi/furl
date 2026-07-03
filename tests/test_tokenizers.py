@@ -243,6 +243,113 @@ def hello():
         assert "EstimatingTokenCounter" in repr(counter)
 
 
+class TestEstimatorPrefixSampling:
+    """PERF-14: auto-mode detection runs on a 4KB prefix sample.
+
+    ``count_text`` previously ``json.loads``-parsed multi-MB valid-JSON
+    strings and ran two full-text regex scans (URL + UUID) PER CALL just to
+    pick 3.2 vs 4.0 chars/token. Detection — including
+    ``_count_special_overhead``, not just ``_detect_ratio`` — now operates
+    on a ``_DETECTION_SAMPLE_CHARS`` prefix; texts at or under the sample
+    size keep the exact historical behavior.
+    """
+
+    def _huge_json(self) -> str:
+        import json as _json
+
+        rows = [
+            {"id": i, "path": f"/repo/src/module_{i}.py", "status": "ok", "score": i * 0.5}
+            for i in range(20_000)
+        ]
+        return _json.dumps(rows)
+
+    def test_huge_valid_json_keeps_the_json_ratio_class(self):
+        """Same ratio class as the historical full parse — via the prefix."""
+        from furl_ctx.tokenizers.estimator import _DETECTION_SAMPLE_CHARS
+
+        counter = EstimatingTokenCounter()
+        huge = self._huge_json()
+        assert len(huge) > 100 * _DETECTION_SAMPLE_CHARS
+
+        assert counter._detect_ratio(huge) == counter.CHARS_PER_TOKEN_JSON
+
+    def test_huge_json_never_pays_a_full_parse(self, monkeypatch):
+        """The 'fast' half of the pin: counting a multi-MB JSON string must
+        not call json.loads AT ALL (a truncated prefix can never parse, and
+        the full parse was the cost being removed)."""
+        import json as _json
+
+        calls = {"n": 0}
+        real_loads = _json.loads
+
+        def spy_loads(*args, **kwargs):
+            calls["n"] += 1
+            return real_loads(*args, **kwargs)
+
+        monkeypatch.setattr(_json, "loads", spy_loads)
+        counter = EstimatingTokenCounter()
+        huge = self._huge_json()
+
+        count = counter.count_text(huge)
+
+        assert count > 0
+        assert calls["n"] == 0
+
+    def test_huge_numeric_json_array_keeps_the_json_ratio_class(self):
+        counter = EstimatingTokenCounter()
+        huge = "[" + ", ".join(str(1_000_000_000 + i) for i in range(50_000)) + "]"
+
+        assert counter._detect_ratio(huge) == counter.CHARS_PER_TOKEN_JSON
+
+    def test_huge_bracketed_log_is_not_misread_as_json(self):
+        """'[INFO] ...' starts with the JSON head byte but is prose-dense,
+        not structural-dense — stays at the default ratio."""
+        counter = EstimatingTokenCounter()
+        huge = "\n".join(
+            f"[INFO] worker {i} finished the assigned batch without any retries"
+            for i in range(10_000)
+        )
+
+        assert counter._detect_ratio(huge) == counter.CHARS_PER_TOKEN
+
+    def test_small_texts_keep_exact_historical_behavior(self):
+        counter = EstimatingTokenCounter()
+        assert counter._detect_ratio('{"name": "test", "value": 123}') == (
+            counter.CHARS_PER_TOKEN_JSON
+        )
+        assert counter._detect_ratio("[not json at all") == counter.CHARS_PER_TOKEN
+        assert (
+            counter._detect_ratio("def f():\n    pass\ndef g():\n    pass\n")
+            == counter.CHARS_PER_TOKEN_CODE
+        )
+
+    def test_special_overhead_scans_only_the_prefix_sample(self):
+        from furl_ctx.tokenizers.estimator import _DETECTION_SAMPLE_CHARS
+
+        counter = EstimatingTokenCounter()
+        uuid = "0f8fad5b-d9cb-469f-a165-70867728950e"
+        inside = uuid + " " + "x" * (2 * _DETECTION_SAMPLE_CHARS)
+        outside = "x" * (2 * _DETECTION_SAMPLE_CHARS) + " " + uuid
+
+        assert counter._count_special_overhead(inside) == 2
+        assert counter._count_special_overhead(outside) == 0
+
+    def test_huge_json_counts_fast(self):
+        """Loose wall-clock sanity bound (was O(full parse + 2 full regex
+        scans) per call; a generous ceiling keeps this stable on CI)."""
+        import time
+
+        counter = EstimatingTokenCounter()
+        huge = self._huge_json()
+
+        t0 = time.perf_counter()
+        for _ in range(20):
+            counter.count_text(huge)
+        elapsed = time.perf_counter() - t0
+
+        assert elapsed < 1.0, f"20 estimator counts on {len(huge)} chars took {elapsed:.2f}s"
+
+
 class TestCharacterCounter:
     """Tests for CharacterCounter."""
 

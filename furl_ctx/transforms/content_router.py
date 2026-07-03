@@ -593,15 +593,22 @@ class ContentRouter(Transform):
         context: str,
         bias: float,
         token_counter: Callable[[str], int] | None = None,
+        detection: DetectionResult | None = None,
     ) -> tuple[RouterCompressionResult, float]:
         """Compress with wall-clock timing.  Used by parallel executor."""
         t0 = time.perf_counter()
-        result = self.compress(content, context=context, bias=bias, token_counter=token_counter)
+        result = self.compress(
+            content,
+            context=context,
+            bias=bias,
+            token_counter=token_counter,
+            detection=detection,
+        )
         return result, (time.perf_counter() - t0) * 1000
 
     def _compress_pending(
         self,
-        pending_tasks: list[tuple[int, str, str, float, CacheKey]],
+        pending_tasks: list[tuple[int, str, str, float, CacheKey, DetectionResult | None]],
         messages: list[dict[str, Any]],
         result_slots: list[dict[str, Any] | None],
         *,
@@ -632,13 +639,14 @@ class ContentRouter(Transform):
         if max_workers <= 1 or len(pending_tasks) == 1:
             # Single task or parallelism disabled — compress inline
             task_results = []
-            for _, task_content, task_ctx, task_bias, _ in pending_tasks:
+            for _, task_content, task_ctx, task_bias, _, task_detection in pending_tasks:
                 t0 = time.perf_counter()
                 r = self.compress(
                     task_content,
                     context=task_ctx,
                     bias=task_bias,
                     token_counter=token_counter,
+                    detection=task_detection,
                 )
                 task_results.append((r, (time.perf_counter() - t0) * 1000))
         else:
@@ -646,7 +654,7 @@ class ContentRouter(Transform):
             # is independent; per-task inputs are passed by argument.
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 futures = []
-                for _, task_content, task_ctx, task_bias, _ in pending_tasks:
+                for _, task_content, task_ctx, task_bias, _, task_detection in pending_tasks:
                     futures.append(
                         executor.submit(
                             self._timed_compress,
@@ -654,6 +662,7 @@ class ContentRouter(Transform):
                             task_ctx,
                             task_bias,
                             token_counter,
+                            task_detection,
                         )
                     )
                 task_results = [f.result() for f in futures]
@@ -662,7 +671,7 @@ class ContentRouter(Transform):
         compressor_timing["parallel_compress_total"] = parallel_ms
 
         # --- Pass 3: Merge results back (sequential, updates caches) ---
-        for (slot_idx, _, _, _, content_key), (result, compress_ms) in zip(
+        for (slot_idx, _, _, _, content_key, _), (result, compress_ms) in zip(
             pending_tasks, task_results
         ):
             message = messages[slot_idx]
@@ -691,6 +700,7 @@ class ContentRouter(Transform):
         bias: float = 1.0,
         *,
         token_counter: Callable[[str], int] | None = None,
+        detection: DetectionResult | None = None,
     ) -> RouterCompressionResult:
         """Compress content using optimal strategy based on content detection.
 
@@ -714,6 +724,12 @@ class ContentRouter(Transform):
                 the ``min_ratio`` acceptance gate reads — are measured in the
                 same unit as the gate's threshold. ``None`` (direct callers)
                 keeps the historical whitespace word count.
+            detection: Optional PRECOMPUTED detection of exactly these
+                content bytes (PERF-2c). ``apply()`` threads the
+                classify-time result in so the engine never pays the Rust
+                detect round-trip twice for one message; ``None`` (direct
+                callers) keeps the historical strategy path, including the
+                ``_determine_strategy`` monkeypatch seam.
 
         Returns:
             RouterCompressionResult with compressed content and routing metadata.
@@ -724,6 +740,7 @@ class ContentRouter(Transform):
             question,
             bias,
             token_counter=token_counter,
+            detection=detection,
             hooks=self,
         )
 
@@ -1126,8 +1143,10 @@ class ContentRouter(Transform):
         # Pre-allocate result slots — None means "pending compression".
         result_slots: list[dict[str, Any] | None] = [None] * num_messages
 
-        # Tasks: list of (slot_index, content, context, bias, content_key)
-        _PendingTask = tuple[int, str, str, float, CacheKey]
+        # Tasks: (slot_index, content, context, bias, content_key, detection)
+        # — ``detection`` is the classify-time DetectionResult when a Pass-1
+        # gate already paid for it, else None (PERF-2c).
+        _PendingTask = tuple[int, str, str, float, CacheKey, DetectionResult | None]
         pending_tasks: list[_PendingTask] = []
 
         # Pass 1 dispatches on the MessageDisposition ADT: WHAT happens to a
@@ -1203,7 +1222,7 @@ class ContentRouter(Transform):
                 case AlreadyCompressed():
                     result_slots[i] = message
                     route_counts["already_compressed"] += 1
-                case Compressible(bias=msg_bias, content_key=content_key):
+                case Compressible(bias=msg_bias, content_key=content_key, detection=detection):
                     # Two-tier compression cache. The lookup DECISION — Tier-1
                     # skip, Tier-2 ratio-gate, CCR-backing check, plus every
                     # cache mutation and routing-counter bump — is shared with
@@ -1230,7 +1249,9 @@ class ContentRouter(Transform):
                             compressed_details.append(f"{strategy}:{ratio:.2f}")
                         case Recompute():
                             # Defer to the parallel compression pass (Pass 2/3).
-                            pending_tasks.append((i, content, context, msg_bias, content_key))
+                            pending_tasks.append(
+                                (i, content, context, msg_bias, content_key, detection)
+                            )
                         case other:
                             raise RuntimeError(
                                 f"_lookup_cached_disposition returned unexpected "
