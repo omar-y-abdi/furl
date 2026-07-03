@@ -28,8 +28,13 @@ pub fn hash_field_name(field_name: &str) -> String {
     let digest = hasher.finalize();
     // Truncate to first 8 hex chars (4 bytes of digest). MUST match
     // Python's `[:8]` — see module-level note above.
-    let hex = format!("{:x}", digest);
-    hex[..8].to_string()
+    //
+    // Per-byte `{:02x}` (same pattern as walker.rs/compactor.rs/crusher.rs)
+    // instead of `format!("{:x}", digest)`: digest 0.11 returns
+    // `hybrid_array::Array`, which does not implement `LowerHex` (the old
+    // `GenericArray` did). Byte-identical output — `LowerHex` on the array
+    // was zero-padded per-byte hex, exactly what `{:02x}` produces.
+    digest.iter().take(4).map(|b| format!("{b:02x}")).collect()
 }
 
 #[cfg(test)]
