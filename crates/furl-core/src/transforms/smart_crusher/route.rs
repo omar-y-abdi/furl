@@ -1947,9 +1947,9 @@ mod tests {
     // ---------- recovery-pointer invariant (Defect 1) ----------
 
     #[test]
-    fn enable_ccr_marker_false_still_surfaces_recovery_pointer() {
+    fn advertise_retrieval_tool_false_still_surfaces_recovery_pointer() {
         // Defect 1 (kill silent loss, completed). With
-        // `enable_ccr_marker=false` the engine STILL surfaces the
+        // `advertise_retrieval_tool=false` the engine STILL surfaces the
         // `<<ccr:HASH>>` recovery pointer in `dropped_summary` AND
         // writes the store. The recovery pointer is the retrieval key,
         // not a UX nicety: you cannot drop a distinct item without
@@ -1968,7 +1968,7 @@ mod tests {
         let store: Arc<dyn CcrStore> = Arc::new(InMemoryCcrStore::new());
         let cfg = SmartCrusherConfig {
             lossless_min_savings_ratio: 0.99, // force lossy path
-            enable_ccr_marker: false,
+            advertise_retrieval_tool: false,
             ..SmartCrusherConfig::default()
         };
         let c = SmartCrusherBuilder::new(cfg)
@@ -1986,7 +1986,7 @@ mod tests {
         assert!(
             result.dropped_summary.contains("<<ccr:"),
             "dropped_summary must carry the recovery pointer even with \
-             enable_ccr_marker=false (Defect 1), got: {:?}",
+             advertise_retrieval_tool=false (Defect 1), got: {:?}",
             result.dropped_summary
         );
         assert!(result.dropped_summary.contains("rows_offloaded"));
@@ -2363,7 +2363,7 @@ mod tests {
     }
 
     #[test]
-    fn enable_ccr_marker_true_is_default_behavior() {
+    fn advertise_retrieval_tool_true_is_default_behavior() {
         // Default config still emits markers + stores when rows drop.
         // Sanity: the gate is opt-out, not opt-in.
         use crate::ccr::InMemoryCcrStore;
@@ -2375,8 +2375,8 @@ mod tests {
             lossless_min_savings_ratio: 0.99, // force lossy path
             ..SmartCrusherConfig::default()
         };
-        // Default: enable_ccr_marker = true.
-        assert!(cfg.enable_ccr_marker);
+        // Default: advertise_retrieval_tool = true.
+        assert!(cfg.advertise_retrieval_tool);
         let c = SmartCrusherBuilder::new(cfg)
             .with_ccr_store(Arc::clone(&store))
             .build();

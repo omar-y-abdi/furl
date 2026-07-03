@@ -182,7 +182,7 @@ class CCRConfig:
     recovery invariant forbids; pinned by
     tests/test_ccr_recovery_invariant.py). The flags are the
     retrieval-tool advertisement preference: they flow to the Rust
-    ``enable_ccr_marker`` field and are preserved on
+    ``advertise_retrieval_tool`` field and are preserved on
     ``SmartCrusher._ccr_config`` for embedders that read them back when
     deciding whether to inject the ``furl_retrieve`` tool; the router
     additionally requires them for the optional CCR-offload fallback.

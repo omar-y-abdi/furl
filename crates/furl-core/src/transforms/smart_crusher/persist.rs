@@ -181,7 +181,7 @@ impl SmartCrusher {
     /// and pointer together are the cornerstone of the no-data-loss
     /// guarantee: a dropped needle is always retrievable via
     /// `ccr_get(hash)` AND nameable from the output via the pointer —
-    /// never silently lost. Neither is gated by `enable_ccr_marker`
+    /// never silently lost. Neither is gated by `advertise_retrieval_tool`
     /// (Defect 1): you cannot drop a distinct item without surfacing a
     /// recovery pointer to it.
     ///
@@ -348,11 +348,11 @@ impl SmartCrusher {
         // KEY, not a UX nicety: it is the only way a consumer holding
         // just the output can name the hash and pull the dropped rows
         // back. It MUST be surfaced whenever data is dropped, regardless
-        // of `enable_ccr_marker`. The recovery invariant ("a dropped
+        // of `advertise_retrieval_tool`. The recovery invariant ("a dropped
         // item is recoverable from the output alone") cannot hold if the
         // pointer is suppressed while the rows are still dropped.
         //
-        // `enable_ccr_marker` historically gated this text; that
+        // `advertise_retrieval_tool` historically gated this text; that
         // conflated the *data-loss recovery pointer* with the heavier
         // *retrieval-tool injection* (advertising `furl_retrieve`
         // into the request), which is owned by the router layer
@@ -871,7 +871,7 @@ mod tests {
     #[test]
     fn non_dict_drop_surfaces_pointer_and_persists_even_with_marker_off() {
         // Defect 1: parity with the dict path. With
-        // `enable_ccr_marker=false`, the non-dict string path STILL
+        // `advertise_retrieval_tool=false`, the non-dict string path STILL
         // surfaces the `<<ccr:HASH>>` recovery pointer in the output AND
         // writes the store. The pointer is the recovery key; suppressing
         // it while still dropping rows is the silent loss the invariant
@@ -883,7 +883,7 @@ mod tests {
         let store = Arc::new(InMemoryCcrStore::new());
         let store_dyn: Arc<dyn CcrStore> = Arc::clone(&store) as Arc<dyn CcrStore>;
         let cfg = SmartCrusherConfig {
-            enable_ccr_marker: false,
+            advertise_retrieval_tool: false,
             ..SmartCrusherConfig::default()
         };
         let c = SmartCrusherBuilder::new(cfg)
@@ -904,7 +904,7 @@ mod tests {
         // The recovery pointer IS in the output even with the flag off.
         assert!(
             result.compressed.contains("<<ccr:"),
-            "recovery pointer must be surfaced even with enable_ccr_marker=false \
+            "recovery pointer must be surfaced even with advertise_retrieval_tool=false \
              (Defect 1), got: {}",
             &result.compressed[..result.compressed.len().min(200)]
         );

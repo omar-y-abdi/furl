@@ -76,6 +76,7 @@ from ..tokenizer import Tokenizer
 from .base import CompressionObserver, Transform
 from .content_detector import ContentType, DetectionResult
 from .content_detector import detect_content_type as _regex_detect_content_type
+from .net_mutation_gain import MutationContext, net_mutation_gain
 
 # Extracted seams (pure moves — §4.1 S1-S6). Re-imported here so that:
 #   * existing ``from ...content_router import X`` imports keep resolving,
@@ -296,6 +297,10 @@ class ContentRouterConfig:
             (0 = disabled; overridable per call via the ``protect_recent``
             kwarg).
         protect_analysis_context: Detect "analyze/review" intent, skip compression.
+        enable_net_mutation_gate: Skip compressions whose cache re-billing
+            cost exceeds their token savings (net_mutation_gain <= 0).
+        cached_token_rate: Provider cache-read rate relative to base input,
+            used by the net-mutation model.
     """
 
     # Enable/disable specific compressors
@@ -312,6 +317,18 @@ class ContentRouterConfig:
     # through byte-identically to the historical lossy path.
     enable_log_template: bool = True
     enable_log_compressor: bool = True
+    # net_mutation_gain (NR2-4): cache-economics gate. Compressing message i
+    # mutates the conversation prefix at i, so every token after i loses its
+    # provider prefix-cache discount on the next request; when that
+    # re-billing exceeds the tokens saved, compression is a net loss and is
+    # skipped (decision math in transforms/net_mutation_gain.py). Default
+    # OFF: engagement assumes IMPLICIT provider caching (marker-less, e.g.
+    # OpenAI auto-caching) and prices an estimate (whole-suffix-cached upper
+    # bound) — explicit `cache_control` prefixes are already frozen upstream
+    # in compress(), so flipping this on is a deployment-economics call the
+    # owner makes, not a correctness default.
+    enable_net_mutation_gate: bool = False
+    cached_token_rate: float = 0.1
     # TextCrusher (Engine P2-11): deterministic extractive prose
     # compression for PLAIN_TEXT. Size floors live in the crusher
     # itself (600 chars / 15 segments → passthrough); every crush is
@@ -419,7 +436,7 @@ class ContentRouterConfig:
     # tests/test_ccr_recovery_invariant.py). What the flags actually do:
     #   * gate the reversible CCR-offload fallback (`_should_ccr_offload`
     #     — offload is optional, so "CCR off" honestly disables it);
-    #   * flow to `CCRConfig` / the Rust `enable_ccr_marker` field as the
+    #   * flow to `CCRConfig` / the Rust `advertise_retrieval_tool` field as the
     #     retrieval-tool advertisement preference, preserved for external
     #     embedders that read it back when deciding whether to inject the
     #     `furl_retrieve` tool.
@@ -637,6 +654,7 @@ class ContentRouter(Transform):
         compressed_details: list[str],
         route_counts: Counter[str],
         compressor_timing: dict[str, float],
+        suffix_tokens: list[int] | None = None,
     ) -> None:
         """Pass 2/3 of ``apply()``: compress every cache-miss message and merge.
 
@@ -690,12 +708,27 @@ class ContentRouter(Transform):
         compressor_timing["parallel_compress_total"] = parallel_ms
 
         # --- Pass 3: Merge results back (sequential, updates caches) ---
-        for (slot_idx, _, _, _, content_key, _), (result, compress_ms) in zip(
+        for (slot_idx, task_content, _, _, content_key, _), (result, compress_ms) in zip(
             pending_tasks, task_results
         ):
             message = messages[slot_idx]
             strategy_key = f"compressor:{result.strategy_used.value}"
             compressor_timing[strategy_key] = compressor_timing.get(strategy_key, 0.0) + compress_ms
+
+            # net_mutation_gain gate (NR2-4), BEFORE the cache store: a
+            # gated compression must leave no cache entry behind — the gate
+            # is position-dependent while the cache is content-keyed, so the
+            # same bytes must stay re-decidable at other positions.
+            if suffix_tokens is not None:
+                gate_gain = net_mutation_gain(
+                    token_counter(task_content) - token_counter(result.compressed),
+                    MutationContext(suffix_tokens[slot_idx]),
+                    self.config.cached_token_rate,
+                )
+                if gate_gain is not None and gate_gain <= 0:
+                    result_slots[slot_idx] = message
+                    route_counts["net_mutation_gate"] += 1
+                    continue
 
             if self._store_disposition(content_key, result, min_ratio, route_counts):
                 # Compressed — stored in the result cache; serve it with
@@ -1082,6 +1115,19 @@ class ContentRouter(Transform):
         num_messages = len(messages)
         model_limit = kwargs.get("model_limit", 0)
 
+        # net_mutation_gain (NR2-4): one reversed cumulative sum of
+        # per-message token counts, computed ONLY when the gate is enabled
+        # (zero cost when off). suffix_tokens[i] = tokens AFTER message i —
+        # what loses its provider cache discount if message i's bytes change.
+        suffix_tokens: list[int] | None = None
+        if self.config.enable_net_mutation_gate:
+            per_msg = [tokenizer.count_messages([m]) for m in messages]
+            suffix_tokens = [0] * num_messages
+            running = 0
+            for j in range(num_messages - 1, -1, -1):
+                suffix_tokens[j] = running
+                running += per_msg[j]
+
         # Adaptive Read protection: protect a fraction of recent messages
         if self.config.protect_recent_reads_fraction > 0:
             # Scale: at 10 msgs protect 5, at 50 msgs protect 25, at 200 msgs protect 100
@@ -1263,9 +1309,27 @@ class ContentRouter(Transform):
                         case ServeOriginal():
                             result_slots[i] = message
                         case ServeCached(compressed=served, strategy=strategy, ratio=ratio):
-                            result_slots[i] = {**message, "content": served}
-                            transforms_applied.append(f"router:{strategy}:{ratio:.2f}")
-                            compressed_details.append(f"{strategy}:{ratio:.2f}")
+                            # net_mutation_gain gate ALSO applies to cache
+                            # hits: the result cache is content-keyed but the
+                            # gate is POSITION-dependent (same bytes, larger
+                            # suffix → different economics), so it must be
+                            # re-evaluated at every serve site.
+                            gate_gain = (
+                                net_mutation_gain(
+                                    tokenizer.count_text(content) - tokenizer.count_text(served),
+                                    MutationContext(suffix_tokens[i]),
+                                    self.config.cached_token_rate,
+                                )
+                                if suffix_tokens is not None
+                                else None
+                            )
+                            if gate_gain is not None and gate_gain <= 0:
+                                result_slots[i] = message
+                                route_counts["net_mutation_gate"] += 1
+                            else:
+                                result_slots[i] = {**message, "content": served}
+                                transforms_applied.append(f"router:{strategy}:{ratio:.2f}")
+                                compressed_details.append(f"{strategy}:{ratio:.2f}")
                         case Recompute():
                             # Defer to the parallel compression pass (Pass 2/3).
                             pending_tasks.append(
@@ -1294,6 +1358,7 @@ class ContentRouter(Transform):
                 compressed_details=compressed_details,
                 route_counts=route_counts,
                 compressor_timing=compressor_timing,
+                suffix_tokens=suffix_tokens,
             )
 
         # Build final message list from slots
@@ -1323,6 +1388,8 @@ class ContentRouter(Transform):
             parts.append(f"{route_counts['feedback_skip']} protected (retrieval feedback)")
         if route_counts["ratio_too_high"]:
             parts.append(f"{route_counts['ratio_too_high']} unchanged (ratio>={min_ratio:.2f})")
+        if route_counts.get("net_mutation_gate"):
+            parts.append(f"{route_counts['net_mutation_gate']} unchanged (net mutation gate)")
         if route_counts["content_blocks"]:
             parts.append(f"{route_counts['content_blocks']} content-block msgs")
         if route_counts.get("nested_blocks"):

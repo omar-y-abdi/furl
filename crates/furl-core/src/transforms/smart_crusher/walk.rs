@@ -326,7 +326,7 @@ impl SmartCrusher {
                             // recoverable via `ccr_get(hash)` — never
                             // silently lost. Both the store write and the
                             // sentinel TEXT are unconditional (inside
-                            // `persist_dropped`) — `enable_ccr_marker` gates
+                            // `persist_dropped`) — `advertise_retrieval_tool` gates
                             // NEITHER; it is only the router-layer
                             // retrieval-tool advertisement preference
                             // (pinned by `persist.rs`'s
