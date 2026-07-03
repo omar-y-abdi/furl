@@ -1,9 +1,9 @@
 """Lazy compressor registry for the content router.
 
-Owns the five SELF-CONTAINED lazy compressor factories that the
+Owns the six SELF-CONTAINED lazy compressor factories that the
 :class:`~furl_ctx.transforms.content_router.ContentRouter` dispatches to:
-SmartCrusher, SearchCompressor, LogCompressor, DiffCompressor, and
-TextCrusher.
+SmartCrusher, SearchCompressor, LogCompressor, DiffCompressor,
+TextCrusher, and CodeAwareCompressor.
 
 Each factory is a plain lazy-init-and-cache: it reads only from the router's
 ``ContentRouterConfig`` and memoizes the constructed compressor in a private
@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 
 class CompressorRegistry:
-    """Lazy-init + cache for the five self-contained compressors.
+    """Lazy-init + cache for the six self-contained compressors.
 
     Construct with the router's :class:`ContentRouterConfig`; each ``get_*``
     method lazy-imports and instantiates its compressor on first call and
@@ -40,6 +40,7 @@ class CompressorRegistry:
         self._log_compressor: Any = None
         self._diff_compressor: Any = None
         self._text_crusher: Any = None
+        self._code_aware_compressor: Any = None
 
     def get_smart_crusher(self) -> Any:
         """Get SmartCrusher (lazy load) with CCR config."""
@@ -115,3 +116,17 @@ class CompressorRegistry:
 
             self._text_crusher = TextCrusher()
         return self._text_crusher
+
+    def get_code_aware_compressor(self) -> Any:
+        """Get CodeAwareCompressor (lazy load, Engine P2-12). Pure Python;
+        the tree-sitter grammars are an OPTIONAL extra (`furl-ctx[code]`)
+        imported lazily inside `compress()`, which fails open to
+        passthrough when they are missing — so construction never gates
+        on the dep. `enable_code_aware` / `lossless_only` gating happens
+        in the dispatcher, matching the search/log/text arms.
+        """
+        if self._code_aware_compressor is None:
+            from .code_aware_compressor import CodeAwareCompressor
+
+            self._code_aware_compressor = CodeAwareCompressor()
+        return self._code_aware_compressor

@@ -494,6 +494,17 @@ class ContentRouterConfig:
     # unmarked drops (store-failure vetoes to passthrough). Gated off
     # by `lossless_only` like the other line-dropping compressors.
     enable_text_crusher: bool = True
+    # CodeAwareCompressor (Engine P2-12): OPT-IN AST-verified code
+    # compression for SOURCE_CODE. Default OFF — code keeps shipping
+    # unmangled (PASSTHROUGH), byte-identical to the pre-P2-12 engine.
+    # When True, detected source code routes to the tree-sitter
+    # compressor (optional `furl-ctx[code]` extra; missing dep →
+    # passthrough + one WARN). Every ship is syntax-verified and
+    # CCR-backed (full original persisted under the marker hash;
+    # store failure vetoes to passthrough). The analysis-intent /
+    # protect_recent_code protections run BEFORE routing and still
+    # win; `lossless_only` gates the dispatch arm off.
+    enable_code_aware: bool = False
 
     # Routing preferences
     mixed_content_threshold: int = 2  # Min types to consider mixed
@@ -1298,6 +1309,7 @@ class ContentRouter(Transform):
             get_log_compressor=self._get_log_compressor,
             get_diff_compressor=self._get_diff_compressor,
             get_text_crusher=self._get_text_crusher,
+            get_code_aware_compressor=self._get_code_aware_compressor,
             token_counter=token_counter,
         )
 
@@ -1378,6 +1390,13 @@ class ContentRouter(Transform):
         Thin delegator to :meth:`CompressorRegistry.get_text_crusher`.
         """
         return self._registry.get_text_crusher()
+
+    def _get_code_aware_compressor(self) -> Any:
+        """Get CodeAwareCompressor (lazy load).
+
+        Thin delegator to :meth:`CompressorRegistry.get_code_aware_compressor`.
+        """
+        return self._registry.get_code_aware_compressor()
 
     # Transform interface
 

@@ -31,6 +31,8 @@ class CompressionStrategy(Enum):
     LOG = "log"
     TEXT = "text"
     DIFF = "diff"
+    # Opt-in AST code compression (Engine P2-12, `enable_code_aware`).
+    CODE_AWARE = "code_aware"
     MIXED = "mixed"
     PASSTHROUGH = "passthrough"
     # Reversible last-resort offload to the CCR store (ContentRouter fallback).
@@ -48,10 +50,7 @@ def strategy_from_detection(config: Any, detection: Any) -> CompressionStrategy:
         Selected strategy.
     """
     mapping = {
-        # Source code ships unmangled. (The retired AST/ML code compressors
-        # used to take this arm; their not-installed behavior was a
-        # passthrough, preserved here directly.)
-        ContentType.SOURCE_CODE: CompressionStrategy.PASSTHROUGH,
+        ContentType.SOURCE_CODE: _source_code_strategy(config),
         ContentType.JSON_ARRAY: CompressionStrategy.SMART_CRUSHER,
         ContentType.SEARCH_RESULTS: CompressionStrategy.SEARCH,
         ContentType.BUILD_OUTPUT: CompressionStrategy.LOG,
@@ -61,11 +60,21 @@ def strategy_from_detection(config: Any, detection: Any) -> CompressionStrategy:
     return mapping.get(detection.content_type, config.fallback_strategy)
 
 
+def _source_code_strategy(config: Any) -> CompressionStrategy:
+    """SOURCE_CODE routing: PASSTHROUGH by default — code ships unmangled,
+    exactly the behavior the retired AST/ML code compressors left behind.
+    The opt-in CodeAwareCompressor (``enable_code_aware=True``, Engine
+    P2-12) claims the arm instead; its dispatch arm applies the
+    ``lossless_only`` gate."""
+    if config.enable_code_aware:
+        return CompressionStrategy.CODE_AWARE
+    return CompressionStrategy.PASSTHROUGH
+
+
 def strategy_from_detection_type(config: Any, content_type: ContentType) -> CompressionStrategy:
     """Get strategy from ContentType enum."""
     mapping = {
-        # Source code ships unmangled (see strategy_from_detection).
-        ContentType.SOURCE_CODE: CompressionStrategy.PASSTHROUGH,
+        ContentType.SOURCE_CODE: _source_code_strategy(config),
         ContentType.JSON_ARRAY: CompressionStrategy.SMART_CRUSHER,
         ContentType.SEARCH_RESULTS: CompressionStrategy.SEARCH,
         ContentType.BUILD_OUTPUT: CompressionStrategy.LOG,
@@ -82,6 +91,7 @@ def content_type_from_strategy(strategy: CompressionStrategy) -> ContentType:
         CompressionStrategy.SEARCH: ContentType.SEARCH_RESULTS,
         CompressionStrategy.LOG: ContentType.BUILD_OUTPUT,
         CompressionStrategy.DIFF: ContentType.GIT_DIFF,
+        CompressionStrategy.CODE_AWARE: ContentType.SOURCE_CODE,
         CompressionStrategy.TEXT: ContentType.PLAIN_TEXT,
         CompressionStrategy.PASSTHROUGH: ContentType.PLAIN_TEXT,
         CompressionStrategy.CCR_OFFLOAD: ContentType.PLAIN_TEXT,

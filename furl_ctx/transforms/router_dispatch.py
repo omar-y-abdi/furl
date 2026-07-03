@@ -77,6 +77,7 @@ class StrategyDispatcher:
         get_log_compressor: _GetCompressor,
         get_diff_compressor: _GetCompressor,
         get_text_crusher: _GetCompressor,
+        get_code_aware_compressor: _GetCompressor,
         token_counter: Callable[[str], int] | None = None,
     ) -> tuple[str, int, list[str]]:
         """Apply a compression strategy to content.
@@ -93,6 +94,8 @@ class StrategyDispatcher:
             get_log_compressor: Router getter for the LogCompressor.
             get_diff_compressor: Router getter for the DiffCompressor.
             get_text_crusher: Router getter for the TextCrusher (P2-11).
+            get_code_aware_compressor: Router getter for the opt-in
+                CodeAwareCompressor (P2-12).
             token_counter: Optional real token counter (COR-17). When set,
                 every token count in this dispatch — original, per-strategy
                 compressed, and the fallback-chain comparisons — is measured
@@ -209,6 +212,26 @@ class StrategyDispatcher:
                         count(result.compressed),
                     )
                     decision_reason = "text_crusher"
+
+        elif strategy == CompressionStrategy.CODE_AWARE:
+            # Opt-in AST code compression (Engine P2-12, default OFF — the
+            # policy maps SOURCE_CODE here only when `enable_code_aware`).
+            # Gated off under `lossless_only` like the other line-dropping
+            # compressors (body truncation is a visible, CCR-recoverable
+            # reduction). The compressor itself fails open to a passthrough
+            # result (missing tree-sitter, unknown language, invalid render,
+            # store-write failure), which the generic no-savings handling
+            # below reports honestly.
+            if self.config.enable_code_aware and not self.config.lossless_only:
+                compressor = get_code_aware_compressor()
+                if compressor:
+                    compressor_name = type(compressor).__name__
+                    result = compressor.compress(content, language=language, context=context)
+                    compressed, compressed_tokens = (
+                        result.compressed,
+                        count(result.compressed),
+                    )
+                    decision_reason = "code_aware_compressor"
 
         elif strategy == CompressionStrategy.PASSTHROUGH:
             compressed = content
