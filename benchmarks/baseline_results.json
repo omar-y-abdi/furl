@@ -1,7 +1,7 @@
 {
-  "schema": "headroom.imp3.baseline.v1",
-  "captured_at_utc": "2026-07-02T07:20:37.290595+00:00",
-  "git_commit": "2cf086256152df82956a8cd1b38e1f3e1f0a34de",
+  "schema": "furl_ctx.imp3.baseline.v1",
+  "captured_at_utc": "2026-07-03T10:59:53.090132+00:00",
+  "git_commit": "797e4133a2e0efc8cd0a9661f221a1d942909302",
   "engine_model": "gpt-4o",
   "python": "3.14.2",
   "platform": "macOS-15.7.6-x86_64-i386-64bit-Mach-O",
@@ -11,7 +11,7 @@
       "snapshot": "benchmarks/data/code.raw.json",
       "snapshot_bytes": 185070,
       "n_items_default": 7,
-      "provenance": "Read of this repo's own source files: headroom/compress.py, headroom/tokenizer.py, headroom/config.py, headroom/transforms/smart_crusher.py, headroom/transforms/search_compressor.py, headroom/transforms/log_compressor.py, headroom/cache/compression_store.py (relative to repo root)."
+      "provenance": "Read of this repo's own source files: furl_ctx/compress.py, furl_ctx/tokenizer.py, furl_ctx/config.py, furl_ctx/transforms/smart_crusher.py, furl_ctx/transforms/search_compressor.py, furl_ctx/transforms/log_compressor.py, furl_ctx/cache/compression_store.py (relative to repo root)."
     },
     {
       "dataset": "logs",
@@ -25,7 +25,7 @@
       "snapshot": "benchmarks/data/search.raw.json",
       "snapshot_bytes": 379314,
       "n_items_default": 90,
-      "provenance": "rg --json 'def ' headroom/ \u2014 match objects parsed to {path,line_number,absolute_offset,lines} rows."
+      "provenance": "rg --json 'def ' furl_ctx/ \u2014 match objects parsed to {path,line_number,absolute_offset,lines} rows."
     },
     {
       "dataset": "repeated_logs",
@@ -46,7 +46,35 @@
       "snapshot": "benchmarks/data/multiturn.raw.json",
       "snapshot_bytes": 958121,
       "n_items_default": 135,
-      "provenance": "Two real consecutive invocations each of: `rg --json --sort path def  headroom/` (match rows parsed like the search dataset, first 90 rows per run \u2014 byte-identical across the two runs of the unchanged tree), `df -k` (rows parsed like the disk dataset, the two runs spaced ~3s apart like successive agent turns \u2014 free-space/inode cells genuinely drift between runs), and `git log -n 30` viewed one real commit apart (HEAD~1 then HEAD, parsed like the logs dataset \u2014 29/30 rows byte-identical, the canonical post-commit re-check). All six raw captures snapshotted."
+      "provenance": "Two real consecutive invocations each of: `rg --json --sort path def  furl_ctx/` (match rows parsed like the search dataset, first 90 rows per run \u2014 byte-identical across the two runs of the unchanged tree), `df -k` (rows parsed like the disk dataset, the two runs spaced ~3s apart like successive agent turns \u2014 free-space/inode cells genuinely drift between runs), and `git log -n 30` viewed one real commit apart (HEAD~1 then HEAD, parsed like the logs dataset \u2014 29/30 rows byte-identical, the canonical post-commit re-check). All six raw captures snapshotted."
+    },
+    {
+      "dataset": "ci_log",
+      "snapshot": "benchmarks/data/ci_log.raw.json",
+      "snapshot_bytes": 14803,
+      "n_items_default": 212,
+      "provenance": "Synthesized CI log (rawtext_sources.synth_ci_log, seed=20260703): npm ci warnings + cargo build warning block + pytest run with python-logging timestamped INFO/WARNING lines, one native traceback failure, and the summary line. Deterministic: same seed \u21d2 same bytes."
+    },
+    {
+      "dataset": "grep_raw",
+      "snapshot": "benchmarks/data/grep_raw.raw.json",
+      "snapshot_bytes": 28028,
+      "n_items_default": 300,
+      "provenance": "`grep -rn --include=*.py def  furl_ctx/transforms/` \u2014 raw file:line:content matches over this repo's own transforms package (real tool output, verbatim)."
+    },
+    {
+      "dataset": "diff_raw",
+      "snapshot": "benchmarks/data/diff_raw.raw.json",
+      "snapshot_bytes": 12865,
+      "n_items_default": 238,
+      "provenance": "`git diff 3154e766~1 c8d5e41b -- Cargo.lock Cargo.toml crates/furl-core/Cargo.toml` \u2014 real unified diff between two committed refs of this repo (multi-file; Cargo.lock churn dominates)."
+    },
+    {
+      "dataset": "markdown_doc",
+      "snapshot": "benchmarks/data/markdown_doc.raw.json",
+      "snapshot_bytes": 3915,
+      "n_items_default": 62,
+      "provenance": "README-shaped markdown/prose document (rawtext_sources.MARKDOWN_DOC): headers, lists, indented code blocks, paragraphs. Static committed text, snapshotted verbatim."
     }
   ],
   "datasets": [
@@ -81,7 +109,7 @@
       "took_lossy_path": true,
       "transforms": [
         "router:protected:user_message",
-        "router:mixed:0.05"
+        "router:mixed:0.07"
       ]
     },
     {
@@ -98,7 +126,7 @@
       "took_lossy_path": true,
       "transforms": [
         "router:protected:user_message",
-        "router:smart_crusher:0.04"
+        "router:smart_crusher:0.07"
       ]
     },
     {
@@ -115,7 +143,7 @@
       "took_lossy_path": true,
       "transforms": [
         "router:protected:user_message",
-        "router:smart_crusher:0.00"
+        "router:smart_crusher:0.03"
       ]
     },
     {
@@ -132,19 +160,19 @@
       "took_lossy_path": false,
       "transforms": [
         "router:protected:user_message",
-        "router:smart_crusher:0.01"
+        "router:smart_crusher:0.49"
       ]
     },
     {
       "name": "multiturn@135",
       "n_input_items": 135,
       "tokens_before": 14866,
-      "tokens_after": 2211,
-      "lossless_reduction": 0.8512713574599757,
-      "n_present": 47,
-      "n_dropped": 88,
-      "n_recoverable": 88,
-      "lossy_drop_ratio": 0.6518518518518519,
+      "tokens_after": 2141,
+      "lossless_reduction": 0.8559800887932194,
+      "n_present": 44,
+      "n_dropped": 91,
+      "n_recoverable": 91,
+      "lossy_drop_ratio": 0.674074074074074,
       "information_retention": 1.0,
       "took_lossy_path": true,
       "transforms": [
@@ -155,11 +183,79 @@
         "router:protected:user_message",
         "router:protected:user_message",
         "router:protected:user_message",
-        "router:smart_crusher:0.09",
-        "router:smart_crusher:0.01",
-        "router:smart_crusher:0.01",
-        "router:mixed:0.11",
-        "router:mixed:0.11"
+        "router:smart_crusher:0.14",
+        "router:smart_crusher:0.38",
+        "router:smart_crusher:0.49",
+        "router:mixed:0.14",
+        "router:mixed:0.15"
+      ]
+    },
+    {
+      "name": "ci_log@212",
+      "n_input_items": 212,
+      "tokens_before": 5161,
+      "tokens_after": 576,
+      "lossless_reduction": 0.8883937221468707,
+      "n_present": 34,
+      "n_dropped": 178,
+      "n_recoverable": 178,
+      "lossy_drop_ratio": 0.839622641509434,
+      "information_retention": 1.0,
+      "took_lossy_path": true,
+      "transforms": [
+        "router:protected:user_message",
+        "router:log:0.11"
+      ]
+    },
+    {
+      "name": "grep_raw@300",
+      "n_input_items": 300,
+      "tokens_before": 7472,
+      "tokens_after": 894,
+      "lossless_reduction": 0.8803533190578159,
+      "n_present": 30,
+      "n_dropped": 270,
+      "n_recoverable": 270,
+      "lossy_drop_ratio": 0.9,
+      "information_retention": 1.0,
+      "took_lossy_path": true,
+      "transforms": [
+        "router:protected:user_message",
+        "router:search:0.12"
+      ]
+    },
+    {
+      "name": "diff_raw@238",
+      "n_input_items": 238,
+      "tokens_before": 4673,
+      "tokens_after": 2701,
+      "lossless_reduction": 0.4219987160282474,
+      "n_present": 146,
+      "n_dropped": 92,
+      "n_recoverable": 92,
+      "lossy_drop_ratio": 0.3865546218487395,
+      "information_retention": 1.0,
+      "took_lossy_path": true,
+      "transforms": [
+        "router:protected:user_message",
+        "router:diff:0.58"
+      ]
+    },
+    {
+      "name": "markdown_doc@62",
+      "n_input_items": 62,
+      "tokens_before": 797,
+      "tokens_after": 345,
+      "lossless_reduction": 0.5671267252195734,
+      "n_present": 23,
+      "n_dropped": 39,
+      "n_recoverable": 39,
+      "lossy_drop_ratio": 0.6290322580645161,
+      "information_retention": 1.0,
+      "took_lossy_path": true,
+      "transforms": [
+        "router:protected:user_message",
+        "router:text:0.41"
       ]
     }
   ],
@@ -178,6 +274,22 @@
         "trials": 9
       }
     },
+    "control": {
+      "overall_output_or_ccr": 1.0,
+      "overall_visible_only": 0.6111111111111112,
+      "by_family": {
+        "search": {
+          "recall_output_or_ccr": 1.0,
+          "recall_visible_only": 1.0,
+          "trials": 9
+        },
+        "logs": {
+          "recall_output_or_ccr": 1.0,
+          "recall_visible_only": 0.2222222222222222,
+          "trials": 9
+        }
+      }
+    },
     "trials": [
       {
         "family": "search",
@@ -186,7 +298,8 @@
         "recalled": true,
         "in_output": true,
         "ccr_recoverable": false,
-        "n_visible_rows": 7
+        "n_visible_rows": 7,
+        "arm": "naming"
       },
       {
         "family": "search",
@@ -195,7 +308,8 @@
         "recalled": true,
         "in_output": true,
         "ccr_recoverable": false,
-        "n_visible_rows": 7
+        "n_visible_rows": 7,
+        "arm": "naming"
       },
       {
         "family": "search",
@@ -204,7 +318,8 @@
         "recalled": true,
         "in_output": true,
         "ccr_recoverable": false,
-        "n_visible_rows": 7
+        "n_visible_rows": 7,
+        "arm": "naming"
       },
       {
         "family": "search",
@@ -213,7 +328,8 @@
         "recalled": true,
         "in_output": true,
         "ccr_recoverable": false,
-        "n_visible_rows": 9
+        "n_visible_rows": 9,
+        "arm": "naming"
       },
       {
         "family": "search",
@@ -222,7 +338,8 @@
         "recalled": true,
         "in_output": true,
         "ccr_recoverable": false,
-        "n_visible_rows": 9
+        "n_visible_rows": 9,
+        "arm": "naming"
       },
       {
         "family": "search",
@@ -231,7 +348,8 @@
         "recalled": true,
         "in_output": true,
         "ccr_recoverable": false,
-        "n_visible_rows": 9
+        "n_visible_rows": 9,
+        "arm": "naming"
       },
       {
         "family": "search",
@@ -240,7 +358,8 @@
         "recalled": true,
         "in_output": true,
         "ccr_recoverable": false,
-        "n_visible_rows": 7
+        "n_visible_rows": 7,
+        "arm": "naming"
       },
       {
         "family": "search",
@@ -249,7 +368,8 @@
         "recalled": true,
         "in_output": true,
         "ccr_recoverable": false,
-        "n_visible_rows": 7
+        "n_visible_rows": 7,
+        "arm": "naming"
       },
       {
         "family": "search",
@@ -258,7 +378,8 @@
         "recalled": true,
         "in_output": true,
         "ccr_recoverable": false,
-        "n_visible_rows": 7
+        "n_visible_rows": 7,
+        "arm": "naming"
       },
       {
         "family": "logs",
@@ -267,7 +388,8 @@
         "recalled": true,
         "in_output": true,
         "ccr_recoverable": false,
-        "n_visible_rows": 7
+        "n_visible_rows": 7,
+        "arm": "naming"
       },
       {
         "family": "logs",
@@ -276,7 +398,8 @@
         "recalled": true,
         "in_output": true,
         "ccr_recoverable": false,
-        "n_visible_rows": 7
+        "n_visible_rows": 7,
+        "arm": "naming"
       },
       {
         "family": "logs",
@@ -285,7 +408,8 @@
         "recalled": true,
         "in_output": true,
         "ccr_recoverable": false,
-        "n_visible_rows": 7
+        "n_visible_rows": 7,
+        "arm": "naming"
       },
       {
         "family": "logs",
@@ -294,7 +418,8 @@
         "recalled": true,
         "in_output": true,
         "ccr_recoverable": false,
-        "n_visible_rows": 9
+        "n_visible_rows": 9,
+        "arm": "naming"
       },
       {
         "family": "logs",
@@ -303,7 +428,8 @@
         "recalled": true,
         "in_output": true,
         "ccr_recoverable": false,
-        "n_visible_rows": 9
+        "n_visible_rows": 9,
+        "arm": "naming"
       },
       {
         "family": "logs",
@@ -312,7 +438,8 @@
         "recalled": true,
         "in_output": true,
         "ccr_recoverable": false,
-        "n_visible_rows": 9
+        "n_visible_rows": 9,
+        "arm": "naming"
       },
       {
         "family": "logs",
@@ -321,7 +448,8 @@
         "recalled": true,
         "in_output": true,
         "ccr_recoverable": false,
-        "n_visible_rows": 18
+        "n_visible_rows": 18,
+        "arm": "naming"
       },
       {
         "family": "logs",
@@ -330,7 +458,8 @@
         "recalled": true,
         "in_output": true,
         "ccr_recoverable": false,
-        "n_visible_rows": 18
+        "n_visible_rows": 18,
+        "arm": "naming"
       },
       {
         "family": "logs",
@@ -339,7 +468,188 @@
         "recalled": true,
         "in_output": true,
         "ccr_recoverable": false,
-        "n_visible_rows": 18
+        "n_visible_rows": 18,
+        "arm": "naming"
+      },
+      {
+        "family": "search",
+        "cardinality": 30,
+        "position": "start",
+        "recalled": true,
+        "in_output": true,
+        "ccr_recoverable": false,
+        "n_visible_rows": 7,
+        "arm": "control"
+      },
+      {
+        "family": "search",
+        "cardinality": 30,
+        "position": "middle",
+        "recalled": true,
+        "in_output": true,
+        "ccr_recoverable": false,
+        "n_visible_rows": 7,
+        "arm": "control"
+      },
+      {
+        "family": "search",
+        "cardinality": 30,
+        "position": "end",
+        "recalled": true,
+        "in_output": true,
+        "ccr_recoverable": false,
+        "n_visible_rows": 7,
+        "arm": "control"
+      },
+      {
+        "family": "search",
+        "cardinality": 90,
+        "position": "start",
+        "recalled": true,
+        "in_output": true,
+        "ccr_recoverable": false,
+        "n_visible_rows": 9,
+        "arm": "control"
+      },
+      {
+        "family": "search",
+        "cardinality": 90,
+        "position": "middle",
+        "recalled": true,
+        "in_output": true,
+        "ccr_recoverable": false,
+        "n_visible_rows": 9,
+        "arm": "control"
+      },
+      {
+        "family": "search",
+        "cardinality": 90,
+        "position": "end",
+        "recalled": true,
+        "in_output": true,
+        "ccr_recoverable": false,
+        "n_visible_rows": 9,
+        "arm": "control"
+      },
+      {
+        "family": "search",
+        "cardinality": 300,
+        "position": "start",
+        "recalled": true,
+        "in_output": true,
+        "ccr_recoverable": false,
+        "n_visible_rows": 7,
+        "arm": "control"
+      },
+      {
+        "family": "search",
+        "cardinality": 300,
+        "position": "middle",
+        "recalled": true,
+        "in_output": true,
+        "ccr_recoverable": false,
+        "n_visible_rows": 7,
+        "arm": "control"
+      },
+      {
+        "family": "search",
+        "cardinality": 300,
+        "position": "end",
+        "recalled": true,
+        "in_output": true,
+        "ccr_recoverable": false,
+        "n_visible_rows": 7,
+        "arm": "control"
+      },
+      {
+        "family": "logs",
+        "cardinality": 30,
+        "position": "start",
+        "recalled": true,
+        "in_output": true,
+        "ccr_recoverable": false,
+        "n_visible_rows": 7,
+        "arm": "control"
+      },
+      {
+        "family": "logs",
+        "cardinality": 30,
+        "position": "middle",
+        "recalled": true,
+        "in_output": false,
+        "ccr_recoverable": true,
+        "n_visible_rows": 7,
+        "arm": "control"
+      },
+      {
+        "family": "logs",
+        "cardinality": 30,
+        "position": "end",
+        "recalled": true,
+        "in_output": true,
+        "ccr_recoverable": false,
+        "n_visible_rows": 7,
+        "arm": "control"
+      },
+      {
+        "family": "logs",
+        "cardinality": 90,
+        "position": "start",
+        "recalled": true,
+        "in_output": false,
+        "ccr_recoverable": true,
+        "n_visible_rows": 8,
+        "arm": "control"
+      },
+      {
+        "family": "logs",
+        "cardinality": 90,
+        "position": "middle",
+        "recalled": true,
+        "in_output": false,
+        "ccr_recoverable": true,
+        "n_visible_rows": 8,
+        "arm": "control"
+      },
+      {
+        "family": "logs",
+        "cardinality": 90,
+        "position": "end",
+        "recalled": true,
+        "in_output": false,
+        "ccr_recoverable": true,
+        "n_visible_rows": 8,
+        "arm": "control"
+      },
+      {
+        "family": "logs",
+        "cardinality": 300,
+        "position": "start",
+        "recalled": true,
+        "in_output": false,
+        "ccr_recoverable": true,
+        "n_visible_rows": 17,
+        "arm": "control"
+      },
+      {
+        "family": "logs",
+        "cardinality": 300,
+        "position": "middle",
+        "recalled": true,
+        "in_output": false,
+        "ccr_recoverable": true,
+        "n_visible_rows": 17,
+        "arm": "control"
+      },
+      {
+        "family": "logs",
+        "cardinality": 300,
+        "position": "end",
+        "recalled": true,
+        "in_output": false,
+        "ccr_recoverable": true,
+        "n_visible_rows": 17,
+        "arm": "control"
       }
     ]
   }
