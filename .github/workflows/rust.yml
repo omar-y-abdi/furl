@@ -113,9 +113,14 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-audit,cargo-deny
-      - name: cargo audit (soft-fail)
-        continue-on-error: true
+      # SEC-8: both steps used to run `continue-on-error: true`, so a critical
+      # RUSTSEC advisory in the statically-linked graph (which vendors onig_sys
+      # C/C++ and ring) could never turn CI red. They hard-fail now — each as
+      # its own named step so a red run points at the exact gate. The audit
+      # soft-fail arrived unexplained with the inherited initial commit; no
+      # flakiness was ever recorded for it, and an audit failure on a freshly
+      # published advisory is the signal working as designed, not flake.
+      - name: cargo audit
         run: cargo audit
       - name: cargo deny check licenses
-        continue-on-error: true
         run: cargo deny check licenses

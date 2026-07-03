@@ -32,8 +32,8 @@ from furl_ctx.ccr.mcp_server import MCP_SESSION_TTL, FurlMCPServer  # noqa: E402
 @pytest.fixture(autouse=True)
 def _isolate_store(tmp_path, monkeypatch):
     """Mirror the handler-test isolation: sandboxed workspace, fresh singleton,
-    and a clean backend-selection environment."""
-    monkeypatch.setattr(mcp_server, "SHARED_STATS_FILE", tmp_path / "shared_stats.jsonl")
+    and a clean backend-selection environment. The shared-stats paths follow
+    FURL_WORKSPACE_DIR per call (SEC-7), so the setenv alone sandboxes them."""
     monkeypatch.setenv("FURL_WORKSPACE_DIR", str(tmp_path))
     monkeypatch.delenv("FURL_CCR_BACKEND", raising=False)
     monkeypatch.delenv("FURL_CCR_SQLITE_PATH", raising=False)

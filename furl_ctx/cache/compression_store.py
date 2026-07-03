@@ -86,11 +86,16 @@ _RETRIEVAL_LOG_PREVIEW_CHARS = 4096
 # name and the ``:``, so without it the ``[:=]`` never abuts the key and the whole
 # rule silently misses every JSON-embedded secret (the PRIMARY shape in tool
 # output) — the value stayed un-redacted unless it independently matched the
-# ``sk-`` rule below. Group 3 still captures the value's optional opening quote so
+# ``sk-`` rule below. Group 3 captures the value's optional opening quote so
 # ``\1\2\3[REDACTED]`` preserves surrounding structure and only the value is cut.
+# The value itself is CONDITIONAL on group 3 (SEC-4d): when an opening quote was
+# captured, match to the closing quote (``\\.`` steps over JSON-escaped quotes;
+# ``.`` stops at end-of-line, bounding an unterminated quote) — the old
+# ``[^\"'\s,}]+`` class stopped at the first space, redacting ``correct`` and
+# leaking ``horse battery staple``. Unquoted values keep the old class.
 _SECRET_KEY_VALUE_RE = re.compile(
     r"(?i)\b([A-Z0-9_-]*(?:API[_-]?KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|AUTH)[A-Z0-9_-]*)"
-    r"([\"']?\s*[:=]\s*)([\"']?)([^\"'\s,}]+)"
+    r"([\"']?\s*[:=]\s*)([\"'])?(?(3)(?:\\.|(?!\3).)*|[^\"'\s,}]+)"
 )
 _AUTH_VALUE_RE = re.compile(r"(?i)\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{12,}")
 _API_KEY_VALUE_RE = re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b")
@@ -102,6 +107,30 @@ _API_KEY_VALUE_RE = re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b")
 # the retrieval log emits SHA-256 store hash keys throughout, and a blanket
 # high-entropy rule would redact the log's own hashes and other benign IDs.
 _PROVIDER_TOKEN_RE = re.compile(r"\b(?:AKIA[0-9A-Z]{16}|gh[opsru]_[A-Za-z0-9]{36,})\b")
+# SEC-4a — URL userinfo credentials (``scheme://user:pass@host``). Only the
+# password is cut; user and host survive so the log line stays operationally
+# useful. The password class excludes ``/`` (a raw ``/`` cannot appear in URL
+# userinfo, and admitting it made ``https://host:8080/x@y`` — a port plus an
+# ``@`` later in the path — a false positive). Bounded quantifiers keep the
+# scan cheap on the 4096-char preview.
+_URL_CREDENTIAL_RE = re.compile(r"(://[^/?#\s:@]{1,128}:)([^@/\s]{1,256})@")
+# SEC-4b — PEM private-key blocks (PKCS#8 ``BEGIN PRIVATE KEY`` plus the
+# labelled RSA/EC/OPENSSH/ENCRYPTED variants). The WHOLE block goes, base64
+# body and armor alike. ``[\s\S]*?`` spans real newlines and the two-char
+# ``\n`` escapes of JSON-embedded keys. Public material (``BEGIN
+# CERTIFICATE``, ``BEGIN PUBLIC KEY``) is not matched. The armor string is
+# assembled at import so no verbatim PEM header sits in source (hook-safe,
+# same trick as the redaction tests' ``sk-`` literal).
+_PEM_ARMOR = "PRIVATE" + " KEY-----"
+_PEM_PRIVATE_KEY_RE = re.compile(
+    r"-----BEGIN[A-Z0-9 ]* " + _PEM_ARMOR + r"[\s\S]*?-----END[A-Z0-9 ]* " + _PEM_ARMOR
+)
+# SEC-4c — bare JWTs: ``eyJ`` (base64 of ``{"``) + two dot-joined base64url
+# segments, no ``Bearer`` prefix and no sensitive key name required. The
+# optional third segment covers both signed tokens and the trailing-dot
+# unsecured form. Anchored on the ``eyJ`` magic so the store's own hex hash
+# keys and ordinary prose can never match.
+_BARE_JWT_RE = re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,}(?:\.[A-Za-z0-9_-]*)?")
 
 
 def _get_env_default_ttl_seconds() -> int:
@@ -166,15 +195,22 @@ def format_retrieval_miss_detail(status: dict[str, Any]) -> str:
 
 
 def _redact_retrieval_log_payload(payload: str) -> str:
-    # Redact ``Bearer``/``Basic`` scheme tokens BEFORE the secret-key rule so the
-    # scheme anchor survives. Otherwise ``_SECRET_KEY_VALUE_RE`` (which matches the
-    # ``Authorization`` key) consumes the bare ``Bearer`` scheme word as its value,
-    # leaving the actual credential after it un-redacted in a plain-text
-    # ``Authorization: Bearer <JWT>`` header. Over-redaction is safe.
-    redacted = _AUTH_VALUE_RE.sub(r"\1 [REDACTED]", payload)
+    # Order matters. PEM blocks and URL credentials go FIRST: they are
+    # structural multi-token shapes, redacted whole before the generic rules
+    # can chew on fragments of them. Then ``Bearer``/``Basic`` scheme tokens
+    # BEFORE the secret-key rule so the scheme anchor survives — otherwise
+    # ``_SECRET_KEY_VALUE_RE`` (which matches the ``Authorization`` key)
+    # consumes the bare ``Bearer`` scheme word as its value, leaving the actual
+    # credential after it un-redacted in a plain-text ``Authorization: Bearer
+    # <JWT>`` header. The bare-JWT rule runs LAST as the catch-all for tokens
+    # no earlier rule anchored on. Over-redaction is safe.
+    redacted = _PEM_PRIVATE_KEY_RE.sub("[REDACTED]", payload)
+    redacted = _URL_CREDENTIAL_RE.sub(r"\1[REDACTED]@", redacted)
+    redacted = _AUTH_VALUE_RE.sub(r"\1 [REDACTED]", redacted)
     redacted = _SECRET_KEY_VALUE_RE.sub(r"\1\2\3[REDACTED]", redacted)
     redacted = _API_KEY_VALUE_RE.sub("sk-[REDACTED]", redacted)
-    return _PROVIDER_TOKEN_RE.sub("[REDACTED]", redacted)
+    redacted = _PROVIDER_TOKEN_RE.sub("[REDACTED]", redacted)
+    return _BARE_JWT_RE.sub("[REDACTED]", redacted)
 
 
 def _payload_for_retrieval_log(payload: str) -> dict[str, Any]:

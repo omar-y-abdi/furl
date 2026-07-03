@@ -27,3 +27,21 @@ updates:
         update-types:
           - "minor"
           - "patch"
+
+  # Rust dependency updates (cargo) — SEC-8: without this entry the Rust
+  # graph (the one cargo-audit gates) never received update PRs at all.
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      # "chore", NOT "deps": commitlint's type-enum does not include "deps"
+      # (TEST-29 — the pip entry above trips exactly that), so a "deps(...)"
+      # PR title arrives with a red required check. "chore" is in the enum.
+      prefix: "chore"
+    open-pull-requests-limit: 5
+    groups:
+      cargo-minor-patch:
+        update-types:
+          - "minor"
+          - "patch"

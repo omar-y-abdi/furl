@@ -50,13 +50,11 @@ from furl_ctx.ccr.mcp_server import (  # noqa: E402
 def _isolate_store(tmp_path, monkeypatch):
     # The CCR store is a process-singleton; reset around every test so a
     # round-trip in one test cannot leak entries into another's stats/retrieve.
-    # Also redirect the shared-stats file to a per-test tmp path so
-    # record_compression() never writes to ~/.furl (keep file mods scoped
-    # to the test sandbox). Stats tests override this with their own path.
-    monkeypatch.setattr(mcp_server, "SHARED_STATS_FILE", tmp_path / "shared_stats.jsonl")
     # furl_read is jailed to $FURL_WORKSPACE_DIR (default cwd). Point it
-    # at the per-test sandbox so file-read happy-path tests run inside the jail;
-    # out-of-jail rejection is covered explicitly below.
+    # at the per-test sandbox so file-read happy-path tests run inside the jail.
+    # The shared-stats paths follow the same env per call (SEC-7:
+    # shared_stats_file() re-reads FURL_WORKSPACE_DIR), so this single setenv
+    # also keeps record_compression() from ever writing to ~/.furl.
     monkeypatch.setenv("FURL_WORKSPACE_DIR", str(tmp_path))
     reset_compression_store()
     yield
@@ -230,16 +228,17 @@ def _write_shared_events(path: Path, events: list[dict]) -> None:
     path.write_text("\n".join(lines) + "\n")
 
 
-async def test_stats_aggregates_subagent_savings(server, tmp_path, monkeypatch) -> None:
+async def test_stats_aggregates_subagent_savings(server, tmp_path) -> None:
     # Drive the cross-process aggregation branch (:603-623): a sub-agent
     # (foreign pid) compressed 1000 → 100 tokens. With this session's own
     # stats at zero, all_input = 1000, all_saved = 900 → 90.0%.
+    # The autouse fixture's FURL_WORKSPACE_DIR=tmp_path makes this exact path
+    # what shared_stats_file() resolves to (SEC-7 live paths).
     stats_file = tmp_path / "session_stats.jsonl"
     _write_shared_events(
         stats_file,
         [{"type": "compress", "input_tokens": 1000, "output_tokens": 100}],
     )
-    monkeypatch.setattr(mcp_server, "SHARED_STATS_FILE", stats_file)
 
     env = _envelope(await server._handle_stats())
 
@@ -251,16 +250,15 @@ async def test_stats_aggregates_subagent_savings(server, tmp_path, monkeypatch) 
     assert env["sub_agents"]["tokens_saved"] == 900
 
 
-async def test_stats_all_input_zero_boundary_returns_zero(server, tmp_path, monkeypatch) -> None:
+async def test_stats_all_input_zero_boundary_returns_zero(server, tmp_path) -> None:
     # :621 boundary — a sub-agent event with input_tokens == 0 enters the
     # aggregation block (other_events non-empty) but yields all_input == 0,
     # so savings_percent must take the `else 0` branch (no ZeroDivisionError).
-    stats_file = tmp_path / "session_stats.jsonl"
+    stats_file = tmp_path / "session_stats.jsonl"  # == shared_stats_file() under the fixture env
     _write_shared_events(
         stats_file,
         [{"type": "compress", "input_tokens": 0, "output_tokens": 0}],
     )
-    monkeypatch.setattr(mcp_server, "SHARED_STATS_FILE", stats_file)
 
     env = _envelope(await server._handle_stats())
 
@@ -269,14 +267,11 @@ async def test_stats_all_input_zero_boundary_returns_zero(server, tmp_path, monk
     assert env["combined"]["total_tokens_saved"] == 0
 
 
-async def test_stats_no_subagent_events_has_no_combined_block(
-    server, tmp_path, monkeypatch
-) -> None:
+async def test_stats_no_subagent_events_has_no_combined_block(server, tmp_path) -> None:
     # Boundary complement: with NO foreign events, the aggregation block is
     # skipped entirely — no `combined`/`sub_agents` keys, only base stats.
-    stats_file = tmp_path / "session_stats.jsonl"
+    stats_file = tmp_path / "session_stats.jsonl"  # == shared_stats_file() under the fixture env
     stats_file.write_text("")  # empty → no events
-    monkeypatch.setattr(mcp_server, "SHARED_STATS_FILE", stats_file)
 
     env = _envelope(await server._handle_stats())
 

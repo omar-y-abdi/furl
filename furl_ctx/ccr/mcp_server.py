@@ -155,6 +155,62 @@ def _workspace_root() -> Path:
     return Path.cwd().resolve()
 
 
+# The component-by-component jail walk needs openat()-style dir_fd opens plus
+# O_DIRECTORY/O_NOFOLLOW — present on macOS and Linux, absent on Windows.
+_DIR_FD_WALK_SUPPORTED = (
+    os.open in os.supports_dir_fd and hasattr(os, "O_DIRECTORY") and hasattr(os, "O_NOFOLLOW")
+)
+
+
+def _open_jailed(path: Path, root: Path) -> int:
+    """Open ``path`` read-only with every component pinned under ``root``.
+
+    ``path`` must already be confirmed ``is_relative_to(root)`` by the caller
+    (both sides ``resolve()``-d). This function closes the SEC-5 residual in
+    that check: ``O_NOFOLLOW`` on a single ``os.open(path)`` guards only the
+    FINAL component, so a *directory* component swapped for a symlink between
+    the caller's ``resolve()`` and the open was silently followed out of the
+    jail (TOCTOU).
+
+    POSIX (macOS/Linux): walk from the workspace root one component at a
+    time, each step an ``os.open(part, dir_fd=parent_fd)`` with ``O_NOFOLLOW``
+    (plus ``O_DIRECTORY`` for intermediates) — a component swapped to a
+    symlink fails its own open (ENOTDIR/ELOOP) instead of being followed, and
+    each step resolves relative to the already-pinned parent fd, never by
+    re-walking the full path. The returned fd is the pinned descriptor the
+    caller fstat()s and reads: no second path lookup anywhere.
+
+    Windows (no ``dir_fd`` support): falls back to one direct open of the
+    ``resolve()``-d path. Residual threat model, documented and accepted: on
+    that platform an intermediate component swapped for a link between
+    ``resolve()`` and open is followed; the jail there rests on the
+    resolve()+is_relative_to pre-check (and furl_read ships off-by-default).
+
+    Raises ``FileNotFoundError``/``OSError`` exactly like ``os.open``; callers
+    map them to the "File not found" / generic "Cannot read file" envelopes.
+    """
+    if not _DIR_FD_WALK_SUPPORTED:
+        return os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+
+    rel_parts = path.relative_to(root).parts
+    fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in rel_parts[:-1]:
+            next_fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = next_fd
+        if not rel_parts:
+            # path == root: hand back the root fd; the caller's S_ISREG gate
+            # turns a directory into the "Not a file" envelope.
+            return fd
+        final_fd = os.open(rel_parts[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=fd)
+    except BaseException:
+        os.close(fd)
+        raise
+    os.close(fd)
+    return final_fd
+
+
 # Feature flag: enable furl_read tool (file read caching via CCR)
 # Set FURL_MCP_READ=on to enable
 _READ_ENABLED = os.environ.get("FURL_MCP_READ", "off").lower().strip() in (
@@ -210,21 +266,41 @@ def _default_store_backend() -> Any:
 # Shared stats file: all MCP instances (main + sub-agents) append here.
 # furl_stats aggregates across all instances within the session window.
 # Respects FURL_WORKSPACE_DIR.
-SHARED_STATS_DIR = _paths.workspace_dir()
-SHARED_STATS_FILE = _paths.session_stats_path()
+#
+# Functions, not import-frozen constants (SEC-7): paths.py's contract is
+# explicit — "No caching. Every call re-reads the environment" — and the
+# furl_read jail already re-reads FURL_WORKSPACE_DIR per call. Freezing these
+# two at import let the stats file and the jail disagree about the workspace
+# when the env changes after import (tests, host re-configuration). Each use
+# site calls these; within one operation the value is read once and kept in a
+# local so a single append/read never straddles two workspaces.
 SESSION_WINDOW_SECONDS = 7200  # 2 hours — events older than this are pruned
+
+
+def shared_stats_dir() -> Path:
+    """Workspace directory holding the shared stats file (re-read per call)."""
+    return _paths.workspace_dir()
+
+
+def shared_stats_file() -> Path:
+    """Path of the cross-process session stats JSONL file (re-read per call)."""
+    return _paths.session_stats_path()
 
 
 def _append_shared_event(event: dict[str, Any]) -> None:
     """Append an event to the shared stats file (cross-process, file-locked)."""
     try:
-        SHARED_STATS_DIR.mkdir(parents=True, exist_ok=True)
+        shared_stats_dir().mkdir(parents=True, exist_ok=True)
         event["pid"] = os.getpid()
         line = json.dumps(event, separators=(",", ":")) + "\n"
-        with open(SHARED_STATS_FILE, "a") as f:
+        with open(shared_stats_file(), "a") as f:
             if _HAS_FCNTL:
                 fcntl.flock(f, fcntl.LOCK_EX)
             f.write(line)
+            # Flush BEFORE releasing the lock: an append still sitting in the
+            # userspace buffer when the lock drops can interleave with the
+            # prune-rewrite in _read_shared_events (SEC-6 protocol soundness).
+            f.flush()
             if _HAS_FCNTL:
                 fcntl.flock(f, fcntl.LOCK_UN)
     except Exception:
@@ -232,41 +308,55 @@ def _append_shared_event(event: dict[str, Any]) -> None:
 
 
 def _read_shared_events(window_seconds: int = SESSION_WINDOW_SECONDS) -> list[dict[str, Any]]:
-    """Read shared events within the session time window, pruning old entries."""
-    if not SHARED_STATS_FILE.exists():
+    """Read shared events within the session time window, pruning old entries.
+
+    Read and prune-rewrite happen on ONE ``r+`` handle under ONE exclusive
+    lock (SEC-6). The old flow read under ``LOCK_SH``, released, then rewrote
+    under a separate ``open(..., "w")`` + ``LOCK_EX`` — an event appended by
+    another MCP process between the two locks was silently destroyed by the
+    rewrite, and the ``"w"`` open truncated the file BEFORE its lock was even
+    acquired, so the rewrite wasn't atomic even against a correctly-locked
+    appender.
+    """
+    stats_file = shared_stats_file()
+    if not stats_file.exists():
         return []
     cutoff = time.time() - window_seconds
     events: list[dict[str, Any]] = []
     keep_lines: list[str] = []
     try:
-        with open(SHARED_STATS_FILE) as f:
+        with open(stats_file, "r+") as f:
             if _HAS_FCNTL:
-                fcntl.flock(f, fcntl.LOCK_SH)
-            lines = f.readlines()
-            if _HAS_FCNTL:
-                fcntl.flock(f, fcntl.LOCK_UN)
-        for line in lines:
-            line = line.strip()
-            if not line:
-                continue
+                fcntl.flock(f, fcntl.LOCK_EX)
             try:
-                evt = json.loads(line)
-                if evt.get("timestamp", 0) >= cutoff:
-                    events.append(evt)
-                    keep_lines.append(line + "\n")
-            except json.JSONDecodeError:
-                continue
-        # Prune old entries (only if we dropped some)
-        if len(keep_lines) < len(lines):
-            try:
-                with open(SHARED_STATS_FILE, "w") as f:
-                    if _HAS_FCNTL:
-                        fcntl.flock(f, fcntl.LOCK_EX)
-                    f.writelines(keep_lines)
-                    if _HAS_FCNTL:
-                        fcntl.flock(f, fcntl.LOCK_UN)
-            except Exception:
-                logger.debug("Shared-stats prune failed (non-fatal)", exc_info=True)
+                lines = f.readlines()
+                for line in lines:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        evt = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if evt.get("timestamp", 0) >= cutoff:
+                        events.append(evt)
+                        keep_lines.append(line + "\n")
+                # Prune old entries (only if we dropped some) — same handle,
+                # same lock, so no appender can slip between read and rewrite.
+                if len(keep_lines) < len(lines):
+                    try:
+                        f.seek(0)
+                        f.truncate()
+                        f.writelines(keep_lines)
+                        # Land the rewrite before the lock releases (an
+                        # unflushed rewrite could interleave with the next
+                        # locked appender).
+                        f.flush()
+                    except Exception:
+                        logger.debug("Shared-stats prune failed (non-fatal)", exc_info=True)
+            finally:
+                if _HAS_FCNTL:
+                    fcntl.flock(f, fcntl.LOCK_UN)
     except Exception:
         logger.debug("Shared-stats read failed (non-fatal)", exc_info=True)
     return events
@@ -919,13 +1009,14 @@ class FurlMCPServer:
         # Open ONCE and pin the file descriptor, then stat + read from that SAME
         # fd (TOCTOU defense): the old flow re-opened the path by name for the
         # size stat and again for the body read, so a swap between checks could
-        # serve a different inode than the one validated. ``O_NOFOLLOW`` refuses
-        # a final-component symlink (the jail's resolve() already collapses
-        # symlinks before is_relative_to, this is the belt-and-braces at open).
+        # serve a different inode than the one validated. ``_open_jailed`` walks
+        # every component from the workspace root with dir_fd + O_NOFOLLOW
+        # (SEC-5: a single O_NOFOLLOW open guarded only the final component; a
+        # directory component swapped to a symlink after resolve() escaped).
         # ``fstat`` on the fd drives the regular-file, hardlink, and size checks
         # so they describe exactly the inode we will read — no second lookup.
         try:
-            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+            fd = _open_jailed(path, root)
         except FileNotFoundError:
             # Missing path (or a final-component symlink removed between resolve
             # and open). Mirror the prior exists()-check message + path echo.
@@ -974,7 +1065,10 @@ class FurlMCPServer:
 
             # Reject a multiply-linked inode: an in-jail hardlink can point at an
             # out-of-jail inode and resolve() cannot see through a hardlink
-            # (unlike a symlink), so is_relative_to alone would pass it.
+            # (unlike a symlink), so is_relative_to alone would pass it. The
+            # error string is honest about WHY (SEC-5): a legitimately
+            # hardlinked in-jail file is rejected too, and telling its owner
+            # "path outside workspace" was simply false.
             if st.st_nlink > 1:
                 logger.warning(
                     "event=mcp_read_rejected reason=multiply_linked_inode nlink=%d root=%s",
@@ -984,7 +1078,7 @@ class FurlMCPServer:
                 return [
                     TextContent(
                         type="text",
-                        text=json.dumps({"error": "path outside workspace"}),
+                        text=json.dumps({"error": "hardlinked file rejected"}),
                     )
                 ]
 

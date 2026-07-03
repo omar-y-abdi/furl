@@ -31,7 +31,6 @@ from furl_ctx.cache.compression_store import (  # noqa: E402
     get_compression_store,
     reset_compression_store,
 )
-from furl_ctx.ccr import mcp_server  # noqa: E402
 from furl_ctx.ccr.mcp_server import FurlMCPServer  # noqa: E402
 from furl_ctx.compress import CompressResult  # noqa: E402
 from furl_ctx.tokenizers import get_tokenizer  # noqa: E402
@@ -46,10 +45,10 @@ compress_mod = importlib.import_module("furl_ctx.compress")
 
 @pytest.fixture(autouse=True)
 def _isolate_store(tmp_path, monkeypatch):
-    # Mirror test_mcp_server_handlers isolation: per-test shared-stats file,
-    # workspace jail in tmp (the sqlite default backend then lives under the
-    # sandboxed workspace), fresh store singleton around every test.
-    monkeypatch.setattr(mcp_server, "SHARED_STATS_FILE", tmp_path / "shared_stats.jsonl")
+    # Mirror test_mcp_server_handlers isolation: workspace jail in tmp (the
+    # sqlite default backend AND the shared-stats file — whose path follows
+    # FURL_WORKSPACE_DIR per call, SEC-7 — then live under the sandboxed
+    # workspace), fresh store singleton around every test.
     monkeypatch.setenv("FURL_WORKSPACE_DIR", str(tmp_path))
     monkeypatch.delenv("FURL_CCR_BACKEND", raising=False)
     reset_compression_store()
