@@ -523,12 +523,22 @@ class CompressionStore:
         self,
         hash_key: str,
         query: str | None = None,
+        *,
+        record_feedback_signal: bool = True,
     ) -> CompressionEntry | None:
         """Retrieve original content by hash.
 
         Args:
             hash_key: Hash key returned by store().
             query: Optional query for retrieval-event tracking.
+            record_feedback_signal: When True (default), a hit feeds one
+                signal into the local retrieval-feedback loop (Engine P2-13)
+                keyed by the entry's compression metadata. Engine-INTERNAL
+                verification reads — the CCR-offload round-trip and the
+                CCR-mirror backing check — pass False so the loop learns only
+                from real (model-driven) retrievals; they otherwise keep the
+                store's pre-existing bookkeeping (retrieval_count, event log)
+                unchanged.
 
         Returns:
             CompressionEntry if found and not expired, ``None`` otherwise.
@@ -580,6 +590,15 @@ class CompressionStore:
             # (entry could be modified/evicted after lock release)
             # The entry contains mutable fields (search_queries list) that must be copied
             result_entry = replace(entry, search_queries=list(entry.search_queries))
+
+        # Engine P2-13: a real hit is the retrieval-feedback signal — the
+        # model needed content this entry's compression dropped. Emitted
+        # OUTSIDE the store lock (the aggregator's lock is a leaf; the store
+        # never nests into it) and only for model-driven retrievals (see the
+        # ``record_feedback_signal`` doc above). Misses and expired entries
+        # returned ``None`` earlier and never reach this point.
+        if record_feedback_signal and self._enable_feedback:
+            self._emit_retrieval_signal(result_entry.tool_name, result_entry.compression_strategy)
 
         return result_entry
 
@@ -968,13 +987,45 @@ class CompressionStore:
         between the search's read and this bump — in that case there is
         nothing to record and the results (built from a pre-eviction copy)
         still ship to the caller.
+
+        Engine P2-13: this bump is also the search-side retrieval-feedback
+        emission point. ``search()`` calls here only when results actually
+        shipped (COR-37), so the feedback loop inherits the same honesty —
+        zero-result probes never emit a signal.
         """
+        signal_meta: tuple[str | None, str | None] | None = None
         with self._lock:
             entry = self._backend.get(hash_key)
             if entry is None or entry.is_expired():
                 return
             entry.record_access(query)
             self._backend.set(hash_key, entry)
+            signal_meta = (entry.tool_name, entry.compression_strategy)
+        # Emit outside the store lock (aggregator lock is a leaf — no nesting).
+        if self._enable_feedback and signal_meta is not None:
+            self._emit_retrieval_signal(*signal_meta)
+
+    def _emit_retrieval_signal(
+        self,
+        tool_name: str | None,
+        compression_strategy: str | None,
+    ) -> None:
+        """Feed one model-driven retrieval into the local feedback loop.
+
+        Never raises: the feedback plane is ADVISORY — a broken aggregator
+        must not turn a successful retrieval into a failure. Imported lazily
+        so the store stays importable without the feedback module and the
+        emission stays monkeypatch-friendly in tests.
+        """
+        try:
+            from . import retrieval_feedback
+
+            retrieval_feedback.record_retrieval_signal(
+                tool_name=tool_name,
+                compression_strategy=compression_strategy,
+            )
+        except Exception as e:  # pragma: no cover - defensive
+            logger.debug("retrieval-feedback signal dropped (non-fatal): %s", e)
 
     def exists(self, hash_key: str, clean_expired: bool = False) -> bool:
         """Check if a hash key exists and is not expired.

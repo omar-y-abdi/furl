@@ -161,7 +161,10 @@ class DiffCompressor:
             # store() defaults to SHA-256(original)[:24]. Pass the
             # marker's key explicitly so retrieving the marker hash
             # actually finds the entry.
-            store.store(original, compressed, explicit_hash=cache_key)
+            # compression_strategy attributes the entry to its route so
+            # retrievals feed the shape-keyed retrieval-feedback loop
+            # (Engine P2-13; value = CompressionStrategy.DIFF.value).
+            store.store(original, compressed, explicit_hash=cache_key, compression_strategy="diff")
             return True
         except Exception as e:
             logger.error(

@@ -599,7 +599,16 @@ class FurlMCPServer:
         hash_key: str,
         query: str | None,
     ) -> dict[str, Any]:
-        """Retrieve content from the local CCR store."""
+        """Retrieve content from the local CCR store.
+
+        Retrieval-feedback wiring (Engine P2-13): this handler is where real
+        model-driven retrievals land, and the signal they emit rides the
+        store's own access bump — ``store.retrieve`` on the full path,
+        ``store.search`` → ``_record_search_access`` on the query path (which
+        fires only when results shipped, COR-37). No second emission here:
+        the store is the single honest choke point, and a handler-level
+        emission would double-count every retrieval.
+        """
         store = self._get_local_store()
         if query:
             results = store.search(hash_key, query)

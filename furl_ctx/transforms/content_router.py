@@ -41,7 +41,7 @@ import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from ..ccr import marker_grammar
 from ..ccr.tool_injection import CCR_TOOL_NAME
@@ -88,6 +88,12 @@ from .router_split import (
     is_mixed_content,
     split_into_sections,
 )
+
+if TYPE_CHECKING:
+    # Annotation-only: the runtime import stays lazy inside
+    # ``_get_feedback_hints`` — content_router never imports the cache
+    # package at module level (same deferred-import rule as the CCR store).
+    from ..cache.retrieval_feedback import FeedbackHints
 
 logger = logging.getLogger(__name__)
 
@@ -505,6 +511,19 @@ class ContentRouterConfig:
     # protect_recent_code protections run BEFORE routing and still
     # win; `lossless_only` gates the dispatch arm off.
     enable_code_aware: bool = False
+    # Retrieval-feedback loop (Engine P2-13): OPT-IN adaptive routing driven
+    # by the store's own retrieval bookkeeping. Default OFF — the feedback
+    # aggregator is never consulted and routing is byte-identical to the
+    # pre-P2-13 engine (pinned by test_retrieval_feedback_router.py). When
+    # True, the router consults ``furl_ctx.cache.retrieval_feedback`` at
+    # routing time: a content shape (tool name + detected content type) the
+    # model recently retrieved from the CCR store gets a keep-budget bias
+    # multiplier, and under sustained retrieval pressure a full compression
+    # skip (``router:feedback:skip``). Signals are LOCAL-ONLY — an in-process
+    # aggregator fed by ``CompressionStore.retrieve``/``search`` real hits
+    # (COR-37-honest; engine-internal verification reads opt out). No
+    # telemetry, no disk ledger.
+    enable_retrieval_feedback: bool = False
 
     # Routing preferences
     mixed_content_threshold: int = 2  # Min types to consider mixed
@@ -1002,7 +1021,10 @@ class ContentRouter(Transform):
                 query_context=context or None,
                 compression_strategy=CompressionStrategy.CCR_OFFLOAD.value,
             )
-            entry = store.retrieve(ccr_hash)
+            # Round-trip verification is an ENGINE-INTERNAL read — it must not
+            # feed the retrieval-feedback loop as if the model asked for this
+            # content back (Engine P2-13).
+            entry = store.retrieve(ccr_hash, record_feedback_signal=False)
             if entry is None or entry.original_content != content:
                 logger.warning("ccr_offload: round-trip failed for %s; keeping original", ccr_hash)
                 return None
@@ -1648,6 +1670,7 @@ class ContentRouter(Transform):
             role = message.get("role", "")
             content = message.get("content", "")
             bias = 1.0  # Default bias, may be overridden for tool messages
+            msg_tool_name = ""  # Resolved for tool/function messages below
 
             messages_from_end = num_messages - i
 
@@ -1717,6 +1740,7 @@ class ContentRouter(Transform):
                 tool_name = tool_name_map.get(tool_call_id, "") or str(
                     message.get("name", "") or ""
                 )
+                msg_tool_name = tool_name
                 if tool_call_id in excluded_tool_ids or (
                     tool_name and is_tool_excluded(tool_name, exclude_tools)
                 ):
@@ -1807,11 +1831,31 @@ class ContentRouter(Transform):
                 route_counts["already_compressed"] += 1
                 continue
 
+            # Retrieval-feedback protection (Engine P2-13, opt-in): a shape
+            # the model keeps retrieving from the CCR store gets gentler
+            # routing — skip compression entirely at sustained pressure, or
+            # fold a keep-more multiplier into the bias below. Flag off
+            # (default) never consults the aggregator: byte-identical routing.
+            feedback_multiplier = 1.0
+            if self.config.enable_retrieval_feedback and role in _TOOL_ROLES:
+                hints = self._get_feedback_hints(
+                    msg_tool_name, content, content_type_tag=detection.content_type.value
+                )
+                if hints.skip_compression:
+                    result_slots[i] = message
+                    transforms_applied.append("router:feedback:skip")
+                    route_counts.setdefault("feedback_skip", 0)
+                    route_counts["feedback_skip"] += 1
+                    continue
+                feedback_multiplier = hints.keep_budget_multiplier
+
             # Route and compress based on content detection
             # Merge tool-specific bias with hook-provided bias (multiplicative)
             msg_bias = bias if role in _TOOL_ROLES else 1.0
             if i in hook_biases:
                 msg_bias *= hook_biases[i]
+            if feedback_multiplier != 1.0:
+                msg_bias *= feedback_multiplier
 
             # Two-tier compression cache. The lookup DECISION — Tier-1 skip,
             # Tier-2 ratio-gate, CCR-backing check, plus every cache mutation and
@@ -1940,6 +1984,8 @@ class ContentRouter(Transform):
             parts.append(f"{route_counts['already_compressed']} pinned (already compressed)")
         if route_counts.get("error_protected"):
             parts.append(f"{route_counts['error_protected']} protected (error output)")
+        if route_counts.get("feedback_skip"):
+            parts.append(f"{route_counts['feedback_skip']} protected (retrieval feedback)")
         if route_counts["ratio_too_high"]:
             parts.append(f"{route_counts['ratio_too_high']} unchanged (ratio>={min_ratio:.2f})")
         if route_counts["content_blocks"]:
@@ -2009,6 +2055,42 @@ class ContentRouter(Transform):
             return profile.bias
 
         return 1.0  # Default: moderate
+
+    def _get_feedback_hints(
+        self,
+        tool_name: str,
+        content: str,
+        content_type_tag: str | None = None,
+    ) -> FeedbackHints:
+        """Look up retrieval-feedback hints for one compression unit.
+
+        The retrieval-side sibling of ``_get_tool_bias`` (Engine P2-13): where
+        tool bias is static per-tool configuration, these hints are the
+        adaptive signal from the model's own CCR retrievals, keyed by
+        (tool name, content type). Default-NEUTRAL — with
+        ``enable_retrieval_feedback`` off (the default) the aggregator is
+        never consulted and this returns the shared neutral hints, so routing
+        stays byte-identical.
+
+        Args:
+            tool_name: Tool that produced the content ("" when unknown).
+            content: The compression unit; detected only when
+                *content_type_tag* was not precomputed by the caller.
+            content_type_tag: ``ContentType.value`` tag when the caller
+                already ran detection (the string path did — don't pay the
+                detect twice).
+        """
+        from ..cache.retrieval_feedback import (
+            NEUTRAL_HINTS,
+            get_retrieval_feedback,
+            routing_shape_key,
+        )
+
+        if not self.config.enable_retrieval_feedback:
+            return NEUTRAL_HINTS
+        if content_type_tag is None:
+            content_type_tag = _detect_content(content).content_type.value
+        return get_retrieval_feedback().get_hints(routing_shape_key(tool_name, content_type_tag))
 
     def _lookup_cached_disposition(
         self,
@@ -2166,6 +2248,7 @@ class ContentRouter(Transform):
         compressed_details: list[str] | None,
         compressor_timing: dict[str, float] | None,
         min_chars: int,
+        tool_name: str = "",
         token_counter: Callable[[str], int] | None = None,
     ) -> tuple[dict[str, Any], bool]:
         """Compress the inner ``type=="text"`` parts of a nested ``tool_result``
@@ -2224,6 +2307,19 @@ class ContentRouter(Transform):
                 new_parts.append(part)
                 bump("already_compressed")
                 continue
+            # Retrieval-feedback protection (Engine P2-13, opt-in) — per
+            # PART: each text part is its own compression unit with its own
+            # detected shape. Flag off never consults.
+            part_bias = bias
+            if self.config.enable_retrieval_feedback:
+                hints = self._get_feedback_hints(tool_name, part_text)
+                if hints.skip_compression:
+                    new_parts.append(part)
+                    transforms_applied.append("router:feedback:skip")
+                    bump("feedback_skip")
+                    continue
+                if hints.keep_budget_multiplier != 1.0:
+                    part_bias = bias * hints.keep_budget_multiplier
             new_part, did = self._compress_content_block(
                 part,
                 part_text,
@@ -2232,7 +2328,7 @@ class ContentRouter(Transform):
                 detail_prefix="tool",
                 context=context,
                 min_ratio=min_ratio,
-                bias=bias,
+                bias=part_bias,
                 transforms_applied=transforms_applied,
                 route_counts=route_counts,
                 compressed_details=compressed_details,
@@ -2401,6 +2497,22 @@ class ContentRouter(Transform):
                             route_counts["already_compressed"] += 1
                         continue
 
+                    # Retrieval-feedback protection (Engine P2-13, opt-in) —
+                    # mirror of the string path. The helper runs detection
+                    # itself (this frame never detected); flag off never
+                    # reaches it.
+                    if self.config.enable_retrieval_feedback:
+                        hints = self._get_feedback_hints(tool_name, tool_content)
+                        if hints.skip_compression:
+                            new_blocks.append(block)
+                            transforms_applied.append("router:feedback:skip")
+                            if route_counts is not None:
+                                route_counts.setdefault("feedback_skip", 0)
+                                route_counts["feedback_skip"] += 1
+                            continue
+                        if hints.keep_budget_multiplier != 1.0:
+                            bias = bias * hints.keep_budget_multiplier
+
                     new_block, did = self._compress_content_block(
                         block,
                         tool_content,
@@ -2437,6 +2549,7 @@ class ContentRouter(Transform):
                         compressed_details=compressed_details,
                         compressor_timing=compressor_timing,
                         min_chars=min_chars,
+                        tool_name=tool_name,
                         token_counter=token_counter,
                     )
                     new_blocks.append(new_block)

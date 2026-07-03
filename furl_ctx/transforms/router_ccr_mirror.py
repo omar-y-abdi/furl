@@ -125,7 +125,10 @@ class CcrMirror:
             return False
 
         for h in hashes:
-            if store.retrieve(h) is None:
+            # Backing verification is an ENGINE-INTERNAL read — it must not
+            # feed the retrieval-feedback loop as if the model asked for this
+            # content back (Engine P2-13).
+            if store.retrieve(h, record_feedback_signal=False) is None:
                 logger.debug(
                     "_ensure_ccr_backed: hash %s unbackable after re-mirror "
                     "(both CCR stores expired) — recompute required",
