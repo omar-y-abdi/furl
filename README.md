@@ -20,7 +20,6 @@
 <p align="center">
   <a href="#get-started-60-seconds">Install</a> ·
   <a href="#proof">Proof</a> ·
-  <a href="https://discord.gg/yRmaUNpsPJ">Discord</a> ·
   <a href="llms.txt">llms.txt</a>
 </p>
 
@@ -31,11 +30,6 @@
 ---
 
 Furl compresses everything your AI agent reads — tool outputs, logs, RAG chunks, files, and conversation history — before it reaches the LLM. Same answers, fraction of the tokens.
-
-<p align="center">
-  <img src="FurlDemo-Fast.gif" alt="Furl in action" width="820">
-  <br/><sub>Live: 10,144 → 1,260 tokens — same FATAL found.</sub>
-</p>
 
 ## What it does
 
