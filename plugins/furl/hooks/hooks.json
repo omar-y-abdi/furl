@@ -5,7 +5,7 @@
       "hooks": [
         {
           "type": "command",
-          "command": "python \"${CLAUDE_PLUGIN_ROOT}/hooks/compress_tool_output.py\"",
+          "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/compress_tool_output.py\"",
           "timeout": 30,
           "env": {
             "FURL_CCR_BACKEND": "sqlite",

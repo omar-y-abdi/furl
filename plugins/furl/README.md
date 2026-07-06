@@ -10,30 +10,35 @@ Bundles Furl's context compression into Claude Code as a single plugin:
 
 ## Install (2 commands)
 
-**1 — Install Furl** into the same Python that Claude Code will run:
+**1 — Install Furl** into the same Python that Claude Code will run. Prebuilt
+wheels ship on the GitHub Release, so this needs **no Rust toolchain** and picks
+the right wheel for your platform automatically (macOS arm64/x86_64, Linux
+arm64/x86_64):
 
 ```bash
-pip install "furl-ctx[mcp]"
+pip install "furl-ctx[mcp]" --only-binary furl-ctx \
+  --find-links https://github.com/omar-y-abdi/furl/releases/expanded_assets/v0.27.0
 ```
 
-**2 — Add the plugin** from this repo (it ships a marketplace manifest):
+**2 — Add the plugin** from this repo (its root ships the marketplace manifest at
+`.claude-plugin/marketplace.json`):
 
 ```
-/plugin marketplace add /path/to/headroom/plugins/furl
+/plugin marketplace add /path/to/headroom
 /plugin install furl@furl
 ```
 
 Run those two `/plugin …` lines inside Claude Code (they are slash commands, not
-shell commands). The first registers this directory as a marketplace named `furl`;
-the second installs the `furl` plugin from it. Restart the session (or re-enable the
-plugin) so the MCP server and hook load.
+shell commands). The first registers the repo root as a marketplace named `furl`
+(which points at `./plugins/furl`); the second installs the `furl` plugin from it.
+Restart the session (or re-enable the plugin) so the MCP server and hook load.
 
-> Once Furl is published to a public marketplace you'll be able to skip step 2's
-> `marketplace add` and install directly. Until then, the local-path form above is
-> the honest, working route. To install straight from Git instead of a local path,
-> point `marketplace add` at the repo URL:
-> `/plugin marketplace add https://github.com/omar-y-abdi/furl` (adjust to the real
-> repository), then `/plugin install furl@furl`.
+> **Installing from GitHub instead of a local clone:** once this repo's default
+> branch carries the manifest, `/plugin marketplace add omar-y-abdi/furl` (the
+> GitHub `owner/repo` shorthand) works directly — it reads
+> `.claude-plugin/marketplace.json` from the default branch. Before that merge,
+> use the local-path form above against your clone. Once Furl is on PyPI, step 1
+> shortens to `pip install "furl-ctx[mcp]"`.
 
 **Verify** it loaded: run `/plugin` (the `furl` plugin should be enabled) and ask
 Claude to call `furl_stats` — it should return session stats from the `furl` MCP
@@ -41,11 +46,12 @@ server.
 
 ### Prerequisite detail (be honest about this)
 
-Both the MCP server and the hook invoke the **`python` on your PATH** (they run
-`python -m furl_ctx.ccr.mcp_server` and `import furl_ctx`). That interpreter must be
-the one where you ran `pip install "furl-ctx[mcp]"`. If you use a virtualenv or
-`pyenv`, make sure the active `python` resolves to it, or the MCP server won't start
-and the hook will silently fail-open (do nothing) rather than error.
+Both the MCP server and the hook invoke **`python3` on your PATH** (they run
+`python3 -m furl_ctx.ccr.mcp_server` and `import furl_ctx`). That interpreter must
+be the one where you installed Furl in step 1. If you use a virtualenv or `pyenv`,
+make sure the active `python3` resolves to it, or the MCP server won't start and the
+hook will silently fail-open (do nothing) rather than error. Verify with `/mcp`
+(the `furl` server should be listed) after the plugin loads.
 
 ## What each piece does
 
@@ -56,7 +62,7 @@ like `mcp__furl__furl_compress` well under Claude Code's 64-char limit):
 
 ```json
 { "mcpServers": { "furl": {
-  "command": "python",
+  "command": "python3",
   "args": ["-m", "furl_ctx.ccr.mcp_server"],
   "env": { "FURL_CCR_BACKEND": "sqlite", "FURL_CCR_TTL_SECONDS": "86400" }
 }}}
@@ -99,10 +105,11 @@ retrieve originals, or how to tune/disable it.
 ## Structure
 
 ```
+.claude-plugin/
+└── marketplace.json         # repo-root marketplace → source ./plugins/furl
 plugins/furl/
 ├── .claude-plugin/
-│   ├── plugin.json          # manifest (name, version, skills)
-│   └── marketplace.json     # lets `/plugin marketplace add` find this plugin
+│   └── plugin.json          # plugin manifest (name, version, skills)
 ├── .mcp.json                # registers the `furl` MCP server
 ├── hooks/
 │   ├── hooks.json           # PostToolUse registration (auto-loaded)
