@@ -71,6 +71,14 @@ jobs:
               # sit BLOCKED forever with everything green-or-skipped
               # (first hit: PR #15).
               - '.github/workflows/**'
+              # Same ruleset logic for plugin + docs PRs: the plugin ships
+              # executable code (the PostToolUse hook) plus the marketplace
+              # and manifest JSON, and any PR that only edits docs must still
+              # let the required checks CONCLUDE rather than sit skipped and
+              # BLOCKED forever (first hit: PR #32, plugin-readiness).
+              - 'plugins/**'
+              - '.claude-plugin/**'
+              - '**/*.md'
 
   lint:
     needs: changes

@@ -68,6 +68,11 @@ is in the Furl README's "Configuration" section.
 
 ## Prerequisite
 
-Both the hook and the MCP server run `python -m furl_ctx.ccr.mcp_server` / import
-`furl_ctx`, so the `python` on PATH must have Furl installed:
-`pip install "furl-ctx[mcp]"`.
+Both the hook and the MCP server run `python3 -m furl_ctx.ccr.mcp_server` / import
+`furl_ctx`, so the `python3` on PATH must have Furl installed. Prebuilt wheels ship
+on the GitHub Release (no Rust toolchain needed):
+
+```bash
+pip install "furl-ctx[mcp]" --only-binary furl-ctx \
+  --find-links https://github.com/omar-y-abdi/furl/releases/expanded_assets/v0.27.0
+```

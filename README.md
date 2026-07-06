@@ -13,7 +13,7 @@
 <p align="center"><strong>60–95% fewer tokens on redundant workloads · library · MCP · local-first · reversible</strong></p>
 
 <p align="center">
-  <a href="https://pypi.org/project/furl-ctx/"><img src="https://img.shields.io/pypi/v/furl-ctx.svg" alt="PyPI"></a>
+  <a href="https://github.com/omar-y-abdi/furl/releases/latest"><img src="https://img.shields.io/github/v/release/omar-y-abdi/furl?sort=semver&color=blue" alt="Release"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" alt="License: Apache 2.0"></a>
 </p>
 
@@ -71,9 +71,10 @@ Furl compresses everything your AI agent reads — tool outputs, logs, RAG chunk
 ## Get started (60 seconds)
 
 ```bash
-# 1 — Install
-pip install "furl-ctx[all]"          # MCP server + full CCR
-# or: pip install "furl-ctx[mcp]"     # just the MCP server
+# 1 — Install (prebuilt wheels on the GitHub Release — no Rust; auto-picks your platform)
+pip install "furl-ctx[all]" --only-binary furl-ctx \
+  --find-links https://github.com/omar-y-abdi/furl/releases/expanded_assets/v0.27.0
+# [all] = MCP server + full CCR · use [mcp] for just the MCP server
 ```
 
 ```python
@@ -86,7 +87,7 @@ result = compress(messages, model="claude-sonnet-4")
 
 ```bash
 # 3 — Or run the MCP server for Claude Code / Cursor / any MCP host
-python -m furl_ctx.ccr.mcp_server       # exposes furl_compress / _retrieve / _stats
+python3 -m furl_ctx.ccr.mcp_server      # exposes furl_compress / _retrieve / _stats
 ```
 
 Granular extras: `[mcp]` (MCP server), `[code]` (tree-sitter AST-verified code compression, ~50 MB, opt-in), `[dev]`. Requires **Python 3.10+**.
@@ -97,13 +98,14 @@ Furl ships as a Claude Code plugin (`plugins/furl/`) that bundles the MCP server
 automatic compression hook, and a how-it-works skill. Two commands:
 
 ```bash
-# 1 — install Furl into the python Claude Code uses
-pip install "furl-ctx[mcp]"
+# 1 — install Furl into the python3 Claude Code uses (prebuilt wheels; no Rust)
+pip install "furl-ctx[mcp]" --only-binary furl-ctx \
+  --find-links https://github.com/omar-y-abdi/furl/releases/expanded_assets/v0.27.0
 ```
 
 ```
 # 2 — add + install the plugin (these are /slash commands inside Claude Code)
-/plugin marketplace add /path/to/headroom/plugins/furl
+/plugin marketplace add /path/to/headroom      # repo root · or: omar-y-abdi/furl once merged
 /plugin install furl@furl
 ```
 
@@ -147,7 +149,7 @@ These are a single deterministic capture at HEAD (`benchmarks/BASELINE.md`). Acr
 | Your setup     | Hook in with                                  |
 |----------------|-----------------------------------------------|
 | Any Python app | `compress(messages, model=…)`                 |
-| MCP clients    | `python -m furl_ctx.ccr.mcp_server`           |
+| MCP clients    | `python3 -m furl_ctx.ccr.mcp_server`          |
 
 </details>
 
@@ -200,22 +202,30 @@ hitting. Two rules keep caching and compression compatible:
 
 ## Install
 
+Prebuilt wheels ship on the GitHub Release — **no Rust toolchain needed**, and pip
+auto-selects your platform's wheel (macOS arm64/x86_64, Linux arm64/x86_64):
+
 ```bash
-pip install "furl-ctx[all]"          # MCP server + full CCR
+pip install "furl-ctx[all]" --only-binary furl-ctx \
+  --find-links https://github.com/omar-y-abdi/furl/releases/expanded_assets/v0.27.0
 ```
 
-Granular extras: `[mcp]` (MCP server), `[code]` (tree-sitter AST-verified code compression, ~50 MB, opt-in), `[dev]`. Requires **Python 3.10+**.
+Once Furl is on PyPI this shortens to `pip install "furl-ctx[all]"`. Granular extras: `[mcp]` (MCP server), `[code]` (tree-sitter AST-verified code compression, ~50 MB, opt-in), `[dev]`. Requires **Python 3.10+**.
 
-Using `pipx`? Choose a supported interpreter explicitly:
+Using `pipx`? Pass the release index through and choose an interpreter:
 
 ```bash
-pipx install --python python3.13 "furl-ctx[all]"
+pipx install --python python3.13 \
+  --pip-args "--only-binary furl-ctx --find-links https://github.com/omar-y-abdi/furl/releases/expanded_assets/v0.27.0" \
+  "furl-ctx[all]"
 ```
 
 ### Corporate / SSL-inspection environments
 
-If `pip install "furl-ctx[all]"` fails with `CERTIFICATE_VERIFY_FAILED`
-(`unable to get local issuer certificate`), your network uses **SSL inspection** — a MITM
+The prebuilt-wheel install above needs no Rust and avoids this entirely. It only
+applies if you force a **source build** (`--no-binary`, `git+…`, or an unsupported
+platform) and `pip` fails with `CERTIFICATE_VERIFY_FAILED`
+(`unable to get local issuer certificate`): your network uses **SSL inspection** — a MITM
 proxy presenting a company-issued CA. The build backend (`maturin`) downloads `rustup` over a
 connection your TLS stack doesn't trust. **Install Rust first** so the build doesn't fetch it:
 
@@ -226,8 +236,8 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh && rustup default
 winget install Rustlang.Rustup && rustup default stable
 ```
 
-Restart your shell, then `pip install "furl-ctx[all]"`. A prebuilt wheel avoids the Rust
-build entirely where available: `pip install --only-binary furl-ctx furl-ctx`.
+Restart your shell, then re-run the install. Simplest of all: use the prebuilt wheel
+(the `--find-links` command above), which skips the Rust build — and this whole issue — entirely.
 
 One runtime asset is fetched over TLS; if it is blocked, trust your corporate CA via
 `REQUESTS_CA_BUNDLE` / `SSL_CERT_FILE` / `CURL_CA_BUNDLE`:
