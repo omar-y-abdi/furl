@@ -79,9 +79,12 @@ already exists in the code but is gated off, unwired, or unexported.
       `resolve_markers(messages)` (immutable copy, honest miss), `CompressResult.ccr_hashes`
       (derived property — can't drift). `hash_of_match`/`hashes_in_text` in marker_grammar
       (reuse `marker_patterns`). Bench-neutral. 1603 pass. *(PM-implemented.)*
-- [ ] **Q5 — Wire CCR spill tier** (#5, S). `CompressionStore(spill=...)` implemented
-      (`_spill_evicted`/`_recover_from_spill`) but the MCP server passes `spill=None`. Wire
-      `FURL_CCR_SPILL_BACKEND`.
+- [x] **Q5 — CCR spill tier** (#5, S) — **already wired** (PR #30, post-dates the report).
+      `get_compression_store()` builds the spill from `FURL_CCR_SPILL` env (`_create_spill_
+      backend_from_env`); the MCP server delegates to it. Verified functionally (in-memory
+      primary → spill active; sqlite primary → redundant-guard off) + tested
+      (`test_ccr_spill_tier.py`). Only gap was docs → added `FURL_CCR_SPILL` to LIBRARY.md.
+      `FURL_CCR_SPILL_BACKEND` (configurable spill backend) = speculative YAGNI, skipped.
 - [ ] **Q6 — Hook wires shipped config** (#2, S). Hook calls `compress()` with bare
       defaults, ignoring `DEFAULT_TOOL_PROFILES`, `is_tool_excluded()`, and `tool_name`.
       Map tool→profile bias, use the exclusion helper, accept a model; expose
