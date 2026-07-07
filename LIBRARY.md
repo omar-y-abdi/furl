@@ -95,6 +95,18 @@ hitting. Two rules keep caching and compression compatible:
   best-effort detector (CCR registry hit inside the frozen prefix) surfaces
   this in `result.warnings`.
 
+## CLI
+
+`pip install furl-ctx` also installs a `furl` command — shell-native access to the
+same engine (pipelines, CI log reduction, offline eval, no LLM harness):
+
+```bash
+psql -c 'table events' | furl compress        # FILE, or stdin, -> compressed stdout
+furl compress big.json --json                 # compressed text + token stats as JSON
+furl retrieve <hash>                          # original content for a <<ccr:HASH>> marker
+furl doctor                                   # check the install: native core, tokenizer, store
+```
+
 ## Configuration (environment variables)
 
 Every live `FURL_*` knob. All are optional — the defaults are the shipped behavior.

@@ -98,9 +98,12 @@ already exists in the code but is gated off, unwired, or unexported.
       cost-rate fallback). Docs in SKILL/README/LIBRARY. 1611 pass. **Scoped out** (lazy):
       durable JSONL (`shared_stats_file` already appends cross-process) + `per_message_stats`/
       `timing` on `CompressResult` (speculative surface, no consumer). *(PM-implemented.)*
-- [ ] **Q8 — `furl` CLI** (#7, M). No `[project.scripts]`. Thin
-      `furl_ctx.cli:main` over the library: `compress [file|-]` (`--json`,
-      `--lossless-only`, `--model`), `retrieve <hash>`, `stats`, `doctor`. *Uses Q4, Q1.*
+- [x] **Q8 — `furl` CLI** (#7, M) — `furl_ctx/cli.py` + `[project.scripts]`. Thin stdlib-argparse
+      wrapper: `compress [file|-]` (`--model`, `--json`), `retrieve <hash>` (exit 1 + msg on miss),
+      `doctor` (import/native `_core`/tiktoken/store health). Installed `furl` console script
+      verified end-to-end. Reuses compress()/retrieve(). 1615 pass. **Scoped out** (lazy): `stats`
+      (aggregation entangled in the async MCP handler; `furl_stats` covers in-session) +
+      `--lossless-only` (no clean engine lever = roadmap #9). *(PM-implemented.)*
 
 ### Big bets
 - [ ] **B1 — HTML main-content extractor** (#9, M). WebFetch is profiled *aggressive*
