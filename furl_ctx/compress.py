@@ -62,6 +62,7 @@ import threading
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
+from .ccr.marker_grammar import hashes_in_text
 from .config import DEFAULT_MIN_TOKENS_TO_COMPRESS
 from .pipeline import PipelineExtensionManager, PipelineStage, summarize_routing_markers
 from .utils import extract_user_query as _extract_user_query
@@ -167,6 +168,19 @@ class CompressResult:
     transforms_applied: list[str] = field(default_factory=list)
     error: str | None = None
     warnings: list[str] = field(default_factory=list)
+
+    @property
+    def ccr_hashes(self) -> list[str]:
+        """CCR marker hashes present in the compressed messages (first-seen order).
+
+        Derived from ``messages`` so it can never drift from what shipped. Pass
+        each to ``furl_ctx.retrieve`` / ``resolve_markers`` to recover the content.
+        """
+        parts: list[str] = []
+        for message in self.messages:
+            content = message.get("content")
+            parts.append(content if isinstance(content, str) else json.dumps(content))
+        return hashes_in_text("\n".join(parts))
 
 
 def _compute_frozen_message_count(messages: list[dict[str, Any]]) -> int:

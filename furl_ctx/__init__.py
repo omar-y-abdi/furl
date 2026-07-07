@@ -55,6 +55,7 @@ from typing import Any
 
 from .compress import CompressConfig, CompressResult, compress
 from .compress_to import compress_to
+from .retrieve import resolve_markers, retrieve
 
 # Keep a real callable bound for the one-function compression API so
 # `from furl_ctx import compress` is never shadowed by the submodule object.
@@ -92,6 +93,8 @@ __all__ = [
     # One-function compression API
     "compress",
     "compress_to",
+    "retrieve",
+    "resolve_markers",
     "CompressConfig",
     "CompressResult",
     # Hooks
