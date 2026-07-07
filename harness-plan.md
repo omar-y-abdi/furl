@@ -69,10 +69,12 @@ already exists in the code but is gated off, unwired, or unexported.
       raises/loops/over-budget). Measures the real tokenizer per rung, not the fail-open
       `tokens_after`. No engine change → bench-neutral. 1589 pass. *(PM-implemented: 2
       subagent stream-idle-timeouts on big-file reads; ~55-LOC item, sanctioned small edit.)*
-- [ ] **Q3 — API-envelope unwrap** `{"data":[...],"meta":{}}` (#1, S). `content_detector`
-      only detects `JSON_ARRAY` when the top level *is* a list. Add one unwrap pass over
-      common keys (`data/results/items/hits/records/edges/rows/documents`) → SmartCrusher
-      → re-wrap non-array fields. *(envelope keys speculative — verify.)*
+- [x] **Q3 — API-envelope unwrap** `{"data":[...],"meta":{}}` (#1, S) — `envelope_ingest.py`.
+      Mirrors the CSV path: `sniff_envelope` (shared predicate) unwraps the single common-key
+      array → SmartCrusher; meta preserved inline; marker recovers FULL original byte-exact.
+      Fail-open on ambiguity/veto/no-savings. Bench-neutral (0/83 bench items sniff as
+      envelopes). 1599 pass; byte-exact recovery + veto tested. *(PM-implemented — subagent
+      timeout, see blocker.)*
 - [ ] **Q4 — Retrieval exports** (#4, S). `retrieve`/`search`/`search_all` exist on
       `CompressionStore` but not in `furl_ctx.__all__`. Export `retrieve(hash, query=None)`,
       add `ccr_hashes: list[str]` to `CompressResult`, add `resolve_markers(messages, store)`.
@@ -113,6 +115,16 @@ already exists in the code but is gated off, unwired, or unexported.
       exist internally; expose `furl eval <corpus> --recall` (the trust gate). *Uses Q4, Q8.*
 
 ## Blocker questions (fill during the run; ask after everything is done)
+
+- **Subagent delegation is broken in this environment** — 3 consecutive `general-purpose`
+  Agent subagents (Q2×2, Q3×1) hit reproducible `API Error: Stream idle timeout` at ~10-11
+  tool uses / ~6.5 min with 0 output tokens, even with a fully pre-digested, minimal-reading
+  spec. Matches a documented prior failure mode in `PLAN.md` ("big-file reads stall bg agents
+  regardless of model; run foreground"). Given the "autonomous, don't pause, complete to
+  perfection" mandate and the broken delegate path, I am **implementing directly** (as the
+  sanctioned rare-small-edit exception, scaled up out of necessity) while gating each item as
+  the harsh critic + full green gate. Flagging the deviation from "delegate everything" for
+  your awareness — the alternative (halt) would violate the no-pause mandate.
 
 - **B1 HTML extractor** re-introduces functionality the "Great Excision" deliberately
   deleted (`html_extractor.py` + trafilatura, user: "i want it GONE"). User re-authorized
