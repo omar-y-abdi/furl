@@ -75,9 +75,10 @@ already exists in the code but is gated off, unwired, or unexported.
       Fail-open on ambiguity/veto/no-savings. Bench-neutral (0/83 bench items sniff as
       envelopes). 1599 pass; byte-exact recovery + veto tested. *(PM-implemented — subagent
       timeout, see blocker.)*
-- [ ] **Q4 — Retrieval exports** (#4, S). `retrieve`/`search`/`search_all` exist on
-      `CompressionStore` but not in `furl_ctx.__all__`. Export `retrieve(hash, query=None)`,
-      add `ccr_hashes: list[str]` to `CompressResult`, add `resolve_markers(messages, store)`.
+- [x] **Q4 — Retrieval exports** (#4, S) — `retrieve.py`. Exported `retrieve(hash,query=None)`,
+      `resolve_markers(messages)` (immutable copy, honest miss), `CompressResult.ccr_hashes`
+      (derived property — can't drift). `hash_of_match`/`hashes_in_text` in marker_grammar
+      (reuse `marker_patterns`). Bench-neutral. 1603 pass. *(PM-implemented.)*
 - [ ] **Q5 — Wire CCR spill tier** (#5, S). `CompressionStore(spill=...)` implemented
       (`_spill_evicted`/`_recover_from_spill`) but the MCP server passes `spill=None`. Wire
       `FURL_CCR_SPILL_BACKEND`.
