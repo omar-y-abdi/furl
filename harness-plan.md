@@ -106,9 +106,11 @@ already exists in the code but is gated off, unwired, or unexported.
       `--lossless-only` (no clean engine lever = roadmap #9). *(PM-implemented.)*
 
 ### Big bets
-- [ ] **B1 — HTML main-content extractor** (#9, M). WebFetch is profiled *aggressive*
-      but HTML routes to `noop` (0%). Add a readability-style main-content extractor
-      (strip nav/script/ads, keep article + headings).
+- [x] **B1 — HTML main-content extractor** (#9, M) — `html_ingest.py`. Stdlib `html.parser`
+      extractor (NO trafilatura dep), wired into the TEXT dispatch arm: strips
+      script/style/nav/footer boilerplate, ships extracted article + a marker recovering the
+      FULL original HTML byte-exact. Lossy-but-reversible, gated off under lossless_only.
+      Bench-neutral (0 HTML bench items). 1619 pass. *(PM-implemented.)*
 - [ ] **B2 — CCR durable-retention epic** (#10, L). Eviction *demotes* not deletes;
       session/conversation-scoped lifetime; TTL-extension-on-access; `session_id`/`agent_id`
       namespacing on `compress()`; `ccr_export`/`import`; pin-forever. See `CCR-RETENTION.md`.
