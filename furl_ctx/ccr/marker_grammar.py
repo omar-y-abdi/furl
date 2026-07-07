@@ -170,3 +170,25 @@ def marker_patterns() -> list[re.Pattern]:
         GENERIC_BRACKET_PATTERN,
         DOUBLE_ANGLE_PATTERN,
     ]
+
+
+def hash_of_match(match: re.Match[str]) -> str:
+    """The hash a marker-pattern match captured — its last, always-present group."""
+    idx = match.lastindex
+    assert idx is not None, "marker patterns always capture at least one group"
+    hash_value = match.group(idx)
+    assert hash_value is not None, "the hash capture group is never optional"
+    return hash_value
+
+
+def hashes_in_text(text: str) -> list[str]:
+    """Every CCR marker hash in *text*, in first-seen order (deduped).
+
+    Runs each :func:`marker_patterns` pattern and unions the hashes (the last
+    capture group of each match), exactly as the scan contract above describes.
+    """
+    seen: dict[str, None] = {}
+    for pattern in marker_patterns():
+        for match in pattern.finditer(text):
+            seen.setdefault(hash_of_match(match), None)
+    return list(seen)

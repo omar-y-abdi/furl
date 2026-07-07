@@ -54,9 +54,12 @@ from importlib import import_module
 from typing import Any
 
 from .compress import CompressConfig, CompressResult, compress
+from .compress_to import compress_to
+from .retrieve import resolve_markers, retrieve
 
 # Keep a real callable bound for the one-function compression API so
 # `from furl_ctx import compress` is never shadowed by the submodule object.
+# ``compress_to`` is bound the same way (its submodule would otherwise shadow it).
 
 __all__ = [
     # Exceptions — the reserved base class only. The eight subclasses this
@@ -89,6 +92,9 @@ __all__ = [
     "count_tokens_messages",
     # One-function compression API
     "compress",
+    "compress_to",
+    "retrieve",
+    "resolve_markers",
     "CompressConfig",
     "CompressResult",
     # Hooks

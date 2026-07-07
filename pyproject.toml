@@ -62,6 +62,9 @@ Homepage = "https://github.com/omar-y-abdi/furl"
 Repository = "https://github.com/omar-y-abdi/furl"
 Issues = "https://github.com/omar-y-abdi/furl/issues"
 
+[project.scripts]
+furl = "furl_ctx.cli:main"
+
 [project.optional-dependencies]
 # MCP server for Claude Code integration (furl_ctx.ccr.mcp_server).
 # (httpx was dropped from this extra — nothing in the package imports it;

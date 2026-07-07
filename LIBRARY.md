@@ -95,6 +95,18 @@ hitting. Two rules keep caching and compression compatible:
   best-effort detector (CCR registry hit inside the frozen prefix) surfaces
   this in `result.warnings`.
 
+## CLI
+
+`pip install furl-ctx` also installs a `furl` command — shell-native access to the
+same engine (pipelines, CI log reduction, offline eval, no LLM harness):
+
+```bash
+psql -c 'table events' | furl compress        # FILE, or stdin, -> compressed stdout
+furl compress big.json --json                 # compressed text + token stats as JSON
+furl retrieve <hash>                          # original content for a <<ccr:HASH>> marker
+furl doctor                                   # check the install: native core, tokenizer, store
+```
+
 ## Configuration (environment variables)
 
 Every live `FURL_*` knob. All are optional — the defaults are the shipped behavior.
@@ -107,11 +119,13 @@ Every live `FURL_*` knob. All are optional — the defaults are the shipped beha
 | `FURL_CCR_BACKEND_OPTS` | unset (`{}`) | JSON object of keyword arguments passed to a third-party backend factory, e.g. `{"url": "..."}`. |
 | `FURL_CCR_SQLITE_PATH` | `<workspace>/ccr.sqlite3` | File path of the durable SQLite CCR store. |
 | `FURL_CCR_SQLITE_MAX_ROWS` | `10000` | Row cap for the SQLite store (oldest-created evicted first). |
+| `FURL_CCR_SPILL` | `off` | Q10 retention. When truthy (`1`/`true`/`yes`/`on`), an **in-memory** primary demotes evicted entries to a durable SQLite **spill** tier instead of deleting them, so a `retrieve()` past the in-memory cap still recovers (byte-identical, read-only — no promotion back). Ignored when the primary is already `sqlite` (`FURL_CCR_BACKEND=sqlite`, the MCP server's default): a durable primary has nothing to spill to. |
 | `FURL_MCP_READ` | `off` | Enables the `furl_read` MCP tool (`on`/`true`/`1`/`yes`/`enabled`). Reads are jailed to `FURL_WORKSPACE_DIR`. |
 | `FURL_COMPRESS_WORKERS` | `4` | Worker threads for the router's parallel per-message compression. |
 | `FURL_PIPELINE_BREAKER_THRESHOLD` | `3` | Consecutive pipeline failures before the circuit breaker opens and messages pass through **uncompressed** for the cooldown window. `<= 0` disables the breaker. |
 | `FURL_PIPELINE_BREAKER_COOLDOWN_S` | `60` | Seconds an open circuit breaker keeps passing messages through untouched before retrying. |
 | `FURL_COMPACTION_FORMAT` | `csv-schema` | Lossless render format for SmartCrusher compaction: `csv-schema`, `json`, or `markdown-kv`. Unknown values raise. |
+| `FURL_COST_RATE_USD_PER_MTOK` | `3.0` | Blended $/1M-token rate for the MCP `furl_stats` cost-saved estimate. Invalid/negative values fall back to the default. |
 
 The Claude Code plugin's own hook/MCP knobs (`FURL_HOOK_*`) are documented in
 [`plugins/furl/README.md`](plugins/furl/README.md).
