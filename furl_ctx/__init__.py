@@ -93,6 +93,9 @@ __all__ = [
     # One-function compression API
     "compress",
     "compress_to",
+    # Cross-turn / whole-history presets
+    "compress_chat_history",
+    "compress_with_cache",
     "retrieve",
     "resolve_markers",
     "CompressConfig",
@@ -145,6 +148,9 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "count_tokens_messages": ("furl_ctx.tokenizer", "count_tokens_messages"),
     # One-function API
     "compress": ("furl_ctx.compress", "compress"),
+    # Cross-turn / whole-history presets (thin compress() wrappers)
+    "compress_chat_history": ("furl_ctx.chat", "compress_chat_history"),
+    "compress_with_cache": ("furl_ctx.chat", "compress_with_cache"),
     # Hooks
     "CompressionHooks": ("furl_ctx.hooks", "CompressionHooks"),
     "CompressContext": ("furl_ctx.hooks", "CompressContext"),
