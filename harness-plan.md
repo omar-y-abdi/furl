@@ -184,3 +184,41 @@ scans `BRACKET_RETRIEVE_PATTERN`; `retrieve()`/`resolve_markers()`/`ccr_hashes` 
 - **B3 at-rest encryption** (`FURL_CCR_ENCRYPT_KEY` / SQLCipher) needs a heavy crypto dep →
   building the minimal redaction/purge/namespace/audit core; **encryption deferred as a
   question** (which dep, or skip?). Audit-format (fields/rotation) also a question.
+
+## PERF — #1 PRIORITY (do after B2/B4 land)
+
+**Measured 2026-07-08 — furl-ctx 0.27.0, isolated venv, real 33.8 MB Chrome DevTools trace,
+per-stage bounded slices:**
+
+| stage | 1 MB | 4 MB | scaling |
+|-------|------|------|---------|
+| tiktoken count | 0.15 s | 0.58 s | **O(n)** ~6 MB/s — fine |
+| content detector | 0.01 s | 0.03 s | **O(n)** — fine |
+| **compress()** | **2.75 s** | **19.6 s** | **4× data → 7.1× time = SUPER-LINEAR** |
+
+4×→7.1× is worse than O(n). Extrapolates to ~10–50 min for 33 MB → matches the observed
+15-min hang. **It is the engine (router/crusher), not the harness or the test script** —
+tokenizer + detector are linear. Threshold effect: 1 MB routes to `router:mixed` (2.75 s,
+70 % saved); 4 MB routes to `router:ccr_offload` (19.6 s, ratio ≈ 1.0, ≈0 useful savings) —
+the large-input path is BOTH slow AND ineffective.
+
+**Why #1:** for file/log compression **latency IS the product**. A multi-minute compress is
+worse than useless — an agent would rather burn tokens or `grep`/`bash` the file than wait.
+Perf beats ratio for this use case.
+
+**Epic:**
+1. **Profiled root cause** (4 MB, 21.5 s total, cProfile): `router_engine._compress_mixed`
+   fans the blob into ~9,400 fragments, calling the Rust `SmartCrusher.crush` **9,406×** (9.6 s)
+   and the tiktoken encoder **37,877×** (6.9 s) — ~4 re-tokenizations per fragment.
+   `_extract_json_block` (router_split.py:164) is re-called 9,408× (likely O(n²) rescanning).
+   The blowup is **per-fragment fan-out + redundant re-tokenization**, not the tokenizer itself.
+   → Fix: tokenize once / batch; cap fragment count; stop re-scanning from the top per block.
+2. **Latency budget + early-exit**: hard per-call size/time ceiling. Above a byte threshold,
+   short-circuit to a bounded cheap path (structural head/tail keep + CCR-offload the bulk)
+   instead of the expensive crusher. Never worse-than-linear; target ≥ 20–50 MB/s end-to-end.
+3. **Fix `ccr_offload` accounting**: 4 MB reported `saved=1,508,034` yet `ratio≈0.9997`
+   (contradiction) while saving ≈0 useful tokens and costing 19.6 s.
+4. **Guard in the eval harness (B5)**: fail if end-to-end MB/s drops below a floor.
+
+Note: Q3 (envelope-unwrap) is a **ratio/routing** fix (detect `traceEvents`, crush the inner
+array — the trace detects as PLAIN_TEXT in 0.27.0), **NOT** a perf fix. Perf is its own epic.
