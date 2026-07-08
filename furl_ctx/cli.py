@@ -2,6 +2,7 @@
 
     furl compress [FILE]   # FILE (or - / omitted for stdin) -> compressed stdout
     furl retrieve HASH     # print the original content for a CCR marker hash
+    furl eval CORPUS --recall  # corpus compression ratio + needle-recall gate
     furl doctor            # check the install: native core, tokenizer, CCR store
 
 Shell-native access to the same engine the library and MCP server use — for
@@ -64,6 +65,98 @@ def _cmd_retrieve(args: argparse.Namespace) -> int:
     return 0
 
 
+def _corpus_files(path: str) -> list[str]:
+    """Return the sorted list of files under *path* (a single file or a dir).
+
+    Directories are walked recursively; the order is deterministic so the
+    pooled ratio/recall over a dir does not depend on filesystem iteration.
+    """
+    if os.path.isdir(path):
+        found: list[str] = []
+        for root, _dirs, names in os.walk(path):
+            found.extend(os.path.join(root, name) for name in names)
+        return sorted(found)
+    return [path]
+
+
+def _engine_needle_recall() -> float:
+    """Engine-wide needle-recall trust gate, or ``-1.0`` if unavailable.
+
+    Reuses ``benchmarks/needle_recall.py`` — the audited harness that injects a
+    known needle into REAL row arrays and asks whether it survives compression
+    (visible OR CCR-recoverable). ``recalled = in_output or ccr_recoverable``,
+    so a *silently* dropped needle (no marker, unrecoverable) lowers the rate —
+    the exact failure a mere "were surfaced markers recoverable?" count is blind
+    to. Runs a trimmed grid (both regimes, one cell) to stay a fast canary.
+
+    Note: this is an ENGINE property, not a property of the user's corpus — the
+    harness's ``NeedleFamily`` is hardwired to its own base rows (frozen +
+    raises for other families), so corpus-fed needle-recall is not reachable
+    from ``cli.py`` alone. lazy: ceiling is the internal SEARCH/LOGS families;
+    upgrade path is a corpus-parameterizable ``NeedleFamily`` in benchmarks/.
+    """
+    try:
+        from benchmarks.needle_recall import (
+            LOGS_FAMILY,
+            SEARCH_FAMILY,
+            recall_rate,
+            run_needle_recall,
+        )
+    except ImportError:
+        return -1.0
+    results = run_needle_recall(
+        families=(SEARCH_FAMILY, LOGS_FAMILY),
+        cardinalities=(30,),
+        positions=("middle",),
+        arms=("naming",),
+    )
+    return recall_rate(results)
+
+
+def _cmd_eval(args: argparse.Namespace) -> int:
+    """Report a corpus's compression ratio + the engine's needle-recall gate.
+
+    Two honestly-scoped numbers: the ratio is measured on the user's own corpus
+    (``CompressResult.compression_ratio`` pooled across files — the same figure
+    ``compress --json`` reports), and the recall is the engine-wide needle-recall
+    trust gate (see ``_engine_needle_recall``). measure.py's ``measure`` /
+    ``effective_savings`` are skipped for the ratio: they need bench-case
+    scaffolding (a granular per-row ``chunk_tokens`` index, ``n_dropped_rows``)
+    that arbitrary corpus text does not carry.
+    """
+    from furl_ctx import compress
+
+    files = _corpus_files(args.corpus)
+    if not files:
+        sys.stderr.write(f"furl: no files found in corpus {args.corpus}\n")
+        return 1
+
+    tokens_before = 0
+    tokens_after = 0
+    for path in files:
+        try:
+            text = _read_input(path)
+        except (OSError, UnicodeDecodeError) as exc:
+            sys.stderr.write(f"furl: skipping {path}: {exc}\n")
+            continue
+        result = compress([{"role": "tool", "content": text}], model=args.model)
+        tokens_before += result.tokens_before
+        tokens_after += result.tokens_after
+
+    ratio = (tokens_before - tokens_after) / tokens_before if tokens_before else 0.0
+    recall = _engine_needle_recall()
+
+    sys.stdout.write(
+        f"files: {len(files)}  tokens: {tokens_before} -> {tokens_after}\n"
+        f"corpus compression ratio: {ratio * 100:.1f}%\n"
+    )
+    if recall < 0:
+        sys.stdout.write("engine needle-recall (trust gate): unavailable (benchmarks not found)\n")
+    else:
+        sys.stdout.write(f"engine needle-recall (trust gate): {recall * 100:.1f}%\n")
+    return 0
+
+
 def _cmd_doctor(_args: argparse.Namespace) -> int:
     checks: list[tuple[str, bool, str]] = []
 
@@ -116,6 +209,14 @@ def main(argv: list[str] | None = None) -> int:
     p_retrieve = sub.add_parser("retrieve", help="print the original content for a CCR hash")
     p_retrieve.add_argument("hash")
     p_retrieve.set_defaults(func=_cmd_retrieve)
+
+    p_eval = sub.add_parser("eval", help="compression ratio + needle recall over a corpus")
+    p_eval.add_argument("corpus", help="a file or a directory of files to evaluate")
+    p_eval.add_argument(
+        "--recall", action="store_true", required=True, help="report needle-recall %%"
+    )
+    p_eval.add_argument("--model", default="claude-sonnet-4-5-20250929")
+    p_eval.set_defaults(func=_cmd_eval)
 
     p_doctor = sub.add_parser("doctor", help="check the install (core, tokenizer, store)")
     p_doctor.set_defaults(func=_cmd_doctor)
