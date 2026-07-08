@@ -201,6 +201,15 @@ class TiktokenCounter(BaseTokenizer):
     MESSAGE_OVERHEAD = 3
     REPLY_OVERHEAD = 3
 
+    # count_text memoization: the router / min_ratio gate re-count the SAME
+    # multi-MB content many times per compress() (measured ~18x on a 33 MB
+    # Chrome trace — tiktoken is O(n), so that dominated latency). Cache only
+    # large strings (small ones are ~unique, not worth the memory) and bound the
+    # cache to a few entries. The memo is a pure function of the text for a fixed
+    # encoding, so a cache hit is always the exact count — accounting is unchanged.
+    _COUNT_CACHE_MIN_LEN = 65_536
+    _COUNT_CACHE_MAX_BYTES = 64 * 1024 * 1024
+
     def __init__(self, model: str = "gpt-4o"):
         """Initialize tiktoken counter.
 
@@ -229,6 +238,12 @@ class TiktokenCounter(BaseTokenizer):
         # names like "GPT-4o" which must not fall through to the default.
         self.encoding_name = get_encoding_for_model(model.lower())
         self._encoding = _load_encoding_bounded(self.encoding_name)
+        # Bounded memo, capped by total cached BYTES (oldest evicted first). A
+        # plain clear-on-overflow thrashed at scale — the hottest string (a
+        # 33 MB doc re-counted many times) got evicted and re-encoded. Bounding
+        # by bytes keeps the working set resident, so each string is encoded once.
+        self._count_cache: dict[str, int] = {}
+        self._count_cache_bytes = 0
 
     @property
     def encoding(self):
@@ -259,6 +274,12 @@ class TiktokenCounter(BaseTokenizer):
     def count_text(self, text: str) -> int:
         """Count tokens in text using tiktoken.
 
+        Large strings are memoized (see ``_COUNT_CACHE_MIN_LEN``): the router and
+        the ``min_ratio`` gate re-count the same multi-MB content many times per
+        compress(), and tiktoken is O(n). A cache hit returns the exact count (a
+        pure function of the text for this encoding), so accounting is unchanged —
+        only the number of encode passes drops.
+
         Args:
             text: Text to tokenize.
 
@@ -267,7 +288,19 @@ class TiktokenCounter(BaseTokenizer):
         """
         if not text:
             return 0
-        return len(self._encode_tolerant(text))
+        if len(text) < self._COUNT_CACHE_MIN_LEN:
+            return len(self._encode_tolerant(text))
+        cached = self._count_cache.get(text)
+        if cached is not None:
+            return cached
+        n = len(self._encode_tolerant(text))
+        self._count_cache[text] = n
+        self._count_cache_bytes += len(text)
+        while self._count_cache_bytes > self._COUNT_CACHE_MAX_BYTES and len(self._count_cache) > 1:
+            oldest = next(iter(self._count_cache))
+            self._count_cache_bytes -= len(oldest)
+            del self._count_cache[oldest]
+        return n
 
     def count_messages(self, messages: list[dict[str, Any]]) -> int:
         """Count tokens in messages using OpenAI's exact formula.
