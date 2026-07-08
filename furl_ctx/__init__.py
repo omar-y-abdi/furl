@@ -98,6 +98,9 @@ __all__ = [
     "compress_with_cache",
     "retrieve",
     "resolve_markers",
+    # CCR durable-retention checkpointing (B2)
+    "ccr_export",
+    "ccr_import",
     "CompressConfig",
     "CompressResult",
     # Hooks
@@ -151,6 +154,9 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     # Cross-turn / whole-history presets (thin compress() wrappers)
     "compress_chat_history": ("furl_ctx.chat", "compress_chat_history"),
     "compress_with_cache": ("furl_ctx.chat", "compress_with_cache"),
+    # CCR durable-retention checkpointing (B2)
+    "ccr_export": ("furl_ctx.cache.compression_store", "ccr_export"),
+    "ccr_import": ("furl_ctx.cache.compression_store", "ccr_import"),
     # Hooks
     "CompressionHooks": ("furl_ctx.hooks", "CompressionHooks"),
     "CompressContext": ("furl_ctx.hooks", "CompressContext"),

@@ -416,6 +416,8 @@ def compress(
     hooks: CompressionHooks | None = None,
     config: CompressConfig | None = None,
     pipeline: Any | None = None,
+    session_id: str | None = None,
+    agent_id: str | None = None,
     **kwargs: Any,
 ) -> CompressResult:
     """Compress messages using Furl's full compression pipeline.
@@ -437,6 +439,15 @@ def compress(
             aggressive ``ContentRouter``) for THIS call without disturbing the
             global default — the fail-open, token-counting, and hook wiring
             around it are identical either way.
+        session_id: Optional tenant/session identifier. When set (or with
+            ``FURL_CCR_NAMESPACE`` / ``agent_id``), this call reads and writes
+            an ISOLATED per-namespace CCR store instead of the process-global
+            one, so an entry another tenant stored is never retrievable here.
+            Default ``None`` with no namespace env keeps today's global
+            behavior byte-for-byte.
+        agent_id: Optional sub-agent identifier, combined with ``session_id``
+            and ``FURL_CCR_NAMESPACE`` to form the CCR isolation boundary. Same
+            zero-change default as ``session_id``.
         **kwargs: Shorthand for CompressConfig fields. These override config:
             compress_user_messages, compress_system_messages, protect_recent,
             protect_analysis_context, min_tokens_to_compress.
@@ -500,7 +511,31 @@ def compress(
     if overrides:
         cfg = replace(cfg, **overrides)
 
+    # Per-tenant CCR isolation (B2). When a namespace is active
+    # (``session_id`` / ``agent_id`` / ``FURL_CCR_NAMESPACE``) bind that
+    # tenant's isolated store to the request ContextVar for the duration of
+    # this call, so the inline get_compression_store() reads in the transforms
+    # and the diagnostic helper above resolve the tenant store instead of the
+    # global one. Default (no namespace) resolves to None and the ContextVar is
+    # left untouched — today's global behavior, byte-for-byte. The token is
+    # RESET (never cleared) in the finally so an outer middleware store is
+    # restored, and reset-always keeps the fail-open path clean.
+    from .cache.compression_store import (
+        _request_ccr_store,
+        resolve_ccr_namespace_store,
+    )
+
+    _ccr_token = None
     try:
+        # Namespace resolution + the ContextVar bind sit INSIDE the fail-open
+        # boundary too: this is the first place compress() constructs a store,
+        # and a store-construction failure (e.g. a bad workspace path) must
+        # fail open like every other compression error, never raise out of the
+        # namespaced call.
+        _ccr_store = resolve_ccr_namespace_store(session_id, agent_id)
+        if _ccr_store is not None:
+            _ccr_token = _request_ccr_store.set(_ccr_store)
+
         # Pipeline construction sits INSIDE the fail-open boundary (COR-43):
         # the import chain behind TransformPipeline hard-requires the
         # furl_ctx._core extension, so a broken/missing wheel raises
@@ -749,6 +784,12 @@ def compress(
             compression_ratio=0.0,
             error=str(e),
         )
+    finally:
+        # Restore the prior CCR store (reset the token, do not clear) on BOTH
+        # the success and fail-open paths, so a per-tenant binding never leaks
+        # past this call and an outer middleware store is preserved.
+        if _ccr_token is not None:
+            _request_ccr_store.reset(_ccr_token)
 
 
 def _get_pipeline() -> Any:
