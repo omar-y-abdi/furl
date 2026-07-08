@@ -184,3 +184,104 @@ scans `BRACKET_RETRIEVE_PATTERN`; `retrieve()`/`resolve_markers()`/`ccr_hashes` 
 - **B3 at-rest encryption** (`FURL_CCR_ENCRYPT_KEY` / SQLCipher) needs a heavy crypto dep →
   building the minimal redaction/purge/namespace/audit core; **encryption deferred as a
   question** (which dep, or skip?). Audit-format (fields/rotation) also a question.
+
+## PERF — #1 PRIORITY (do after B2/B4 land)
+
+**Measured 2026-07-08 — furl-ctx 0.27.0, isolated venv, real 33.8 MB Chrome DevTools trace,
+per-stage bounded slices:**
+
+| stage | 1 MB | 4 MB | scaling |
+|-------|------|------|---------|
+| tiktoken count | 0.15 s | 0.58 s | **O(n)** ~6 MB/s — fine |
+| content detector | 0.01 s | 0.03 s | **O(n)** — fine |
+| **compress()** | **2.75 s** | **19.6 s** | **4× data → 7.1× time = SUPER-LINEAR** |
+
+4×→7.1× is worse than O(n). Extrapolates to ~10–50 min for 33 MB → matches the observed
+15-min hang. **It is the engine (router/crusher), not the harness or the test script** —
+tokenizer + detector are linear. Threshold effect: 1 MB routes to `router:mixed` (2.75 s,
+70 % saved); 4 MB routes to `router:ccr_offload` (19.6 s, ratio ≈ 1.0, ≈0 useful savings) —
+the large-input path is BOTH slow AND ineffective.
+
+**Why #1:** for file/log compression **latency IS the product**. A multi-minute compress is
+worse than useless — an agent would rather burn tokens or `grep`/`bash` the file than wait.
+Perf beats ratio for this use case.
+
+**Epic:**
+1. **Profiled root cause — CORRECTED.** The first profile used *truncated* JSON (`raw[:4MB]`),
+   an artifact: on truncated input the top-level `{` never balances, so the mixed splitter falls
+   through to per-event extraction → ~9,400 tiny sections. On a **VALID complete trace** the
+   splitter yields **1 section** (the whole balanced doc) — the fan-out/size-guard fixes were
+   chasing the artifact and are **dropped**. Real bottleneck (valid JSON, 4 MB, 14.8 s cProfile):
+   **tokenization = 82 %** — `tiktoken.encode` 12.1 s across 243 `count_text` calls (≈ ~17
+   full-content passes at ~0.7 s/pass); the single Rust `crush` is only 1.0 s. The
+   router / dispatch / `min_ratio` gate / fallback chain **re-tokenizes the same multi-MB content
+   ~17×**. → Fix: tokenize once before + once after; reuse/estimate counts for the ratio gate and
+   fallback comparisons instead of re-encoding the full content each time. Contract to preserve:
+   the `min_ratio` gate must still read correct token units (COR-17) — don't weaken it, cache it.
+2. **Latency budget + early-exit**: hard per-call size/time ceiling. Above a byte threshold,
+   short-circuit to a bounded cheap path (structural head/tail keep + CCR-offload the bulk)
+   instead of the expensive crusher. Never worse-than-linear; target ≥ 20–50 MB/s end-to-end.
+3. **Fix `ccr_offload` accounting**: 4 MB reported `saved=1,508,034` yet `ratio≈0.9997`
+   (contradiction) while saving ≈0 useful tokens and costing 19.6 s.
+4. **Guard in the eval harness (B5)**: fail if end-to-end MB/s drops below a floor.
+
+Note: Q3 (envelope-unwrap) is a **ratio/routing** fix (detect `traceEvents`, crush the inner
+array — the trace detects as PLAIN_TEXT in 0.27.0), **NOT** a perf fix. Perf is its own epic.
+
+**RESULT (2026-07-08) — tokenization memo shipped (commit e8c739e3).** Fixed the confirmed 82 %:
+`TiktokenCounter.count_text` now memoizes large strings (bounded by cached bytes, oldest evicted),
+so the ~18× re-tokenization of the same multi-MB content collapses. **4 MB: 14.8 s → 5.05 s. Real
+33 MB Chrome trace: ~15 min → ~68 s (~13×).** Ratio byte-identical (0.2752), 1633 pytest green,
+verify.run gates pass (hash_failures=0, silent_loss=0, byte_exact=True). Accounting-only — no
+compression change.
+
+**Residual at 33 MB (~68 s) — deeper, needs a decision (steps 2–4 above superseded):**
+- **Rust `crush` = 26 s** (one call, super-linear: 1 s@4 MB → 26 s@33 MB). SmartCrusher is O(>n) on
+  huge input → a Rust-side algorithmic fix (harder, contract-risk).
+- **`encode` = 34 s** — tiktoken is slow on the base64-heavy trace (sourcemaps); the memo already
+  collapsed the repeats, so this is ~one honest tokenization of 33 MB. Reducible only by ESTIMATING
+  token counts for huge content (≈ bytes/4) instead of exact tiktoken — a latency-vs-accuracy trade
+  on the `min_ratio` gate (the "latency IS the product" stance favors it, but it lowers gate
+  precision → needs sign-off).
+- **Or a size-guard**: above ~N MB, skip the expensive exact path (estimate + one bounded crush, or
+  CCR-offload) → predictable latency, some ratio trade.
+13× is banked; the last mile is a trade-off call.
+
+**RESULT 2 (2026-07-08) — size-guard shipped (commit 9b4775a7).** Above
+`FURL_MAX_COMPRESS_BYTES` (default 8 MB) a content block offloads to CCR immediately
+(O(n), head/tail preview + full original byte-exact recoverable) instead of the super-linear
+crush. **33 MB trace: 68 s → 24 s; cumulative ~15 min → 24 s (~37×).** Content below the
+ceiling is byte-identical (verify.run degradations/hash_failures/silent_loss unchanged);
+1636 pytest green.
+- **Rust crush now LOW-URGENCY**: huge content bypasses the crush entirely, so SmartCrusher's
+  super-linearity only affects mid-size (4–8 MB) content (~5–13 s, tolerable). The deep
+  Rust-side fix is deferred unless the 4–8 MB path must be faster.
+- **Remaining 24 s residual**: `tokens_before` is one exact tokenization of the 33 MB (~11.7 s,
+  memoized). Reducible to ~10 s total by estimating tokens for huge content at the pipeline
+  (small change, minor reported-count accuracy trade) — optional last mile.
+
+**Rust crush — scoped for a focused effort (user requested it; needs fresh context — a broken
+`.so` from an interrupted `maturin develop` breaks the whole tool, so don't rebuild-loop at
+deep context).** Entry: `walk.rs:44 crush` → `smart_crush_content_collecting` → per JSON array
+`route.rs:147 crush_array` = walk items → `analyzer.analyze_array` → `planner.create_plan` →
+`execute_plan` → compaction (`compactor.rs` / `formatter.rs`). The **analyzer is O(n)** (per-key
+stats, keys ≈ const) — ruled out. The super-linear term (1 s@4 MB → 26 s@33 MB, ~O(n^1.4)) is
+NOT yet pinpointed; prime suspects: a quadratic op in `planning.rs` (item loops at
+:322/:441/:575/:622/:719) or `compactor.rs` (19 item loops). **Method:** instrument the 4 phases
+in `crush_array` with `Instant` timing, `maturin develop` once, run a <8 MB subset (the
+size-guard offloads >8 MB) at two sizes → the phase whose time scales super-linearly is the
+target. Fix MUST keep the crush output byte-identical (grammar + compression-floor contract) +
+`cargo test --workspace` + `verify.run` unchanged. Note: LOW real-world urgency — the size-guard
+already bounds huge inputs; this only speeds the 4–8 MB path.
+
+**DONE (commit 621509b7, delegated 2-agent pipeline: pinpoint → fix).** The pinpoint
+CONTRADICTED the scoping above: the O(n²) was `count_unique_simhash` (`adaptive_sizer.rs:276-298`)
+— a greedy simhash-cluster scan inside adaptive k-selection (`compute_optimal_k`), NOT
+planning/compactor/formatter (all measured linear-in-bytes). Fix: a 16-bit block index (pigeonhole
+LSH — two fps within Hamming t share ≥1 of t+1 equal blocks) → byte-identical cluster count,
+**cluster-scan 30.5 s → 0.4 s** at the full trace. Verified by the orchestrator: cargo test 832 +
+fmt clean, pytest 1636, verify.run unchanged (degradations=6/hash_failures=0/silent_loss=0 →
+byte-identical crush output). Residual: the crush is still slow for guard-disabled large content
+(~33 s @ 7.4 MB — other phases sum large), but production offloads >8 MB, so this only affects the
+4–8 MB path (lower the guard if that matters). **Lesson: delegated measurement > static scoping —
+the pinpoint found the culprit my guess (planning/compactor) missed.**

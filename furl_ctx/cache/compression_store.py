@@ -49,8 +49,10 @@ import threading
 import time
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from .. import paths as _paths
 from ..relevance.bm25 import BM25Scorer
 
 if TYPE_CHECKING:
@@ -1507,6 +1509,125 @@ def clear_request_compression_store() -> None:
     _request_ccr_store.set(None)
 
 
+# ---------------------------------------------------------------------------
+# Per-tenant CCR namespacing (B2 durable-retention).
+#
+# Real isolation, not prefixing: search/stats/expiry/heap-rebuild all iterate
+# the WHOLE backend and the sqlite backend has no namespace column, so a shared
+# backend with prefixed keys would leak entries across tenants. Instead each
+# namespace gets its OWN ``CompressionStore`` (its own backend / sqlite file),
+# swapped in via the ``_request_ccr_store`` ContextVar around the pipeline call.
+# An entry written under namespace A is simply not present in namespace B's
+# store object, so cross-namespace retrieval returns None — the invariant is
+# structural, not a filter that can be forgotten.
+# ---------------------------------------------------------------------------
+
+FURL_CCR_NAMESPACE_ENV = "FURL_CCR_NAMESPACE"
+
+# Registry of namespace-key -> store, so identical (namespace, session, agent)
+# tuples converge on the SAME store across calls (cross-turn retrieval works)
+# and in-memory tenants do not lose their entries between compress() calls.
+_namespace_stores: dict[str, CompressionStore] = {}
+_namespace_lock = threading.Lock()
+
+
+def _namespace_key(session_id: str | None, agent_id: str | None) -> str | None:
+    """Compose the isolation key from ``FURL_CCR_NAMESPACE`` + session + agent.
+
+    The three segments together define the tenant boundary: an identical tuple
+    maps to the same store (so a later turn recovers what an earlier turn
+    stored), any difference maps to a different store. Blank/None segments
+    contribute an empty field. When NONE of the three is set the caller wants
+    today's global behavior, so this returns ``None`` — the resolver then
+    touches nothing and the global singleton serves.
+    """
+    env_ns = (os.environ.get(FURL_CCR_NAMESPACE_ENV) or "").strip()
+    session = (session_id or "").strip()
+    agent = (agent_id or "").strip()
+    if not env_ns and not session and not agent:
+        return None
+    # NUL-joined so distinct segmentations cannot alias (``a`` + ``bc`` vs
+    # ``ab`` + ``c``); the raw values are opaque and never touch a filesystem
+    # path directly — the sqlite filename is derived by hashing this key.
+    return "\x00".join((env_ns, session, agent))
+
+
+def _ccr_namespace_db_path(namespace_key: str) -> Path:
+    """Per-namespace durable sqlite path, derived by HASHING the key.
+
+    ``session_id`` / ``agent_id`` are untrusted request data, so the key never
+    interpolates into a path verbatim (``session_id="../../x"`` would traverse).
+    The filename is ``ccr-ns-<sha256(key)[:16]>.sqlite3`` under the workspace
+    dir — 64 bits of hash, far more than enough that two tenants cannot collide
+    onto one file. Sits beside the global ``ccr.sqlite3`` so every tenant shares
+    the workspace root but never the same database.
+    """
+    digest = hashlib.sha256(namespace_key.encode("utf-8", "surrogatepass")).hexdigest()[:16]
+    return _paths.workspace_dir() / f"ccr-ns-{digest}.sqlite3"
+
+
+def _build_namespace_store(namespace_key: str) -> CompressionStore:
+    """Construct a fresh, isolated store for ``namespace_key``.
+
+    Backend selection mirrors the global default (``FURL_CCR_BACKEND``): the
+    durable ``sqlite`` backend gets a per-namespace file (so tenants never share
+    a database), every other selection — including the in-memory default — gets
+    its OWN backend instance via the ``CompressionStore`` constructor. Never
+    falls back to the global store: that would defeat isolation.
+    """
+    backend_type = (os.environ.get("FURL_CCR_BACKEND") or "").strip().lower()
+    backend: CompressionStoreBackend | None = None
+    if backend_type == "sqlite":
+        from .backends.sqlite import SqliteBackend
+
+        backend = SqliteBackend(db_path=_ccr_namespace_db_path(namespace_key))
+    # Deliberately NO spill tier here: the env spill (FURL_CCR_SPILL) targets the
+    # shared global ``ccr.sqlite3``, so wiring one would demote every tenant into
+    # a single shared file — the exact cross-namespace leak this isolation
+    # forbids. Each namespace is self-contained in its own backend.
+    return CompressionStore(
+        default_ttl=_get_env_default_ttl_seconds(),
+        backend=backend,
+    )
+
+
+def _resolve_namespace_store(namespace_key: str) -> CompressionStore:
+    """Return the store for ``namespace_key``, creating it once (registry).
+
+    Non-throwing by construction: a dict lookup under a lock plus
+    ``SqliteBackend.__init__`` (which degrades to in-memory internally rather
+    than raising). The double-check keeps store creation single-flight without
+    holding the lock across construction longer than needed.
+    """
+    store = _namespace_stores.get(namespace_key)
+    if store is not None:
+        return store
+    with _namespace_lock:
+        store = _namespace_stores.get(namespace_key)
+        if store is None:
+            store = _build_namespace_store(namespace_key)
+            _namespace_stores[namespace_key] = store
+    return store
+
+
+def resolve_ccr_namespace_store(
+    session_id: str | None = None,
+    agent_id: str | None = None,
+) -> CompressionStore | None:
+    """Resolve the tenant-scoped store for ``(namespace, session, agent)``.
+
+    Returns ``None`` when no namespace is active (the global singleton serves —
+    zero change to today's behavior), otherwise the isolated per-namespace
+    store. This is the seam ``compress()`` binds onto ``_request_ccr_store`` so
+    the inline ``get_compression_store()`` calls in the transforms pick up the
+    tenant store for the duration of the call.
+    """
+    key = _namespace_key(session_id, agent_id)
+    if key is None:
+        return None
+    return _resolve_namespace_store(key)
+
+
 def _backend_opts_from_env() -> dict[str, Any]:
     """Parse ``FURL_CCR_BACKEND_OPTS`` (a JSON object) into factory kwargs.
 
@@ -1656,10 +1777,105 @@ def get_compression_store(
 
 
 def reset_compression_store() -> None:
-    """Reset the global compression store. Mainly for testing."""
+    """Reset the global compression store. Mainly for testing.
+
+    Also drops every per-namespace store (B2): the existing autouse fixtures
+    call this between tests, so folding the namespace registry in here keeps
+    tenant stores from leaking retrievable entries across tests.
+    """
     global _compression_store
 
     with _store_lock:
         if _compression_store is not None:
             _compression_store.clear()
         _compression_store = None
+
+    with _namespace_lock:
+        for store in _namespace_stores.values():
+            store.clear()
+        _namespace_stores.clear()
+
+
+def _active_ccr_store(
+    session_id: str | None,
+    agent_id: str | None,
+) -> CompressionStore:
+    """The store ``ccr_export``/``ccr_import`` act on for a given tenant.
+
+    When a namespace is active (``FURL_CCR_NAMESPACE`` or ``session_id`` /
+    ``agent_id``) this is that tenant's isolated store; otherwise it is
+    whatever ``get_compression_store()`` resolves — the request-scoped store if
+    middleware set one, else the global singleton. Checkpointing a specific
+    tenant is thus a matter of passing the same ids used at ``compress()`` time.
+    """
+    namespace_store = resolve_ccr_namespace_store(session_id, agent_id)
+    if namespace_store is not None:
+        return namespace_store
+    return get_compression_store()
+
+
+def ccr_export(
+    path: str | os.PathLike[str],
+    *,
+    session_id: str | None = None,
+    agent_id: str | None = None,
+) -> int:
+    """Checkpoint a CCR store to a durable sqlite file at ``path``.
+
+    Copies entries at the BACKEND level (``items()`` -> ``set()``) so every
+    field round-trips byte-exact: routing through ``store.store()`` would
+    recompute the key and reset ``created_at`` / ``ttl`` / ``retrieval_count``.
+    The destination is a fresh ``SqliteBackend`` on ``path`` — its
+    ``surrogatepass`` BLOB encoding preserves hostile payloads (lone
+    surrogates, NULs, control chars) unchanged.
+
+    ``session_id`` / ``agent_id`` (default ``None``) select the tenant store to
+    export, matching the values passed to ``compress()``; with none set the
+    active/global store is exported.
+
+    Returns the number of entries written.
+    """
+    from .backends.sqlite import SqliteBackend
+
+    source = _active_ccr_store(session_id, agent_id)
+    destination = SqliteBackend(db_path=path)
+    try:
+        entries = source._backend.items()
+        for hash_key, entry in entries:
+            destination.set(hash_key, entry)
+    finally:
+        destination.close()
+    return len(entries)
+
+
+def ccr_import(
+    path: str | os.PathLike[str],
+    *,
+    session_id: str | None = None,
+    agent_id: str | None = None,
+) -> int:
+    """Restore a CCR checkpoint written by ``ccr_export`` into a store.
+
+    Reads the sqlite file at ``path`` and copies each entry into the target
+    store's backend (``items()`` -> ``backend.set()``), preserving
+    ``created_at`` / ``ttl`` / ``retrieval_count`` so a restored entry is
+    byte-identical to the one exported. TTL is honored on later ``retrieve()``
+    (an entry that has since expired correctly misses — TTL-on-access promotion
+    is deliberately out of scope for B2).
+
+    ``session_id`` / ``agent_id`` (default ``None``) select the destination
+    tenant store; with none set the active/global store receives the entries.
+
+    Returns the number of entries restored.
+    """
+    from .backends.sqlite import SqliteBackend
+
+    source = SqliteBackend(db_path=path)
+    try:
+        entries = source.items()
+    finally:
+        source.close()
+    destination = _active_ccr_store(session_id, agent_id)
+    for hash_key, entry in entries:
+        destination._backend.set(hash_key, entry)
+    return len(entries)
