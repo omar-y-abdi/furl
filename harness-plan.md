@@ -246,3 +246,16 @@ compression change.
 - **Or a size-guard**: above ~N MB, skip the expensive exact path (estimate + one bounded crush, or
   CCR-offload) → predictable latency, some ratio trade.
 13× is banked; the last mile is a trade-off call.
+
+**RESULT 2 (2026-07-08) — size-guard shipped (commit 9b4775a7).** Above
+`FURL_MAX_COMPRESS_BYTES` (default 8 MB) a content block offloads to CCR immediately
+(O(n), head/tail preview + full original byte-exact recoverable) instead of the super-linear
+crush. **33 MB trace: 68 s → 24 s; cumulative ~15 min → 24 s (~37×).** Content below the
+ceiling is byte-identical (verify.run degradations/hash_failures/silent_loss unchanged);
+1636 pytest green.
+- **Rust crush now LOW-URGENCY**: huge content bypasses the crush entirely, so SmartCrusher's
+  super-linearity only affects mid-size (4–8 MB) content (~5–13 s, tolerable). The deep
+  Rust-side fix is deferred unless the 4–8 MB path must be faster.
+- **Remaining 24 s residual**: `tokens_before` is one exact tokenization of the 33 MB (~11.7 s,
+  memoized). Reducible to ~10 s total by estimating tokens for huge content at the pipeline
+  (small change, minor reported-count accuracy trade) — optional last mile.
