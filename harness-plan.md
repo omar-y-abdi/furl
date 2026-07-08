@@ -227,3 +227,22 @@ Perf beats ratio for this use case.
 
 Note: Q3 (envelope-unwrap) is a **ratio/routing** fix (detect `traceEvents`, crush the inner
 array — the trace detects as PLAIN_TEXT in 0.27.0), **NOT** a perf fix. Perf is its own epic.
+
+**RESULT (2026-07-08) — tokenization memo shipped (commit e8c739e3).** Fixed the confirmed 82 %:
+`TiktokenCounter.count_text` now memoizes large strings (bounded by cached bytes, oldest evicted),
+so the ~18× re-tokenization of the same multi-MB content collapses. **4 MB: 14.8 s → 5.05 s. Real
+33 MB Chrome trace: ~15 min → ~68 s (~13×).** Ratio byte-identical (0.2752), 1633 pytest green,
+verify.run gates pass (hash_failures=0, silent_loss=0, byte_exact=True). Accounting-only — no
+compression change.
+
+**Residual at 33 MB (~68 s) — deeper, needs a decision (steps 2–4 above superseded):**
+- **Rust `crush` = 26 s** (one call, super-linear: 1 s@4 MB → 26 s@33 MB). SmartCrusher is O(>n) on
+  huge input → a Rust-side algorithmic fix (harder, contract-risk).
+- **`encode` = 34 s** — tiktoken is slow on the base64-heavy trace (sourcemaps); the memo already
+  collapsed the repeats, so this is ~one honest tokenization of 33 MB. Reducible only by ESTIMATING
+  token counts for huge content (≈ bytes/4) instead of exact tiktoken — a latency-vs-accuracy trade
+  on the `min_ratio` gate (the "latency IS the product" stance favors it, but it lowers gate
+  precision → needs sign-off).
+- **Or a size-guard**: above ~N MB, skip the expensive exact path (estimate + one bounded crush, or
+  CCR-offload) → predictable latency, some ratio trade.
+13× is banked; the last mile is a trade-off call.
