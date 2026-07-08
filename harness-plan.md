@@ -273,3 +273,15 @@ size-guard offloads >8 MB) at two sizes → the phase whose time scales super-li
 target. Fix MUST keep the crush output byte-identical (grammar + compression-floor contract) +
 `cargo test --workspace` + `verify.run` unchanged. Note: LOW real-world urgency — the size-guard
 already bounds huge inputs; this only speeds the 4–8 MB path.
+
+**DONE (commit 621509b7, delegated 2-agent pipeline: pinpoint → fix).** The pinpoint
+CONTRADICTED the scoping above: the O(n²) was `count_unique_simhash` (`adaptive_sizer.rs:276-298`)
+— a greedy simhash-cluster scan inside adaptive k-selection (`compute_optimal_k`), NOT
+planning/compactor/formatter (all measured linear-in-bytes). Fix: a 16-bit block index (pigeonhole
+LSH — two fps within Hamming t share ≥1 of t+1 equal blocks) → byte-identical cluster count,
+**cluster-scan 30.5 s → 0.4 s** at the full trace. Verified by the orchestrator: cargo test 832 +
+fmt clean, pytest 1636, verify.run unchanged (degradations=6/hash_failures=0/silent_loss=0 →
+byte-identical crush output). Residual: the crush is still slow for guard-disabled large content
+(~33 s @ 7.4 MB — other phases sum large), but production offloads >8 MB, so this only affects the
+4–8 MB path (lower the guard if that matters). **Lesson: delegated measurement > static scoping —
+the pinpoint found the culprit my guess (planning/compactor) missed.**
