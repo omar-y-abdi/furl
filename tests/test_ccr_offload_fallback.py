@@ -48,6 +48,24 @@ def _files_payload(n_files: int = 3, blob_lines: int = 250) -> str:
     return json.dumps(rows, ensure_ascii=False)
 
 
+def _trace_payload(n_events: int = 200) -> str:
+    """JSON OBJECT with a dominant inner array — the Chrome DevTools trace
+    shape: ``{"metadata": {...header boilerplate...}, "traceEvents": [...]}``.
+    The head keys are the object's metadata, NOT the events, so a head/tail
+    LINES preview would show almost nothing about the events. Deterministic."""
+    metadata = {
+        "enhancedTraceVersion": 1,
+        "source": "DevTools",
+        "hostDPR": 2.0,
+        "sourceMaps": [],
+    }
+    events = [
+        {"name": f"Event::{i}", "cat": "devtools.timeline", "ph": "X", "ts": 1000 + i, "pid": 1}
+        for i in range(n_events)
+    ]
+    return json.dumps({"metadata": metadata, "traceEvents": events}, ensure_ascii=False)
+
+
 def _offload_router() -> ContentRouter:
     """SmartCrusher disabled so the strategy chain deterministically declines
     and the fallback itself is the unit under test."""
@@ -98,6 +116,36 @@ def test_offload_fires_on_code_benchmark_snapshot_default_config():
     assert result.strategy_used == CompressionStrategy.CCR_OFFLOAD
     assert result.compression_ratio < 0.2
     assert _recover(json.loads(result.compressed)[-1]["_ccr_dropped"]) == content
+
+
+def test_offload_object_with_dominant_array_previews_inner_array():
+    """A JSON OBJECT with a dominant inner array (Chrome-trace shape) must
+    preview a SAMPLE of that array — not the object's metadata header — while
+    staying byte-exact recoverable. Regression: the head/tail LINES fallback
+    shipped the metadata boilerplate and hid the events."""
+    content = _trace_payload()
+    result = _offload_router().compress(content)
+
+    assert result.strategy_used == CompressionStrategy.CCR_OFFLOAD
+    rows = json.loads(result.compressed)
+
+    # Leads with a summary naming the dominant array (its length) and the
+    # object's OTHER top-level keys — here "metadata".
+    assert rows[0]["_preview"] == "'traceEvents': 200 items"
+    assert rows[0]["_other_keys"] == ["metadata"]
+
+    # The sampled elements are the ACTUAL events (their fields survive), and
+    # the metadata header is NOT what the preview shows.
+    sampled = [r for r in rows if r.get("name", "").startswith("Event::")]
+    assert sampled, "preview must contain sampled traceEvents, not the header"
+    assert {"name", "cat", "ph", "ts"} <= set(sampled[0])
+    assert sampled[0]["name"] == "Event::0"
+    assert "enhancedTraceVersion" not in result.compressed
+
+    # Sentinel + both marker grammars intact; byte-exact recovery preserved.
+    assert set(rows[-1]) == {"_ccr_dropped"}
+    assert _recover(rows[-1]["_ccr_dropped"]) == content
+    assert _looks_like_ccr_output(result.compressed)
 
 
 def test_offload_store_failure_fails_open(monkeypatch):

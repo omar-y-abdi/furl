@@ -105,6 +105,11 @@ _OFFLOAD_PREVIEW_MAX_ROWS = 20
 _OFFLOAD_PREVIEW_FIELD_CHARS = 120
 _OFFLOAD_PREVIEW_HEAD_LINES = 12
 _OFFLOAD_PREVIEW_TAIL_LINES = 4
+# Object-with-dominant-array preview (e.g. a Chrome trace: {"metadata": {...},
+# "traceEvents": [...]}). Sample the leading/trailing elements of the inner
+# array so the preview reflects the events, not the object's header boilerplate.
+_OFFLOAD_PREVIEW_ARRAY_HEAD = 8
+_OFFLOAD_PREVIEW_ARRAY_TAIL = 2
 
 # Byte ceiling above which a content block is offloaded immediately instead of
 # run through the exact mixed/crush path — that path is super-linear (a real
@@ -644,10 +649,45 @@ class ContentCompressionEngine:
         )
 
     @staticmethod
-    def _build_offload_preview(content: str) -> tuple[list[Any] | str, int]:
+    def _truncate_row(item: dict[str, Any]) -> dict[str, Any]:
+        """One preview row: long string fields truncated (paths/ids stay
+        verbatim), non-scalar fields elided — the full value is in the CCR
+        store. Shared by the top-level-array and dominant-array previews."""
+        row: dict[str, Any] = {}
+        for k, v in item.items():
+            if isinstance(v, str) and len(v) > _OFFLOAD_PREVIEW_FIELD_CHARS:
+                row[k] = v[:_OFFLOAD_PREVIEW_FIELD_CHARS] + f"… [{len(v)} chars, in CCR]"
+            elif isinstance(v, (str, int, float, bool)) or v is None:
+                row[k] = v
+            else:
+                row[k] = f"[{type(v).__name__} omitted, in CCR]"
+        return row
+
+    @staticmethod
+    def _dominant_array(parsed: Any) -> tuple[str, list[dict[str, Any]], list[str]] | None:
+        """A JSON object with EXACTLY one dominant inner array — a non-empty
+        list of dicts (e.g. a Chrome trace's ``traceEvents``). Mirrors
+        ``sniff_envelope``'s fail-open "exactly one, else None" rule without its
+        wrapper-key allowlist. Returns ``(key, inner, other_key_names)`` or
+        ``None`` when zero or more than one key qualifies (ambiguous)."""
+        if not isinstance(parsed, dict):
+            return None
+        matches = [
+            k
+            for k, v in parsed.items()
+            if isinstance(v, list) and v and all(isinstance(item, dict) for item in v)
+        ]
+        if len(matches) != 1:
+            return None
+        key = matches[0]
+        other = [k for k in parsed if k != key]
+        return key, parsed[key], other
+
+    def _build_offload_preview(self, content: str) -> tuple[list[Any] | str, int]:
         """Identity preview of *content*: for a JSON array of objects, the
         leading rows with long string fields truncated (paths/ids stay
-        verbatim); otherwise the head/tail lines. Returns ``(rows | text,
+        verbatim); for a JSON object with one dominant inner array, a sample of
+        that array; otherwise the head/tail lines. Returns ``(rows | text,
         n_items)``. Never reversible — recovery is the stored original."""
         import json
 
@@ -656,20 +696,30 @@ class ContentCompressionEngine:
         except (json.JSONDecodeError, ValueError):
             parsed = None
         if isinstance(parsed, list) and parsed and all(isinstance(item, dict) for item in parsed):
-            rows: list[Any] = []
-            for item in parsed[:_OFFLOAD_PREVIEW_MAX_ROWS]:
-                row: dict[str, Any] = {}
-                for k, v in item.items():
-                    if isinstance(v, str) and len(v) > _OFFLOAD_PREVIEW_FIELD_CHARS:
-                        row[k] = v[:_OFFLOAD_PREVIEW_FIELD_CHARS] + f"… [{len(v)} chars, in CCR]"
-                    elif isinstance(v, (str, int, float, bool)) or v is None:
-                        row[k] = v
-                    else:
-                        row[k] = f"[{type(v).__name__} omitted, in CCR]"
-                rows.append(row)
+            rows: list[Any] = [
+                self._truncate_row(item) for item in parsed[:_OFFLOAD_PREVIEW_MAX_ROWS]
+            ]
             if len(parsed) > len(rows):
                 rows.append({"_preview": f"first {len(rows)} of {len(parsed)} rows"})
             return rows, len(parsed)
+
+        dominant = self._dominant_array(parsed)
+        if dominant is not None:
+            key, inner, other_keys = dominant
+            head, tail = _OFFLOAD_PREVIEW_ARRAY_HEAD, _OFFLOAD_PREVIEW_ARRAY_TAIL
+            if len(inner) <= head + tail:
+                sample = [self._truncate_row(item) for item in inner]
+            else:
+                sample = [self._truncate_row(item) for item in inner[:head]]
+                sample.append(
+                    {"_preview": f"… {len(inner) - head - tail} of {len(inner)} omitted, in CCR …"}
+                )
+                sample.extend(self._truncate_row(item) for item in inner[-tail:])
+            summary = {
+                "_preview": f"'{key}': {len(inner)} items",
+                "_other_keys": other_keys,
+            }
+            return [summary, *sample], len(inner)
 
         lines = content.splitlines()
         head, tail = _OFFLOAD_PREVIEW_HEAD_LINES, _OFFLOAD_PREVIEW_TAIL_LINES
