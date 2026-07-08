@@ -110,6 +110,26 @@ _OFFLOAD_PREVIEW_TAIL_LINES = 4
 # array so the preview reflects the events, not the object's header boilerplate.
 _OFFLOAD_PREVIEW_ARRAY_HEAD = 8
 _OFFLOAD_PREVIEW_ARRAY_TAIL = 2
+# Signal-aware summary budgets for the two JSON-array-of-dicts offload paths.
+# Two sequential O(n) passes over the rows yield a compact ``_ccr_summary`` that
+# answers aggregate (per-field value histograms) and anomaly (one concrete
+# example row per notable value) questions INLINE, so the agent need not
+# retrieve the full content. All bounds are hard output caps — the summary stays
+# a few KB regardless of row count.
+#
+# A field is CATEGORICAL (gets a histogram + is a candidate for the example
+# field) when its scalar values are low-cardinality: at most
+# _SUMMARY_MAX_CATEGORICAL_DISTINCT distinct values, OR a distinct/row ratio
+# below _SUMMARY_CATEGORICAL_RATIO. An all-unique field (e.g. a monotonic
+# timestamp) fails both and is excluded, so it neither bloats value_counts nor
+# is picked as the example ("type") field.
+#
+# _SUMMARY_TOP_VALUES bounds BOTH the per-field histogram and the example rows
+# (one example per top value of the chosen field).
+_SUMMARY_MAX_CATEGORICAL_DISTINCT = 50
+_SUMMARY_CATEGORICAL_RATIO = 0.02
+_SUMMARY_TOP_VALUES = 20
+_SUMMARY_SAMPLE_ROWS = 6
 
 # Byte ceiling above which a content block is offloaded immediately instead of
 # run through the exact mixed/crush path — that path is super-linear (a real
@@ -683,12 +703,243 @@ class ContentCompressionEngine:
         other = [k for k in parsed if k != key]
         return key, parsed[key], other
 
+    @staticmethod
+    def _dominant_type_name(type_counts: Counter[str]) -> str:
+        """Most frequent value-type name for a field, ties broken by name for
+        determinism. ``null`` only wins when a field is exclusively null."""
+        if not type_counts:
+            return "null"
+        return max(sorted(type_counts), key=lambda name: type_counts[name])
+
+    @staticmethod
+    def _type_name(value: object) -> str:
+        """Domain type label for a cell. ``bool`` is checked before ``int``
+        because Python's ``bool`` is an ``int`` subclass — True/False must read
+        as ``bool``, never ``int`` (and must never enter numeric ranges)."""
+        if value is None:
+            return "null"
+        if isinstance(value, bool):
+            return "bool"
+        if isinstance(value, int):
+            return "int"
+        if isinstance(value, float):
+            return "float"
+        if isinstance(value, str):
+            return "str"
+        if isinstance(value, dict):
+            return "dict"
+        if isinstance(value, list):
+            return "list"
+        return type(value).__name__
+
+    @staticmethod
+    def _is_hashable_scalar(value: object) -> bool:
+        """Only hashable scalars are counted in histograms. ``None`` is elided
+        (an absent/empty field is not a category); dict/list/unhashable values
+        are elided (their full form is in the CCR store)."""
+        return isinstance(value, (str, int, float, bool))
+
+    def _summarize_rows(
+        self,
+        rows: list[dict[str, Any]],
+        *,
+        key: str | None,
+        other_keys: list[str],
+    ) -> tuple[list[dict[str, Any]], int]:
+        """O(n) signal-aware summary of a list of dict rows.
+
+        Two sequential O(n) passes over *rows*: the first tallies per-field type
+        counts, hashable-scalar value counts, and numeric ranges; the second (in
+        ``_build_examples``) attaches one concrete example row to each top value
+        of the chosen "type" field once its top values are known. Output is
+        bounded (per-field top-K histogram + <=_SUMMARY_TOP_VALUES example rows +
+        _SUMMARY_SAMPLE_ROWS sample rows), so it stays a few KB for any *n*.
+
+        Returns ``([{"_ccr_summary": {...}}], len(rows))``. Never mutates *rows*.
+        Pure given *rows*: recovery is always the byte-exact stored original.
+        """
+        n = len(rows)
+        # --- Pass 1: per-field aggregates (single scan over rows). ---
+        type_counts: dict[str, Counter[str]] = {}
+        value_counts: dict[str, Counter[Any]] = {}
+        numeric_ranges: dict[str, tuple[float, float]] = {}
+        for row in rows:
+            for field_name, value in row.items():
+                tc = type_counts.get(field_name)
+                if tc is None:
+                    tc = type_counts[field_name] = Counter()
+                tc[self._type_name(value)] += 1
+                if self._is_hashable_scalar(value):
+                    vc = value_counts.get(field_name)
+                    if vc is None:
+                        vc = value_counts[field_name] = Counter()
+                    vc[value] += 1
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    lo, hi = numeric_ranges.get(field_name, (value, value))
+                    numeric_ranges[field_name] = (min(lo, value), max(hi, value))
+
+        # --- Field classification (over fields, bounded by distinct values). ---
+        schema = {
+            field_name: self._dominant_type_name(tc) for field_name, tc in type_counts.items()
+        }
+        # Coverage = rows in which the field is present (a field may be missing
+        # from heterogeneous rows). Drives the "type" field pick in examples.
+        coverage = {field_name: tc.total() for field_name, tc in type_counts.items()}
+        categorical: dict[str, Counter[Any]] = {
+            field_name: vc
+            for field_name, vc in value_counts.items()
+            if self._is_categorical(len(vc), n)
+        }
+        summary_value_counts: dict[str, dict[str, Any]] = {
+            field_name: self._top_value_counts(vc) for field_name, vc in categorical.items()
+        }
+        ranges = {
+            field_name: {"min": lo, "max": hi} for field_name, (lo, hi) in numeric_ranges.items()
+        }
+
+        summary: dict[str, Any] = {
+            "array": key,
+            "count": n,
+            "other_keys": other_keys,
+            "schema": schema,
+            "value_counts": summary_value_counts,
+            "ranges": ranges,
+            "examples": self._build_examples(rows, categorical, coverage),
+            "sample_rows": [self._truncate_row(rows[i]) for i in self._sample_indices(n)],
+        }
+        return [{"_ccr_summary": summary}], n
+
+    @staticmethod
+    def _is_categorical(distinct: int, n: int) -> bool:
+        """A scalar field is a categorical histogram when it is low-cardinality:
+        few distinct values in absolute terms, OR a small distinct/row ratio (so
+        a large trace with a bounded name set still qualifies). An all-unique
+        field fails both and is excluded."""
+        if distinct == 0:
+            return False
+        if distinct <= _SUMMARY_MAX_CATEGORICAL_DISTINCT:
+            return True
+        return n > 0 and (distinct / n) < _SUMMARY_CATEGORICAL_RATIO
+
+    @staticmethod
+    def _summary_key(value: object) -> str:
+        """JSON-object key for a histogram value: stringified (a JSON key is
+        always a string) and truncated to the same _OFFLOAD_PREVIEW_FIELD_CHARS
+        budget _truncate_row applies, so value_counts can never re-embed a large
+        field value verbatim (no full-content duplication; output stays bounded).
+        Two long values sharing that prefix collapse to one key — a harmless
+        preview artifact; their counts are summed so the histogram stays honest.
+        Recovery is unaffected (it is the byte-exact stored original)."""
+        text = str(value)
+        if len(text) > _OFFLOAD_PREVIEW_FIELD_CHARS:
+            return text[:_OFFLOAD_PREVIEW_FIELD_CHARS] + f"… [{len(text)} chars, in CCR]"
+        return text
+
+    def _top_value_counts(self, counts: Counter[Any]) -> dict[str, Any]:
+        """Top-_SUMMARY_TOP_VALUES ``{value: count}`` for one categorical field
+        plus ``_distinct`` (the true distinct-value count). Keys are bounded via
+        ``_summary_key``; the count is the AGGREGATE answer. Ordered by count
+        desc, value asc for determinism. Counts of keys that collapse under
+        truncation are summed."""
+        top = sorted(counts.items(), key=lambda kv: (-kv[1], str(kv[0])))[:_SUMMARY_TOP_VALUES]
+        histogram: dict[str, Any] = {}
+        for value, count in top:
+            key = self._summary_key(value)
+            histogram[key] = histogram.get(key, 0) + count
+        histogram["_distinct"] = len(counts)
+        return histogram
+
+    @staticmethod
+    def _primary_categorical_field(
+        categorical: dict[str, Counter[Any]],
+        coverage: dict[str, int],
+    ) -> str | None:
+        """The "type" field for the example rows: among categorical fields, the
+        one present in the MOST rows, then (tie) with the MOST distinct values —
+        the axis that best partitions EVERY row into notable kinds.
+
+        Coverage is the primary key so a sparse high-cardinality IDENTIFIER (a
+        hex ``id`` on a few rows, a per-row duration) cannot win over the true
+        type field: an event ``name`` / log level / status labels every row,
+        whereas an id/quantity does not (and already gets ``ranges``). On a
+        Chrome trace: ``name`` (covers all 140669 rows, 242 distinct) beats
+        ``tdur``/``id`` (sparser) and ``cat``/``ph`` (full-coverage but coarser).
+        Tie-broken by field name for determinism. Domain-agnostic — the choice
+        is by coverage + cardinality, never by field name. ``None`` when there is
+        no categorical field."""
+        if not categorical:
+            return None
+        return max(
+            sorted(categorical),
+            key=lambda field_name: (coverage.get(field_name, 0), len(categorical[field_name])),
+        )
+
+    def _build_examples(
+        self,
+        rows: list[dict[str, Any]],
+        categorical: dict[str, Counter[Any]],
+        coverage: dict[str, int],
+    ) -> dict[str, Any]:
+        """The ANOMALY answer: one concrete example row per top value of the
+        primary categorical field, so every notable event type (e.g. an
+        infrequent ``DroppedFrame``) is surfaced INLINE with its own fields
+        (incl. its ts).
+
+        Picks the "type" field, takes its top-_SUMMARY_TOP_VALUES values by count,
+        then a single O(n) scan captures the FIRST row for each wanted value
+        (stable; ties keep the earliest). ``_truncate_row`` runs only on the <=K
+        captured rows. Domain-agnostic — no hardcoded field or value names.
+        Returns ``{}`` when there is no categorical field (sample_rows still
+        conveys shape). Never mutates *rows*."""
+        field_name = self._primary_categorical_field(categorical, coverage)
+        if field_name is None:
+            return {}
+        wanted = {
+            value for value, _count in categorical[field_name].most_common(_SUMMARY_TOP_VALUES)
+        }
+        by_value: dict[str, Any] = {}
+        seen: set[Any] = set()
+        for row in rows:
+            value = row.get(field_name)
+            # Guard membership: a categorical field can still hold an unhashable
+            # value in some rows (str in most, list in a few) — ``value in set``
+            # would raise on it. Only scalars are counted, so only scalars are
+            # wanted example values.
+            if not self._is_hashable_scalar(value) or value in seen or value not in wanted:
+                continue
+            seen.add(value)
+            # First occurrence wins; ``_summary_key`` matches value_counts' keys
+            # (two values sharing a truncated prefix keep the earliest row).
+            by_value.setdefault(self._summary_key(value), self._truncate_row(row))
+            if len(seen) == len(wanted):
+                break
+        return {"field": field_name, "by_value": by_value}
+
+    @staticmethod
+    def _sample_indices(n: int) -> list[int]:
+        """Up to _SUMMARY_SAMPLE_ROWS evenly-spaced row indices (head/mid/tail)
+        for a shape sample. Deterministic and de-duplicated for small *n*."""
+        if n <= 0:
+            return []
+        count = min(_SUMMARY_SAMPLE_ROWS, n)
+        if count == 1:
+            return [0]
+        seen: list[int] = []
+        for step in range(count):
+            index = step * (n - 1) // (count - 1)
+            if index not in seen:
+                seen.append(index)
+        return seen
+
     def _build_offload_preview(self, content: str) -> tuple[list[Any] | str, int]:
-        """Identity preview of *content*: for a JSON array of objects, the
-        leading rows with long string fields truncated (paths/ids stay
-        verbatim); for a JSON object with one dominant inner array, a sample of
-        that array; otherwise the head/tail lines. Returns ``(rows | text,
-        n_items)``. Never reversible — recovery is the stored original."""
+        """Identity preview of *content*: for a JSON array of objects, and for a
+        JSON object with one dominant inner array, a signal-aware ``_ccr_summary``
+        (schema + per-field value histograms + numeric ranges + one example row
+        per notable value + an evenly-spaced sample) computed in two O(n) passes
+        — so aggregate and anomaly questions are answerable inline. The summary is
+        fail-open: on any error it falls back to the leading/sampled rows. A
+        non-array text falls back to head/tail lines. Returns ``(rows | text,
+        n_items)``. Never reversible — recovery is the byte-exact stored original."""
         import json
 
         try:
@@ -696,6 +947,12 @@ class ContentCompressionEngine:
         except (json.JSONDecodeError, ValueError):
             parsed = None
         if isinstance(parsed, list) and parsed and all(isinstance(item, dict) for item in parsed):
+            try:
+                return self._summarize_rows(parsed, key=None, other_keys=[])
+            except Exception:  # noqa: BLE001 - fail-open to the head/tail preview
+                _cr().logger.warning(
+                    "ccr_offload: row summary failed; head/tail preview", exc_info=True
+                )
             rows: list[Any] = [
                 self._truncate_row(item) for item in parsed[:_OFFLOAD_PREVIEW_MAX_ROWS]
             ]
@@ -706,6 +963,12 @@ class ContentCompressionEngine:
         dominant = self._dominant_array(parsed)
         if dominant is not None:
             key, inner, other_keys = dominant
+            try:
+                return self._summarize_rows(inner, key=key, other_keys=other_keys)
+            except Exception:  # noqa: BLE001 - fail-open to the head/tail preview
+                _cr().logger.warning(
+                    "ccr_offload: array summary failed; head/tail preview", exc_info=True
+                )
             head, tail = _OFFLOAD_PREVIEW_ARRAY_HEAD, _OFFLOAD_PREVIEW_ARRAY_TAIL
             if len(inner) <= head + tail:
                 sample = [self._truncate_row(item) for item in inner]

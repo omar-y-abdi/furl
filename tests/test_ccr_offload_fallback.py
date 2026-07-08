@@ -85,10 +85,12 @@ def test_offload_fires_and_original_is_byte_exact_recoverable():
 
     assert result.strategy_used == CompressionStrategy.CCR_OFFLOAD
     assert result.compression_ratio < 0.1
-    # One well-formed JSON array: preview rows with identity fields kept,
-    # sentinel (with both marker grammars) as the last row.
+    # One well-formed JSON array: a signal-aware `_ccr_summary` as the first
+    # row, sentinel (with both marker grammars) as the last row.
     rows = json.loads(result.compressed)
-    assert rows[0]["path"] == "src/module_0.py"
+    summary = rows[0]["_ccr_summary"]
+    assert summary["count"] == 3  # three file rows in the payload
+    assert "path" in summary["value_counts"]  # the `path` field is summarized
     assert set(rows[-1]) == {"_ccr_dropped"}
     assert "Retrieve more: hash=" in rows[-1]["_ccr_dropped"]
     # Byte-exact recovery, and the output pins against recompression.
@@ -120,26 +122,30 @@ def test_offload_fires_on_code_benchmark_snapshot_default_config():
 
 def test_offload_object_with_dominant_array_previews_inner_array():
     """A JSON OBJECT with a dominant inner array (Chrome-trace shape) must
-    preview a SAMPLE of that array — not the object's metadata header — while
-    staying byte-exact recoverable. Regression: the head/tail LINES fallback
-    shipped the metadata boilerplate and hid the events."""
+    summarize that array — not the object's metadata header — while staying
+    byte-exact recoverable. Regression: the head/tail LINES fallback shipped the
+    metadata boilerplate and hid the events."""
     content = _trace_payload()
     result = _offload_router().compress(content)
 
     assert result.strategy_used == CompressionStrategy.CCR_OFFLOAD
     rows = json.loads(result.compressed)
+    summary = rows[0]["_ccr_summary"]
 
-    # Leads with a summary naming the dominant array (its length) and the
-    # object's OTHER top-level keys — here "metadata".
-    assert rows[0]["_preview"] == "'traceEvents': 200 items"
-    assert rows[0]["_other_keys"] == ["metadata"]
+    # The summary names the dominant array and the object's OTHER top-level
+    # keys — here "metadata".
+    assert summary["array"] == "traceEvents"
+    assert summary["other_keys"] == ["metadata"]
+    assert summary["count"] == 200
 
-    # The sampled elements are the ACTUAL events (their fields survive), and
-    # the metadata header is NOT what the preview shows.
-    sampled = [r for r in rows if r.get("name", "").startswith("Event::")]
-    assert sampled, "preview must contain sampled traceEvents, not the header"
-    assert {"name", "cat", "ph", "ts"} <= set(sampled[0])
-    assert sampled[0]["name"] == "Event::0"
+    # The summary is built from the ACTUAL events, not the metadata header: the
+    # event fields appear (in schema/value_counts/examples) and the metadata
+    # boilerplate does not. (`name` here is all-unique per the synthetic
+    # payload, so `cat`/`ph` carry the categorical histogram.)
+    assert {"cat", "ph", "pid", "ts"} <= set(summary["schema"])
+    assert "cat" in summary["value_counts"]
+    example_rows = list(summary["examples"]["by_value"].values())
+    assert example_rows and {"name", "cat", "ph", "ts"} <= set(example_rows[0])
     assert "enhancedTraceVersion" not in result.compressed
 
     # Sentinel + both marker grammars intact; byte-exact recovery preserved.
