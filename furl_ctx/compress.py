@@ -68,6 +68,8 @@ from .pipeline import PipelineExtensionManager, PipelineStage, summarize_routing
 from .utils import extract_user_query as _extract_user_query
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from .hooks import CompressionHooks
 
 logger = logging.getLogger(__name__)
@@ -135,6 +137,23 @@ class CompressConfig:
     """Minimum token count for a message to be compressed.
     Messages shorter than this are left unchanged. Default 250.
     Set lower for voice agents where turns are short."""
+
+    redactor: Callable[[str], str] | None = None
+    """Opt-in content redactor (B3 SECURITY): a PURE function
+    ``raw content -> redacted content`` applied to every string message
+    ``content`` BEFORE compression. Default ``None`` disables it — behavior is
+    then byte-identical to today.
+
+    FAIL-CLOSED — this is the security invariant. Redaction runs OUTSIDE
+    ``compress()``'s fail-open boundary: if the redactor RAISES, the exception
+    propagates and ``compress()`` raises, so unredacted content is never
+    compressed, offloaded to the CCR store, returned, or swallowed by the
+    fail-open path. On a redactor error you get no output rather than a leak.
+
+    Because downstream compression/offload/store only ever see redacted
+    content, a later ``retrieve()`` returns the REDACTED original — the secret
+    is gone from the store BY DESIGN. Non-string content passes through
+    untouched; the caller's input list/dicts are never mutated."""
 
 
 @dataclass
@@ -408,6 +427,27 @@ def _event_ccr_hashes(
     return sorted(h for h in surfaced if is_valid_ccr_hash(h))
 
 
+def _redact_messages(
+    messages: list[dict[str, Any]], redactor: Callable[[str], str]
+) -> list[dict[str, Any]]:
+    """Return NEW messages with every string ``content`` passed through *redactor*.
+
+    FAIL-CLOSED helper for the B3 redaction step. Called BEFORE compress()'s
+    fail-open boundary, so a ``redactor`` that RAISES propagates out of
+    ``compress()`` and no unredacted content is ever compressed, stored, or
+    returned. Immutable: builds new message dicts; non-string content (and the
+    caller's original list/dicts) are left untouched.
+    """
+    redacted: list[dict[str, Any]] = []
+    for message in messages:
+        content = message.get("content")
+        if isinstance(content, str):
+            redacted.append({**message, "content": redactor(content)})
+        else:
+            redacted.append(message)
+    return redacted
+
+
 def compress(
     messages: list[dict[str, Any]],
     model: str = "claude-sonnet-4-5-20250929",
@@ -510,6 +550,18 @@ def compress(
         )
     if overrides:
         cfg = replace(cfg, **overrides)
+
+    # B3 SECURITY — fail-closed content redaction. This runs BEFORE and OUTSIDE
+    # the fail-open ``try/except BaseException`` boundary below ON PURPOSE: if a
+    # configured redactor RAISES, the exception must propagate (compress()
+    # raises) so unredacted content is NEVER compressed, offloaded to the CCR
+    # store, returned, or swallowed by the fail-open path. That is the security
+    # invariant: on redactor error, no output rather than a leak. When redaction
+    # succeeds, every downstream step (pipeline, offload, store) only ever sees
+    # redacted content — so a later retrieve() returns the REDACTED original.
+    # No redactor configured => this is a no-op and behavior is byte-identical.
+    if cfg.redactor is not None:
+        messages = _redact_messages(messages, cfg.redactor)
 
     # Per-tenant CCR isolation (B2). When a namespace is active
     # (``session_id`` / ``agent_id`` / ``FURL_CCR_NAMESPACE``) bind that

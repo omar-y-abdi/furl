@@ -93,6 +93,45 @@ Rules (they mirror the `furl_retrieve` MCP tool and share one validated spec):
 `resolve_markers(messages)` expands **every** resolvable marker in a message list
 back to its original inline (bulk recovery), leaving unresolvable markers in place.
 
+## Redact & purge — security
+
+Offloaded content is stored **byte-exact** for later `retrieve()`, so by default a
+secret inside a tool output is stored and stays recoverable. Two opt-in surfaces
+control that:
+
+**Redactor (fail-closed).** Pass a pure `redactor: str -> str` on `CompressConfig`
+to scrub content **before** it is compressed or stored. Redaction runs **outside**
+`compress()`'s fail-open boundary: if the redactor **raises**, `compress()` raises
+too — unredacted content is never compressed, stored, returned, or swallowed. On a
+redactor error you get **no output rather than a leak**. When it succeeds, every
+downstream step only sees redacted content, so a later `retrieve()` returns the
+**redacted** original (the secret is gone by design). No redactor configured →
+behavior is byte-identical to today. Non-string content passes through untouched;
+your input is never mutated.
+
+```python
+import re
+from furl_ctx import compress, CompressConfig
+
+def scrub(text: str) -> str:
+    return re.sub(r"sk-[A-Za-z0-9_-]{12,}", "[REDACTED]", text)
+
+result = compress(messages, config=CompressConfig(redactor=scrub))
+```
+
+**Purge.** `purge(hash) -> bool` deletes a stored original from the active CCR
+store so it can no longer be `retrieve()`d — the companion for content stored
+before a redaction policy existed, or that must be erased on request. It acts on
+the same namespace-scoped store as `retrieve` (honoring `FURL_CCR_NAMESPACE` /
+`session_id` / `agent_id`), returning `True` if an entry was removed and `False`
+if the hash was absent.
+
+```python
+from furl_ctx import purge
+
+purge(hash)  # True if an entry was deleted, False if already gone
+```
+
 ## How it works
 
 ```
@@ -159,6 +198,7 @@ same engine (pipelines, CI log reduction, offline eval, no LLM harness):
 psql -c 'table events' | furl compress        # FILE, or stdin, -> compressed stdout
 furl compress big.json --json                 # compressed text + token stats as JSON
 furl retrieve <hash>                          # original content for a <<ccr:HASH>> marker
+furl purge <hash>                             # delete a stored original by hash (0 if removed, 1 if absent)
 furl doctor                                   # check the install: native core, tokenizer, store
 ```
 
