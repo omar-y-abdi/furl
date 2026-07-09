@@ -55,7 +55,7 @@ from typing import Any
 
 from .compress import CompressConfig, CompressResult, compress
 from .compress_to import compress_to
-from .retrieve import resolve_markers, retrieve
+from .retrieve import purge, resolve_markers, retrieve
 
 # Keep a real callable bound for the one-function compression API so
 # `from furl_ctx import compress` is never shadowed by the submodule object.
@@ -98,6 +98,8 @@ __all__ = [
     "compress_with_cache",
     "retrieve",
     "resolve_markers",
+    # Purge surface (B3 SECURITY): delete a stored original by hash
+    "purge",
     # CCR durable-retention checkpointing (B2)
     "ccr_export",
     "ccr_import",

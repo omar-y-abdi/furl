@@ -1297,6 +1297,31 @@ class CompressionStore:
 
         return list(reversed(events_copy[-limit:]))
 
+    def delete(self, hash_key: str) -> bool:
+        """Delete the entry for *hash_key* from the store. Returns whether one went.
+
+        The purge surface (B3): removes a single stored original outright so its
+        content is no longer recoverable via ``retrieve``. Deletes from BOTH the
+        primary backend and the durable spill tier (Q10), so a purge leaves no
+        recoverable copy behind; the spill delete is fail-open (logged, never
+        raises) exactly like the other spill operations. Returns True when an
+        entry was removed from EITHER tier, False when the hash was absent from
+        both. Bumps the stale-heap counter on a primary hit so the eviction heap
+        cleans up the dangling ``(created_at, hash_key)`` tuple, matching every
+        other in-store delete path (expiry reaping, collision replace).
+        """
+        with self._lock:
+            primary_deleted = self._backend.delete(hash_key)
+            if primary_deleted:
+                self._stale_heap_entries += 1
+            spill_deleted = False
+            if self._spill is not None:
+                try:
+                    spill_deleted = self._spill.delete(hash_key)
+                except Exception as exc:  # noqa: BLE001 — fail-open, logged below
+                    logger.warning("CCR spill delete failed (non-fatal): %s", exc)
+            return primary_deleted or spill_deleted
+
     def clear(self) -> None:
         """Clear all entries. Mainly for testing."""
         with self._lock:

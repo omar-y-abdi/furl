@@ -6,6 +6,7 @@
     furl retrieve HASH --fields f1 f2  # project named keys out of a JSON array
     furl retrieve HASH --select-field NAME --select-equals VALUE [--limit N]
     furl retrieve HASH --select-field NAME --select-min 0 --select-max 99 [--limit N]
+    furl purge HASH        # delete the stored original for a CCR hash from the store
     furl eval CORPUS --recall  # corpus compression ratio + needle-recall gate
     furl doctor            # check the install: native core, tokenizer, CCR store
 
@@ -133,6 +134,19 @@ def _cmd_retrieve(args: argparse.Namespace) -> int:
         return 1
     sys.stdout.write(result)
     return 0
+
+
+def _cmd_purge(args: argparse.Namespace) -> int:
+    from furl_ctx import purge
+
+    if purge(args.hash):
+        sys.stdout.write(f"furl: purged {args.hash} from the CCR store\n")
+        return 0
+    sys.stderr.write(
+        f"furl: hash {args.hash} not found in the CCR store "
+        "(never stored, already purged, evicted, or expired)\n"
+    )
+    return 1
 
 
 def _corpus_files(path: str) -> list[str]:
@@ -352,6 +366,10 @@ def main(argv: list[str] | None = None) -> int:
         help="maximum number of rows to return from a row-select",
     )
     p_retrieve.set_defaults(func=_cmd_retrieve)
+
+    p_purge = sub.add_parser("purge", help="delete a stored original by CCR hash")
+    p_purge.add_argument("hash")
+    p_purge.set_defaults(func=_cmd_purge)
 
     p_eval = sub.add_parser("eval", help="compression ratio + needle recall over a corpus")
     p_eval.add_argument("corpus", help="a file or a directory of files to evaluate")

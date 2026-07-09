@@ -107,6 +107,28 @@ def retrieve(
     return outcome.content
 
 
+def purge(hash: str) -> bool:
+    """Delete the stored entry for *hash* from the active CCR store.
+
+    The purge surface (B3 SECURITY): permanently removes a single offloaded
+    original so it can no longer be recovered via :func:`retrieve` — the
+    companion to the fail-closed redactor for content that was already stored
+    before a redaction policy existed, or that must be erased on request.
+
+    Acts on the SAME store the retrieve path reads: ``get_compression_store()``,
+    which honors the active namespace (the request-scoped ``FURL_CCR_NAMESPACE``
+    / ``session_id`` / ``agent_id`` isolation), so a purge only ever touches the
+    caller's own tenant store — an entry another tenant stored is neither
+    visible nor deletable here.
+
+    Returns:
+        ``True`` if an entry was removed, ``False`` if the hash was absent
+        (never stored, already purged, or already evicted/expired out of the
+        store window). Total: never raises for a missing hash.
+    """
+    return get_compression_store().delete(hash)
+
+
 def resolve_markers(
     messages: list[dict[str, Any]], *, store: CompressionStore | None = None
 ) -> list[dict[str, Any]]:
