@@ -50,7 +50,6 @@ BASELINE_MD = HERE / "BASELINE.md"
 DATA_DIR = HERE / "data"
 
 # Default out-dir for normal (non-re-baselining) runs.
-# floor_check.py uses the same constant so the two ends stay in sync.
 # Must be outside benchmarks/ so default runs leave `git status benchmarks/` clean.
 DEFAULT_OUT_DIR: Path = Path(tempfile.gettempdir()) / "headroom_bench"
 
@@ -199,7 +198,7 @@ def build_results_payload(
 
     The top-level ``needle_recall`` numbers are the NAMING arm — the same
     best-case-by-construction semantics the committed floor was captured
-    with, and what ``floor_check.py`` gates on (== 100%). The honest
+    with (== 100%). The honest
     non-quoting-user numbers live SEPARATELY under ``needle_recall.control``
     (EFF-7): the control arm is expected to be lower on the lossy path and
     is deliberately NOT part of the 100% gate.

@@ -72,12 +72,8 @@ __all__ = [
     "SmartCrusherConfig",
     "CacheAlignerConfig",
     # Data models
-    "Block",
     "CachePrefixMetrics",
-    "DiffArtifact",
-    "TransformDiff",
     "TransformResult",
-    "WasteSignals",
     # Transforms
     "SmartCrusher",
     "CacheAligner",
@@ -88,8 +84,6 @@ __all__ = [
     "BM25Scorer",
     # Utilities
     "Tokenizer",
-    "count_tokens_text",
-    "count_tokens_messages",
     # One-function compression API
     "compress",
     "compress_to",
@@ -133,12 +127,8 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "SmartCrusherConfig": ("furl_ctx.transforms.smart_crusher", "SmartCrusherConfig"),
     "CacheAlignerConfig": ("furl_ctx.config", "CacheAlignerConfig"),
     # Data models
-    "Block": ("furl_ctx.config", "Block"),
     "CachePrefixMetrics": ("furl_ctx.config", "CachePrefixMetrics"),
-    "DiffArtifact": ("furl_ctx.config", "DiffArtifact"),
-    "TransformDiff": ("furl_ctx.config", "TransformDiff"),
     "TransformResult": ("furl_ctx.config", "TransformResult"),
-    "WasteSignals": ("furl_ctx.config", "WasteSignals"),
     # Transforms
     "SmartCrusher": ("furl_ctx.transforms", "SmartCrusher"),
     "CacheAligner": ("furl_ctx.transforms", "CacheAligner"),
@@ -149,8 +139,6 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "BM25Scorer": ("furl_ctx.relevance", "BM25Scorer"),
     # Utilities
     "Tokenizer": ("furl_ctx.tokenizer", "Tokenizer"),
-    "count_tokens_text": ("furl_ctx.tokenizer", "count_tokens_text"),
-    "count_tokens_messages": ("furl_ctx.tokenizer", "count_tokens_messages"),
     # One-function API
     "compress": ("furl_ctx.compress", "compress"),
     # Cross-turn / whole-history presets (thin compress() wrappers)
