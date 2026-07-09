@@ -131,6 +131,24 @@ _SUMMARY_CATEGORICAL_RATIO = 0.02
 _SUMMARY_TOP_VALUES = 20
 _SUMMARY_SAMPLE_ROWS = 6
 
+# Slice guidance carried inside the ``_ccr_summary`` preview: tells the agent how
+# to fetch a NARROW slice of the offloaded rows instead of the whole array back
+# (the ``furl_retrieve`` row-select filters). Domain-agnostic on purpose — it
+# names no field or value, pointing the agent at the fields it can already see in
+# this same summary (``schema``/``value_counts`` for a category, ``ranges`` for a
+# numeric window). The hash is NOT known here (it is minted later in
+# ``_ccr_offload``), so the hint references "the hash in the marker below" rather
+# than threading a value that does not yet exist.
+_CCR_SUMMARY_RETRIEVE_HINT = (
+    "To drill into these rows without pulling the whole array back, call "
+    "furl_retrieve with the hash in the marker below plus a row-select: "
+    "select_field=<a categorical field from 'schema'/'value_counts'>, "
+    "select_equals=<one of its values> for just those rows; OR "
+    "select_field=<a numeric field from 'ranges'>, select_min=…, select_max=… "
+    "for a range window; add fields=[…] to project only some columns. Omit all "
+    "of these to retrieve the full original."
+)
+
 # Byte ceiling above which a content block is offloaded immediately instead of
 # run through the exact mixed/crush path — that path is super-linear (a real
 # 33 MB Chrome trace took ~68 s), while CCR offload is O(n) and reversible.
@@ -806,6 +824,7 @@ class ContentCompressionEngine:
             "ranges": ranges,
             "examples": self._build_examples(rows, categorical, coverage),
             "sample_rows": [self._truncate_row(rows[i]) for i in self._sample_indices(n)],
+            "retrieve": _CCR_SUMMARY_RETRIEVE_HINT,
         }
         return [{"_ccr_summary": summary}], n
 
