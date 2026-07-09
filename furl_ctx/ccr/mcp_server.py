@@ -1455,8 +1455,7 @@ class FurlMCPServer:
             # the module global live so the cap stays patchable in tests.
             if st.st_size > _MAX_READ_BYTES:
                 return _err(
-                    f"File too large to read: {st.st_size} bytes "
-                    f"(limit {_MAX_READ_BYTES} bytes)"
+                    f"File too large to read: {st.st_size} bytes (limit {_MAX_READ_BYTES} bytes)"
                 )
 
             # Read from the pinned fd, bounded by the cap so an append after fstat
@@ -1478,8 +1477,7 @@ class FurlMCPServer:
 
         if len(raw) > _MAX_READ_BYTES:
             return _err(
-                f"File too large to read: >{_MAX_READ_BYTES} bytes "
-                f"(limit {_MAX_READ_BYTES} bytes)"
+                f"File too large to read: >{_MAX_READ_BYTES} bytes (limit {_MAX_READ_BYTES} bytes)"
             )
 
         # Decode the bytes read from the pinned fd. Avoid lossy decode kwargs
