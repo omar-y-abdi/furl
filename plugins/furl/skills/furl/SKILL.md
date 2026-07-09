@@ -17,7 +17,13 @@ every dropped byte **retrievable on demand**. It ships two things to this sessio
 - `furl_compress` — compress a string on demand. Returns compressed text plus a
   `hash`; the original is stored for later retrieval.
 - `furl_retrieve` — get original, uncompressed content back. Pass a `<<ccr:HASH>>`
-  marker's hash (or a free-text query to search stored entries).
+  marker's hash for the full original, or narrow it with a filter: `pattern` +
+  `context_lines` / `line_range` (regex or a line window over the text),
+  `fields` (project keys of a JSON array), or a **row-select** —
+  `select_field` + `select_equals` (a value) or `select_min`/`select_max` (a
+  numeric range), with optional `fields` and `limit` — to pull just the matching
+  ROWS of a large offloaded JSON array (or a dominant-array object like a Chrome
+  trace) instead of the whole thing. A free-text `query` searches stored entries.
 - `furl_stats` — session compression statistics (compressions, tokens saved, cost).
 
 ## When the hook fires
@@ -45,6 +51,16 @@ When you need the full content behind a marker, **call `furl_retrieve` with that
 hash** — it returns the byte-exact original (within the retention window). The hook
 and the `furl` MCP server share one durable SQLite store (`~/.furl/ccr.sqlite3`),
 so markers the hook creates are retrievable through `furl_retrieve`.
+
+When a marker offloaded a large JSON array (an `_ccr_summary` preview shows its
+schema, per-field value histograms, and numeric ranges), you usually want a
+**slice, not the whole array**. The summary carries a `retrieve` hint telling you
+which fields to filter on. Pass a row-select to `furl_retrieve`:
+`select_field=<a categorical field>, select_equals=<one of its values>` for just
+those rows, or `select_field=<a numeric field>, select_min=…, select_max=…` for a
+range window (add `fields=[…]` to project columns, `limit` to cap). The slice is
+tiny compared to the full original, so locality and anomaly questions are
+answerable without pulling megabytes back into context.
 
 ## Tuning (environment variables)
 

@@ -38,6 +38,61 @@ python3 -m furl_ctx.ccr.mcp_server      # exposes furl_compress / _retrieve / _s
 | Any Python app | `compress(messages, model=…)`                 |
 | MCP clients    | `python3 -m furl_ctx.ccr.mcp_server`          |
 
+## Retrieve — full or sliced
+
+`compress()` offloads large, low-redundancy content to the CCR store and leaves a
+`<<ccr:HASH>>` marker. `retrieve(hash)` turns a marker's hash back into content.
+With **no filter argument it is byte-identical to the full stored original** (or
+`None` if the hash has left the store window — a loud, explicit miss). Passing a
+filter narrows what comes back **without dumping the whole original**, so an agent
+can drill into a huge offloaded array cheaply:
+
+```python
+from furl_ctx import retrieve
+
+# Full original, byte-exact (unchanged behavior):
+original = retrieve(hash)
+
+# ROW-SELECT — keep only the rows of a JSON array of objects (or a JSON object
+# with one dominant inner array, e.g. a Chrome trace {"metadata":…, "traceEvents":[…]})
+# whose field matches a value:
+dropped = retrieve(hash, select_field="name", select_equals="DroppedFrame")
+
+# …or a numeric range window (inclusive; open-ended if a bound is omitted):
+window = retrieve(hash, select_field="ts", select_min=404733, select_max=404999)
+
+# Project only some columns of the selected rows, and cap the result:
+cols = retrieve(hash, select_field="name", select_equals="Paint",
+                fields=["name", "ts"], limit=200)
+
+# TEXT filters over the original as lines (regex + context, or a line window):
+lines = retrieve(hash, pattern=r"ERROR", context_lines=2)
+head  = retrieve(hash, line_range=[1, 50])
+
+# FIELDS projection over a top-level JSON array of objects:
+ids = retrieve(hash, fields=["id", "status"])
+```
+
+Rules (they mirror the `furl_retrieve` MCP tool and share one validated spec):
+
+- A **row-select** needs `select_field` plus **either** `select_equals` (equality)
+  **or** `select_min`/`select_max` (a numeric range) — never both. A row whose
+  field is missing or non-numeric is skipped from a range (never an error). It
+  composes with `fields` (project the selected rows) but not with
+  `pattern`/`line_range`. The result is always bounded by `limit` (default 1000);
+  when more rows match, a `{"_truncated": …}` marker row is appended so a
+  truncated slice is never mistaken for the full set.
+- `select`/`fields` need a JSON array (or a dominant-array object for select). On
+  any other shape they raise `ValueError` — never a silent empty result.
+- `pattern`/`line_range` operate on the original as text lines and return matching
+  lines prefixed with 1-based line numbers.
+- Bad usage (an incompatible filter mix, an invalid regex/range, a filter on the
+  wrong shape, or `query` together with a filter) raises `ValueError`. A store
+  miss returns `None` on every path.
+
+`resolve_markers(messages)` expands **every** resolvable marker in a message list
+back to its original inline (bulk recovery), leaving unresolvable markers in place.
+
 ## How it works
 
 ```
