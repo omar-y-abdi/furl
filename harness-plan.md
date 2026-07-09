@@ -285,3 +285,133 @@ byte-identical crush output). Residual: the crush is still slow for guard-disabl
 (~33 s @ 7.4 MB — other phases sum large), but production offloads >8 MB, so this only affects the
 4–8 MB path (lower the guard if that matters). **Lesson: delegated measurement > static scoping —
 the pinpoint found the culprit my guess (planning/compactor) missed.**
+
+## AGENT-UTILITY / SIGNAL-COMPLETENESS — user reframe (2026-07-08), now the top bar
+
+**Reframe (user):** furl runs as a post-tool-hook compressor. The real acceptance test is NOT
+token ratio and NOT any one signal (DroppedFrame was just an example) — it is: **can the agent
+ACT on the compressed output WITHOUT re-reading the source (grep/bash the raw file)?** If it must
+re-fetch, the tool is net-negative (added latency+cost, zero gain). "If thats the case, then this
+compression tool is useless."
+
+**Known gap:** huge content (>8 MB) hits the size-guard → CCR offload → agent sees only a hash +
+head/tail preview (user: "~30% of the info"). Crush IS signal-complete but too slow (~33 s @ 7.4 MB
+even post-fix). Current design forces a bad binary: fast+info-poor (offload) vs complete+slow (crush).
+
+**Direction (advisor-gated, 2026-07-08):**
+1. **Eval FIRST, fix SECOND.** Do NOT pre-commit an implementation (e.g. rare-value/outlier
+   salience). Build an agent-utility eval, baseline the CURRENT system on real corpora, let the
+   failing queries dictate the mechanism. (Same lesson as the Rust-perf pinpoint: measurement >
+   static scoping.) BLOCKING: no output-changing implementation until the eval justifies it.
+2. **Eval must be DISCRIMINATING** (else confirmation bias). String-presence ("is X in the output")
+   is a weak proxy = the ts-survival test the user told us to generalize past. Grade by a SUBAGENT
+   answering from ONLY the compressed blob vs ground truth from full source, across three query
+   archetypes that stress different failure modes:
+   - **anomaly** ("find the unusual events") — salience/rare-keep wins
+   - **locality** ("what happened around T / line N?") — needs NEIGHBORS, salience loses
+   - **aggregate** ("how many X / distribution of Y?") — needs counts/schema, not kept rows
+   Corpora: Chrome trace, app logs, source file, JSON API dump, stacktrace.
+3. **Check RETRIEVAL before building any salience engine.** Q4's `retrieve(hash, query=None)`: if
+   retrieval can already return a SLICE (predicate/range/query), the offload path isn't useless —
+   the cheap fix is "make the preview tell the agent what to query." If retrieve is all-or-nothing
+   (dumps 33 MB back → blows context), THAT is the real gap. The eval must distinguish these.
+   **RETRIEVAL CHECK RESULT (2026-07-08):** plain `retrieve(hash, query)` is **ALL-OR-NOTHING** —
+   `query` is metadata only (record_access/logging), returns the full stored `original_content`
+   byte-for-byte (retrieve.py:17-25, compression_store.py:575-661). So in the post-hook + library
+   path the agent gets the marker → `retrieve(hash)` → the whole 33 MB back → blows context =
+   **confirms the user's "useless" fear for huge content.** BUT slice capability EXISTS and is
+   under-surfaced: `RetrieveFilters` (regex `pattern`, `line_range`, `fields` projection on JSON
+   arrays) + BM25 `store.search()` return SUBSETS — but they materialize the full blob first
+   (context-cheap, not memory-cheap) and are wired ONLY into the MCP handler (mcp_server.py:868-870,
+   :912), not the plain `retrieve()`. The offload preview is **head-8 + tail-2 truncated rows, no
+   schema, no type-counts, no ranges, no anomalies** (router_engine.py:652-722, consts :103-112) —
+   "almost entirely uninformative" for a 140 k heterogeneous-event trace. → Fix space (quantify via
+   eval, don't pre-commit): (a) richer preview (schema + per-key/type counts + ranges +
+   representative anomalies) → answers AGGREGATE/ANOMALY inline; (b) surface the EXISTING slice
+   filters → answers LOCALITY/specific slices context-cheaply — mostly REUSE, cheaper than a Rust
+   salience engine. Caveat vs the 'MCP waits' north-star: slice filters currently need the MCP tool;
+   pure library/hook `retrieve()` is all-or-nothing.
+4. **Prototype any salience in PYTHON inside the eval harness**, prove across all 3 archetypes, port
+   to Rust ONCE if ever (Rust byte-identical contract + maturin rebuild loops = deep-context hazard).
+   Caveat: "rare value" is only meaningful on low-cardinality categorical fields; on all-unique
+   fields (ts, frameSeqId) everything is "rare" → needs per-field cardinality/type awareness.
+5. **Crush-perf is DISSOLVED by the reframe.** Signal-complete ≠ complete. We don't owe the agent all
+   140 k events fast — we owe it the signal + a navigable summary (schema + counts + ranges + kept
+   anomalies + representative sample). A single O(n) pass is cheaper than the full crusher AND more
+   useful. Stop optimizing crush latency for huge input.
+6. **Checkpoint before implementing.** Proceed autonomously on the EVAL (measurement can't be wrong).
+   Before ANY output-changing implementation, show the user REAL before/after output on their actual
+   trace (they've asked twice to see output, not plans). Note their earlier "crush huge = complete"
+   choice predates crush-perf proving crush can't be fast enough — premise changed, re-surface w/ data.
+
+**CI (2026-07-08):** required checks (build-wheel/lint/test 1-4) all green; `audit` + `commitlint` are
+NON-required. audit = crossbeam-epoch RUSTSEC-2026-0204 → dep bump 0.9.18→0.9.20 (delegated). commitlint
+= one 126-char header on 621509b7 → DISSOLVED by squash-merge (intermediate commit never lands on main);
+NO force-push (rewrites shared history + hook-blocked).
+
+**BASELINE RESULT (2026-07-08, `benchmarks/agent_utility_eval.py` @ commit 6dec22f6, clean release .so):**
+5-corpus run (chrome_trace_slice EXCLUDED — 4MB crush hangs >7min even release, below the 8MB guard =
+a SECOND perf pathology, documented). GT-present cols are a NOISY substring proxy (LLM grading pending);
+the objective evidence is the blob content.
+
+| corpus | bytes | transform | agent-sees | off? | anom | loc | agg |
+|--------|-------|-----------|-----------|------|------|-----|-----|
+| chrome_trace_full | 33.8M | ccr_offload | 1,670 ch | Y | NO | NO | NO |
+| app_log | 341K | mixed (offload) | 903 ch | Y | ~ | NO | ~ |
+| source_file | 37K | protected:recent_code | 36,880 ch | N | Y | Y | ~ |
+| json_api | 78K | smart_crusher (offload) | 4,843 ch | Y | ~ | NO | ~ |
+| stacktrace | 2K | protected:error_output | 1,980 ch | N | Y | Y | Y |
+
+**Findings:**
+- **Large content fails.** 33MB trace = TOTAL failure — the 1,670-char blob is 8 head rows of
+  `__metadata`/`thread_name` (ts=0, useless) + gap + 2 tail InputLatency rows. Zero DroppedFrames, no
+  schema, no counts. Head/tail sampling is BLIND to signal.
+- **Locality is unanswerable from ANY compressed blob** (NO on all 3 offloaded corpora) — sampling never
+  keeps "the neighbors of position T". (Advisor predicted this.)
+- **Small content is fine** — source_file (37K) + stacktrace (2K) PASS THROUGH untouched
+  (router:protected) → agent has everything. furl correctly leaves small/protected content alone.
+- So furl is signal-incomplete EXACTLY where compression matters → agent must re-grep → the user's
+  "useless" is real, and MEASURED.
+- **~~Second perf pathology~~ CORRECTED (2026-07-08):** the "4MB slice hangs >7min" was **CPU
+  starvation** from the concurrent `wqvokspr6` crush-perf workflow (ran 111 min at 99% CPU during the
+  harness runs). Verified once it finished: the slice compresses in **5.0s** (router:mixed, 4MB→2.8MB).
+  NOT a furl pathology — my claim was wrong (harsh-review self-correction). The crush path (<8MB) is
+  fine (~5s@4MB, ~22.9s@33MB guard-disabled per wqvokspr6). **THE sole target is the OFFLOAD path
+  (>8MB → 1,670ch boilerplate)** = `router_engine.py._build_offload_preview`. wqvokspr6 also found: no
+  super-linear crush term remains (621509b7 confirmed, cluster_index 98ms); the ~13s tokens_before
+  tokenization is the floor, ~2x reducible by moving to the Rust tiktoken path — parked (the
+  signal-aware summary sidesteps full-content tokenization anyway).
+
+**Fix (proposed, checkpoint pending):** replace the head/tail offload preview with a SIGNAL-AWARE O(n)
+summary — schema (keys+types) + per-key cardinality/top-values + numeric ranges + per-`name` histogram +
+K representative + K RARE rows — AND surface the EXISTING slice filters (`line_range`/`pattern`/`fields`,
+mcp_server.py:868) in the marker so the agent pulls locality/specific slices context-cheap. Prototype in
+Python first (prove across all 3 archetypes), port to the offload path once proven. Answers
+aggregate+anomaly inline + locality via a cheap slice, AND sidesteps the crush entirely (O(n) summary, no
+super-linear crush) → fixes the latency pathology too. Rare-value salience needs per-field
+cardinality/type awareness (all-unique fields like ts/frameSeqId → everything "rare") — handle in the
+Python prototype.
+
+**FIX SHIPPED + WIRED END-TO-END (2026-07-08/09) — the agent-utility epic is DONE.**
+- **#38** `feat(router): signal-aware CCR offload preview` — `_build_offload_preview` now emits `_ccr_summary`
+  (schema + per-field value histograms + numeric ranges + per-primary-categorical-value `examples` + sample),
+  fail-open to the old head/tail. The builder caught + fixed my picker spec (COVERAGE-first, not most-distinct →
+  picks `name` over sparse `tdur`/`id`, surfacing DroppedFrame with its ts). Trace: anomaly NO→YES, aggregate NO→YES.
+- **#41** `feat(ccr): sliceable retrieve` — new ROW-SELECT filter (`select_field` + `select_equals` | `select_min`/
+  `select_max`, `limit`) over a JSON array OR a dominant-array object; library `retrieve()` surfaces every filter
+  (byte-identical no-filter path); the offload summary carries a domain-agnostic `retrieve` slice-hint; +43 tests.
+- **#42** `feat(cli): furl retrieve slice flags` — `furl retrieve HASH --select-field/--select-equals/...` matches
+  the library (SUPPRESS-defaulted; no-flag byte-identical); +7 tests.
+- **Verified independently on the 33MB trace:** `retrieve(name==DroppedFrame)` = 310KB/1000 rows, `retrieve(ts∈window)`
+  = 21KB/66 events, full retrieve byte-exact. All 3 archetypes servable without re-grep or 33MB dump (anomaly+aggregate
+  inline; locality via a cheap slice). verify.run byte_exact / hash_failures=0 / silent_loss=0; 1708 tests; CI green on all 3.
+- **Deferred (task #8):** advertising `select_*` in the `furl_retrieve` MCP tool schema — the handler already parses it
+  (works if passed); parked at the "MCP waits" north-star, a 1-block add when the freeze lifts.
+
+## REMAINING — B3 core (redaction + purge; needs NO Q3) — IN PROGRESS
+- `CompressConfig.redactor: Callable[[str], str] | None` applied **FAIL-CLOSED before the store write** (outside
+  compress()'s fail-open boundary), so a redactor error never leaks unredacted content into the CCR store.
+- `purge(hash) -> bool` library + `furl purge <hash>` CLI — surface the store's `delete` (sqlite.py:295, memory, base).
+- Namespace **already done** (`FURL_CCR_NAMESPACE_ENV`, compression_store.py:1525-1544, from B2).
+- **Q3-deferred** (user decision): at-rest encryption dep (`FURL_CCR_ENCRYPT_KEY` — SQLCipher vs cryptography vs skip)
+  + `audit.jsonl` format (fields/rotation). **North-star-deferred:** `furl_purge` MCP tool (CLI + library only for now).
