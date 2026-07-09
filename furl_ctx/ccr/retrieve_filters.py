@@ -49,29 +49,19 @@ import re
 from dataclasses import dataclass
 from typing import Any, TypeGuard
 
+from furl_ctx.ccr.compress_modes import (
+    _MAX_PATTERN_CHARS,
+    _MAX_REGEX_LINE_CHARS,
+    _NESTED_QUANTIFIER_RE,
+)
+
 # Bound the regex context window so a caller cannot request an unboundedly
 # large context expansion. 0..50 is far past any real "show me around this
 # match" need while keeping the projected output bounded.
 _MAX_CONTEXT_LINES = 50
 
-# ── ReDoS guards (SEC-2) ────────────────────────────────────────────────────
-# ``pattern`` is caller-supplied and, in ``_filter_lines``, run line by line
-# over a retrieved original of arbitrary size (up to the store's per-entry
-# limit). A catastrophically-backtracking pattern (e.g. ``(a+)+$``) over a long
-# line can wedge the single-threaded MCP process. This is a single-principal
-# stdio server, so the proportionate, dependency-free defense (no ``regex``
-# module for a wall-clock timeout) mirrors ``compress_modes``:
-#
-# * ``_MAX_PATTERN_CHARS`` + the nested-quantifier heuristic reject pathological
-#   patterns at parse time (a ``FilterError``);
-# * ``_MAX_REGEX_LINE_CHARS`` bounds the input any single ``search`` sees, so a
-#   line longer than the cap is skipped from pattern selection (the conservative
-#   reading — it simply does not match) and backtracking stays finite.
-#
-# Both bounds sit far past realistic usage, so normal patterns over normal
-# content behave byte-identically.
-_MAX_REGEX_LINE_CHARS = 10_000
-_MAX_PATTERN_CHARS = 200
+# ReDoS guards (SEC-2): the bounds + nested-quantifier heuristic are shared with
+# ``compress_modes`` (SEC-1) — see the rationale there; validators stay separate.
 
 # Bound a row-select ("give me the matching rows") so a slice can never dump the
 # whole array back — the very failure sliceable retrieve exists to avoid. 1000
@@ -79,11 +69,6 @@ _MAX_PATTERN_CHARS = 200
 # JSON a few hundred KB at most; a caller wanting more raises ``limit``
 # explicitly. Applied only when a select is requested without its own limit.
 _DEFAULT_SELECT_LIMIT = 1000
-
-# Nested unbounded quantifier — the classic exponential-backtracking shape
-# (``(a+)+``, ``(a*)*``, ``(a+)*``, ``(.*)+``). Heuristic, not a proof; the
-# input cap above is the real backstop.
-_NESTED_QUANTIFIER_RE = re.compile(r"\([^)]*[+*][^)]*\)[+*]")
 
 
 @dataclass(frozen=True)
@@ -128,10 +113,6 @@ class RetrieveFilters:
             and self.fields is None
             and not self.has_select
         )
-
-    @property
-    def has_line_filter(self) -> bool:
-        return self.pattern is not None or self.line_start is not None or self.line_end is not None
 
     @property
     def has_select(self) -> bool:

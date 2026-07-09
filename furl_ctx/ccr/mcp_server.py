@@ -131,6 +131,16 @@ def _result_chars_for_log(result: list[Any]) -> int:
     return sum(len(getattr(item, "text", str(item))) for item in result)
 
 
+def _err(message: str) -> list[TextContent]:
+    """A model-visible parameter-error envelope (API-15): compact, no indent.
+
+    Parameter mistakes are the model's to fix, so they ship as success-shaped
+    JSON — distinct from internal failures, which are re-raised so the SDK
+    marks ``isError=True``.
+    """
+    return [TextContent(type="text", text=json.dumps({"error": message}))]
+
+
 def _workspace_root() -> Path:
     """Return the resolved root that furl_read file access is confined to.
 
@@ -463,6 +473,13 @@ class SessionStats:
     started_at: float = field(default_factory=time.time)
     events: list[dict[str, Any]] = field(default_factory=list)
 
+    def _log_event(self, event: dict[str, Any]) -> None:
+        self.events.append(event)
+        _append_shared_event(event)
+        # Keep last 50 events
+        if len(self.events) > 50:
+            self.events = self.events[-50:]
+
     def record_compression(
         self,
         input_tokens: int,
@@ -483,11 +500,7 @@ class SessionStats:
             "strategy": strategy,
             "timestamp": time.time(),
         }
-        self.events.append(event)
-        _append_shared_event(event)
-        # Keep last 50 events
-        if len(self.events) > 50:
-            self.events = self.events[-50:]
+        self._log_event(event)
 
     def record_retrieval(self, hash_key: str) -> None:
         self.retrievals += 1
@@ -496,10 +509,7 @@ class SessionStats:
             "hash": hash_key[:12],
             "timestamp": time.time(),
         }
-        self.events.append(event)
-        _append_shared_event(event)
-        if len(self.events) > 50:
-            self.events = self.events[-50:]
+        self._log_event(event)
 
     def record_cache_hit(self, tokens_avoided: int) -> None:
         """Record a furl_read cache hit WITHOUT touching compression totals.
@@ -516,10 +526,7 @@ class SessionStats:
             "tokens_avoided": avoided,
             "timestamp": time.time(),
         }
-        self.events.append(event)
-        _append_shared_event(event)
-        if len(self.events) > 50:
-            self.events = self.events[-50:]
+        self._log_event(event)
 
     def to_dict(self) -> dict[str, Any]:
         savings_pct = (
@@ -1141,12 +1148,7 @@ class FurlMCPServer:
                 elif name == READ_TOOL_NAME and _READ_ENABLED:
                     result = await self._handle_read(arguments)
                 else:
-                    result = [
-                        TextContent(
-                            type="text",
-                            text=json.dumps({"error": f"Unknown tool: {name}"}),
-                        )
-                    ]
+                    result = _err(f"Unknown tool: {name}")
                 # INFO: outcome envelope — tool, latency, and result SIZE. The
                 # result body can carry retrieved original content or whole file
                 # bodies, so it is never logged verbatim; a char count conveys
@@ -1186,54 +1188,31 @@ class FurlMCPServer:
         """Handle furl_compress tool call."""
         content = arguments.get("content")
         if not content:
-            return [
-                TextContent(
-                    type="text",
-                    text=json.dumps({"error": "content parameter is required"}),
-                )
-            ]
+            return _err("content parameter is required")
 
         # Non-string params take a parameter error, not the generic internal
         # path — mirrors the retrieve handler's hash guard (API-15).
         if not isinstance(content, str):
-            return [
-                TextContent(
-                    type="text",
-                    text=json.dumps(
-                        {
-                            "error": f"content parameter must be a string, got {type(content).__name__}"
-                        }
-                    ),
-                )
-            ]
+            return _err(f"content parameter must be a string, got {type(content).__name__}")
 
         # Reject oversized input before compressing it (OOM DoS guard). ``content``
         # is text, so the cap is measured in characters against the same byte-scale
         # ceiling used by furl_read — well above any realistic tool output.
         if len(content) > _MAX_READ_BYTES:
-            return [
-                TextContent(
-                    type="text",
-                    text=json.dumps(
-                        {
-                            "error": (
-                                f"Content too large to compress: {len(content)} chars "
-                                f"(limit {_MAX_READ_BYTES} chars)"
-                            )
-                        }
-                    ),
-                )
-            ]
+            return _err(
+                f"Content too large to compress: {len(content)} chars "
+                f"(limit {_MAX_READ_BYTES} chars)"
+            )
 
         # NR2-2 feature c: aggressiveness/filter mode. Both default to today's
         # behavior (mode=normal, no patterns), so a plain call is byte-identical.
         mode = CompressionMode.parse(arguments.get("mode"))
         if isinstance(mode, str):
-            return [TextContent(type="text", text=json.dumps({"error": mode}))]
+            return _err(mode)
 
         patterns = SectionPatterns.parse(arguments)
         if isinstance(patterns, str):
-            return [TextContent(type="text", text=json.dumps({"error": patterns}))]
+            return _err(patterns)
 
         # Run compression in thread pool (it's CPU-bound)
         loop = asyncio.get_running_loop()
@@ -1248,14 +1227,7 @@ class FurlMCPServer:
         # mistake, not an internal failure (API-15). Checked BEFORE the hash so
         # the no-hash cross-store-search route (feature a) sees a valid query.
         if query is not None and not isinstance(query, str):
-            return [
-                TextContent(
-                    type="text",
-                    text=json.dumps(
-                        {"error": f"query parameter must be a string, got {type(query).__name__}"}
-                    ),
-                )
-            ]
+            return _err(f"query parameter must be a string, got {type(query).__name__}")
 
         hash_key = arguments.get("hash")
         if not hash_key:
@@ -1276,25 +1248,13 @@ class FurlMCPServer:
             # No hash and no query: unchanged from before this feature — a bare
             # retrieve needs a target. Kept byte-identical (the cross-store
             # search route is discoverable via the tool schema, not this error).
-            return [
-                TextContent(
-                    type="text",
-                    text=json.dumps({"error": "hash parameter is required"}),
-                )
-            ]
+            return _err("hash parameter is required")
 
         # Same width+charset spoofing guard the tool-call parse path applies
         # (marker_grammar.is_valid_ccr_hash) — keep both ccr-hash ingress points
         # consistent. A malformed key is a loud 400 here, never reaches the store.
         if not is_valid_ccr_hash(hash_key):
-            return [
-                TextContent(
-                    type="text",
-                    text=json.dumps(
-                        {"error": "invalid hash format (expected 12 or 24 lowercase-hex chars)"}
-                    ),
-                )
-            ]
+            return _err("invalid hash format (expected 12 or 24 lowercase-hex chars)")
 
         # Store keys are always lowercase (SHA-256 hexdigest output; store()
         # lowercases explicit hashes) while the format guard above is
@@ -1311,22 +1271,13 @@ class FurlMCPServer:
         # crash downstream.
         filters = RetrieveFilters.parse(arguments)
         if isinstance(filters, FilterError):
-            return [TextContent(type="text", text=json.dumps({"error": filters.reason}))]
+            return _err(filters.reason)
         if query is not None and not filters.is_empty:
-            return [
-                TextContent(
-                    type="text",
-                    text=json.dumps(
-                        {
-                            "error": (
-                                "filters (pattern/fields/line_range) cannot be combined "
-                                "with query; use a query to search within the entry, or "
-                                "filters to project the full original"
-                            )
-                        }
-                    ),
-                )
-            ]
+            return _err(
+                "filters (pattern/fields/line_range) cannot be combined "
+                "with query; use a query to search within the entry, or "
+                "filters to project the full original"
+            )
 
         # INFO: the hash is a content-address (validated 12/24-hex above), safe
         # to log; the query is a user-supplied search string and the result can
@@ -1406,7 +1357,7 @@ class FurlMCPServer:
                 "total_compressions": self._stats.compressions + len(other_compressions),
                 "total_tokens_saved": all_saved,
                 "savings_percent": round(all_saved / all_input * 100, 1) if all_input > 0 else 0,
-                "estimated_cost_saved_usd": round(all_saved * 3.0 / 1_000_000, 4),
+                "estimated_cost_saved_usd": round(all_saved * _cost_rate_per_mtok() / 1_000_000, 4),
             }
 
         return [TextContent(type="text", text=json.dumps(stats, indent=2))]
@@ -1419,28 +1370,12 @@ class FurlMCPServer:
         fresh = arguments.get("fresh", False)
 
         if not file_path:
-            return [
-                TextContent(
-                    type="text",
-                    text=json.dumps({"error": "file_path parameter is required"}),
-                )
-            ]
+            return _err("file_path parameter is required")
 
         # Parameter error for a non-string path — mirrors the hash guard; the
         # jail below must only ever see real path strings (API-15).
         if not isinstance(file_path, str):
-            return [
-                TextContent(
-                    type="text",
-                    text=json.dumps(
-                        {
-                            "error": (
-                                f"file_path parameter must be a string, got {type(file_path).__name__}"
-                            )
-                        }
-                    ),
-                )
-            ]
+            return _err(f"file_path parameter must be a string, got {type(file_path).__name__}")
 
         path = Path(file_path).expanduser().resolve()
 
@@ -1457,12 +1392,7 @@ class FurlMCPServer:
                 path,
                 root,
             )
-            return [
-                TextContent(
-                    type="text",
-                    text=json.dumps({"error": "path outside workspace"}),
-                )
-            ]
+            return _err("path outside workspace")
 
         # Open ONCE and pin the file descriptor, then stat + read from that SAME
         # fd (TOCTOU defense): the old flow re-opened the path by name for the
@@ -1478,12 +1408,7 @@ class FurlMCPServer:
         except FileNotFoundError:
             # Missing path (or a final-component symlink removed between resolve
             # and open). Mirror the prior exists()-check message + path echo.
-            return [
-                TextContent(
-                    type="text",
-                    text=json.dumps({"error": f"File not found: {file_path}"}),
-                )
-            ]
+            return _err(f"File not found: {file_path}")
         except OSError as e:
             # Non-missing open failure: O_NOFOLLOW on a symlink raises ELOOP,
             # permission-denied raises EACCES, etc. Reserve "File not found" for a
@@ -1495,12 +1420,7 @@ class FurlMCPServer:
                 getattr(e, "errno", None),
                 root,
             )
-            return [
-                TextContent(
-                    type="text",
-                    text=json.dumps({"error": "Cannot read file"}),
-                )
-            ]
+            return _err("Cannot read file")
 
         # fstat the BARE fd first and run the type/link/size gates before any
         # read wrapper: os.fdopen(fd, "rb") raises IsADirectoryError on a
@@ -1514,12 +1434,7 @@ class FurlMCPServer:
             # os.open succeeds on a directory (S_ISREG is then False); the prior
             # is_file() guard surfaced that as "Not a file".
             if not stat.S_ISREG(st.st_mode):
-                return [
-                    TextContent(
-                        type="text",
-                        text=json.dumps({"error": f"Not a file: {file_path}"}),
-                    )
-                ]
+                return _err(f"Not a file: {file_path}")
 
             # Reject a multiply-linked inode: an in-jail hardlink can point at an
             # out-of-jail inode and resolve() cannot see through a hardlink
@@ -1533,30 +1448,15 @@ class FurlMCPServer:
                     st.st_nlink,
                     root,
                 )
-                return [
-                    TextContent(
-                        type="text",
-                        text=json.dumps({"error": "hardlinked file rejected"}),
-                    )
-                ]
+                return _err("hardlinked file rejected")
 
             # Reject oversized files via the fd's own size (OOM DoS guard) BEFORE
             # reading the body, so a file past the cap is never allocated. Read
             # the module global live so the cap stays patchable in tests.
             if st.st_size > _MAX_READ_BYTES:
-                return [
-                    TextContent(
-                        type="text",
-                        text=json.dumps(
-                            {
-                                "error": (
-                                    f"File too large to read: {st.st_size} bytes "
-                                    f"(limit {_MAX_READ_BYTES} bytes)"
-                                )
-                            }
-                        ),
-                    )
-                ]
+                return _err(
+                    f"File too large to read: {st.st_size} bytes (limit {_MAX_READ_BYTES} bytes)"
+                )
 
             # Read from the pinned fd, bounded by the cap so an append after fstat
             # cannot blow the budget on the same descriptor. os.fdopen adopts the
@@ -1570,30 +1470,15 @@ class FurlMCPServer:
                 getattr(e, "errno", None),
                 root,
             )
-            return [
-                TextContent(
-                    type="text",
-                    text=json.dumps({"error": "Cannot read file"}),
-                )
-            ]
+            return _err("Cannot read file")
         finally:
             if not adopted_for_read:
                 os.close(fd)
 
         if len(raw) > _MAX_READ_BYTES:
-            return [
-                TextContent(
-                    type="text",
-                    text=json.dumps(
-                        {
-                            "error": (
-                                f"File too large to read: >{_MAX_READ_BYTES} bytes "
-                                f"(limit {_MAX_READ_BYTES} bytes)"
-                            )
-                        }
-                    ),
-                )
-            ]
+            return _err(
+                f"File too large to read: >{_MAX_READ_BYTES} bytes (limit {_MAX_READ_BYTES} bytes)"
+            )
 
         # Decode the bytes read from the pinned fd. Avoid lossy decode kwargs
         # in furl_ctx/ccr/ — use the centralized safe-log decoder (this path
@@ -1683,19 +1568,6 @@ class FurlMCPServer:
                 self.server.create_initialization_options(),
             )
 
-    async def cleanup(self) -> None:
-        """Clean up resources (no-op; retained for lifecycle symmetry)."""
-        return None
-
-
-def create_ccr_mcp_server() -> FurlMCPServer:
-    """Create a Furl MCP server instance.
-
-    Returns:
-        FurlMCPServer instance.
-    """
-    return FurlMCPServer()
-
 
 async def main() -> None:
     """Run the Furl MCP server."""
@@ -1715,10 +1587,7 @@ async def main() -> None:
 
     server = FurlMCPServer()
 
-    try:
-        await server.run_stdio()
-    finally:
-        await server.cleanup()
+    await server.run_stdio()
 
 
 if __name__ == "__main__":

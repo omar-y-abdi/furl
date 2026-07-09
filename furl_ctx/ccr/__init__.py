@@ -18,16 +18,7 @@ parsing) had zero production callers post proxy-removal and was excised
 """
 
 from .marker_grammar import CCR_TOOL_NAME, is_valid_ccr_hash
-
-# MCP server is optional (requires mcp package)
-try:
-    from .mcp_server import FurlMCPServer, create_ccr_mcp_server
-
-    MCP_SERVER_AVAILABLE = True
-except ImportError:
-    FurlMCPServer = None  # type: ignore
-    create_ccr_mcp_server = None  # type: ignore
-    MCP_SERVER_AVAILABLE = False
+from .mcp_server import FurlMCPServer
 
 __all__ = [
     # Wire contract
@@ -35,6 +26,4 @@ __all__ = [
     "is_valid_ccr_hash",
     # MCP server
     "FurlMCPServer",
-    "create_ccr_mcp_server",
-    "MCP_SERVER_AVAILABLE",
 ]

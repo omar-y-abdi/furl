@@ -1272,31 +1272,6 @@ class CompressionStore:
                 "backend": backend_stats,
             }
 
-    def get_retrieval_events(
-        self,
-        limit: int = 100,
-        tool_name: str | None = None,
-    ) -> list[RetrievalEvent]:
-        """Get recent retrieval events for feedback analysis.
-
-        Args:
-            limit: Maximum number of events to return.
-            tool_name: Filter by tool name if specified.
-
-        Returns:
-            List of recent retrieval events (copies to prevent mutation).
-        """
-        with self._lock:
-            # Take a slice copy immediately to avoid race conditions
-            # if another thread modifies _retrieval_events after we release the lock
-            events_copy = list(self._retrieval_events)
-
-        # Filter and slice outside lock (safe since we have a copy)
-        if tool_name:
-            events_copy = [e for e in events_copy if e.tool_name == tool_name]
-
-        return list(reversed(events_copy[-limit:]))
-
     def delete(self, hash_key: str) -> bool:
         """Delete the entry for *hash_key* from the store. Returns whether one went.
 
