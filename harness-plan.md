@@ -413,5 +413,18 @@ Python prototype.
   compress()'s fail-open boundary), so a redactor error never leaks unredacted content into the CCR store.
 - `purge(hash) -> bool` library + `furl purge <hash>` CLI — surface the store's `delete` (sqlite.py:295, memory, base).
 - Namespace **already done** (`FURL_CCR_NAMESPACE_ENV`, compression_store.py:1525-1544, from B2).
-- **Q3-deferred** (user decision): at-rest encryption dep (`FURL_CCR_ENCRYPT_KEY` — SQLCipher vs cryptography vs skip)
-  + `audit.jsonl` format (fields/rotation). **North-star-deferred:** `furl_purge` MCP tool (CLI + library only for now).
+- **Q3 RESOLVED (user, 2026-07-09): SKIP both** — at-rest encryption + `audit.jsonl` are out of scope (YAGNI;
+  redactor + namespace + purge cover the threat, no new dep). **B3 COMPLETE (#43).**
+- **`FURL_HOOK_SENSITIVE_TOOLS` — SKIP (user, 2026-07-09, YAGNI):** memory-only compression for named sensitive
+  tools was in the original B3 spec but is redundant with the fail-closed redactor, which already redacts BEFORE
+  every store write. Deliberately not built (no new surface). Recorded explicitly so it is a decision, not a silent
+  drop; revisit only if a real per-tool memory-only requirement appears.
+- **North-star-deferred (not pending work):** `furl_purge` MCP tool + advertising `select_*` in the `furl_retrieve`
+  MCP schema (#8) — parked at the "MCP waits" freeze-line. PERF tokenization→Rust also parked (summary sidesteps it).
+
+## PLAN COMPLETE (2026-07-09)
+Every harness item shipped to main: **Q1–Q8, B1, B2, B3, B4, B5, PERF**, and the **agent-utility / signal-completeness
+epic** (#38 signal-aware summary, #41 sliceable retrieve, #42 CLI slice flags). The tool went from useless on a 33MB
+trace (1,670ch of metadata boilerplate) to a full **compress → signal-aware summarize → cheap slice-retrieve** loop
+(anomaly+aggregate inline, locality via a 21KB slice), plus a **fail-closed redactor + purge** security core. Byte-exact
+recovery intact throughout; CI green on all PRs. Only the MCP-surface items remain, deliberately parked at your north-star.
