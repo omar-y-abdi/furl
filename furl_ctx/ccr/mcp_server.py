@@ -7,6 +7,7 @@ Tools:
     furl_compress   — Compress content on demand
     furl_retrieve   — Retrieve original uncompressed content by hash
     furl_stats      — Session compression statistics
+    furl_purge      — Erase stored originals (one hash, or all)
 
 Usage:
     # As a standalone server (stdio transport, spawned by AI coding tools)
@@ -74,6 +75,7 @@ except ImportError:
 COMPRESS_TOOL_NAME = "furl_compress"
 STATS_TOOL_NAME = "furl_stats"
 READ_TOOL_NAME = "furl_read"
+PURGE_TOOL_NAME = "furl_purge"
 
 # Model this server compresses with — and therefore counts tokens with:
 # _handle_read's original_tokens must come from the same tokenizer
@@ -1171,6 +1173,36 @@ class FurlMCPServer:
                         "properties": {},
                     },
                 ),
+                Tool(
+                    name=PURGE_TOOL_NAME,
+                    description=(
+                        "Permanently erase stored originals from the CCR store — the "
+                        "data-erase escape hatch (offloaded content otherwise persists for "
+                        "the session TTL). Pass EXACTLY ONE of: 'hash' (delete one entry by "
+                        "its CCR hash) or 'all'=true (wipe every entry). Returns how many "
+                        "entries were deleted. A hash that is already absent deletes nothing "
+                        "and is not an error. There is no undo."
+                    ),
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "hash": {
+                                "type": "string",
+                                "description": (
+                                    "CCR hash of the single entry to erase (12 or 24 "
+                                    "lowercase-hex chars). Mutually exclusive with 'all'."
+                                ),
+                            },
+                            "all": {
+                                "type": "boolean",
+                                "description": (
+                                    "When true, erase EVERY stored entry. Mutually exclusive "
+                                    "with 'hash'."
+                                ),
+                            },
+                        },
+                    },
+                ),
             ]
 
             # Conditionally add furl_read (behind feature flag)
@@ -1229,6 +1261,8 @@ class FurlMCPServer:
                     result = await self._handle_retrieve(arguments)
                 elif name == STATS_TOOL_NAME:
                     result = await self._handle_stats()
+                elif name == PURGE_TOOL_NAME:
+                    result = await self._handle_purge(arguments)
                 elif name == READ_TOOL_NAME and _READ_ENABLED:
                     result = await self._handle_read(arguments)
                 else:
@@ -1452,6 +1486,101 @@ class FurlMCPServer:
             }
 
         return stats
+
+    async def _handle_purge(self, arguments: dict[str, Any]) -> list[TextContent]:
+        """Handle furl_purge — erase one entry (by hash) or the whole store.
+
+        The data-erase escape hatch: offloaded originals otherwise persist for
+        the session TTL. Requires EXACTLY ONE of ``hash`` / ``all`` — both or
+        neither is a loud parameter error (API-15), never a silent no-op or an
+        accidental wipe.
+        """
+        hash_arg = arguments.get("hash")
+        all_arg = arguments.get("all", False)
+
+        # ``all`` must be a real boolean — a truthy non-bool (e.g. "yes", 1) is a
+        # caller bug, not an implicit wipe.
+        if not isinstance(all_arg, bool):
+            return _err(f"all parameter must be a boolean, got {type(all_arg).__name__}")
+
+        has_hash = hash_arg is not None
+        if has_hash and all_arg:
+            return _err("provide exactly one of 'hash' or 'all', not both")
+        if not has_hash and not all_arg:
+            return _err(
+                "provide exactly one of 'hash' (erase one entry) or 'all'=true (wipe the store)"
+            )
+
+        if all_arg:
+            deleted = await asyncio.to_thread(self._purge_all)
+            plural = "y" if deleted == 1 else "ies"
+            return [
+                TextContent(
+                    type="text",
+                    text=json.dumps(
+                        {
+                            "purged": "all",
+                            "deleted_count": deleted,
+                            "note": f"Erased {deleted} stored entr{plural} from the CCR store.",
+                        },
+                        indent=2,
+                    ),
+                )
+            ]
+
+        # Single-hash path: same width/charset guard the retrieve ingress applies,
+        # so a malformed key is a loud 400 here and never reaches the store.
+        if not isinstance(hash_arg, str):
+            return _err(f"hash parameter must be a string, got {type(hash_arg).__name__}")
+        if not is_valid_ccr_hash(hash_arg):
+            return _err("invalid hash format (expected 12 or 24 lowercase-hex chars)")
+        hash_key = hash_arg.lower()
+
+        deleted_one = await asyncio.to_thread(self._purge_one, hash_key)
+        return [
+            TextContent(
+                type="text",
+                text=json.dumps(
+                    {
+                        "purged": "hash",
+                        "hash": hash_key,
+                        "found": deleted_one,
+                        "deleted_count": 1 if deleted_one else 0,
+                        "note": (
+                            f"Entry {hash_key} erased from the CCR store."
+                            if deleted_one
+                            else (
+                                f"No entry {hash_key} in the store (already erased, "
+                                "evicted, or never stored); nothing to delete."
+                            )
+                        ),
+                    },
+                    indent=2,
+                ),
+            )
+        ]
+
+    def _purge_one(self, hash_key: str) -> bool:
+        """Delete one entry via the library purge primitive (runs off the loop).
+
+        ``CompressionStore.delete`` is exactly what ``furl_ctx.retrieve.purge``
+        delegates to; calling it on THIS server's store handle — the same one
+        the retrieve path reads — guarantees a purged hash is no longer
+        retrievable. Returns True when an entry went, False when it was already
+        absent.
+        """
+        return bool(self._get_local_store().delete(hash_key))
+
+    def _purge_all(self) -> int:
+        """Wipe every entry; return how many live entries were removed (off-loop).
+
+        Reads the live ``entry_count`` before ``clear()`` so the reported count
+        reflects what was actually erasable (get_stats prunes expired rows first).
+        """
+        store = self._get_local_store()
+        count = int(store.get_stats().get("entry_count", 0))
+        store.clear()
+        return count
 
     async def _handle_read(self, arguments: dict[str, Any]) -> list[TextContent]:
         """Handle furl_read tool call — file read with session caching."""
