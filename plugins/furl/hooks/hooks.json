@@ -1,20 +1,16 @@
 {
-  "PostToolUse": [
-    {
-      "matcher": "Bash|WebFetch|WebSearch|Task",
-      "hooks": [
-        {
-          "type": "command",
-          "command": "sh -lc 'uv run --no-project --with \"furl-ctx[mcp]\" python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/compress_tool_output.py\" || true'",
-          "timeout": 30,
-          "env": {
-            "FURL_CCR_BACKEND": "sqlite",
-            "FURL_CCR_TTL_SECONDS": "86400"
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Bash|WebFetch|WebSearch|Task",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh -lc 'FURL_CCR_BACKEND=sqlite FURL_CCR_TTL_SECONDS=86400 uv run --no-project --with \"furl-ctx[mcp]\" python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/compress_tool_output.py\" || true'",
+            "timeout": 30
           }
-        }
-      ],
-      "description": "Furl: compress large tool outputs before they enter context (fail-open; disable with FURL_HOOK_ENABLED=0)",
-      "id": "furl:post:compress-tool-output"
-    }
-  ]
+        ]
+      }
+    ]
+  }
 }
