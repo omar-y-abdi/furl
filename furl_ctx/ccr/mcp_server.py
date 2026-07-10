@@ -7,6 +7,9 @@ Tools:
     furl_compress   — Compress content on demand
     furl_retrieve   — Retrieve original uncompressed content by hash
     furl_stats      — Session compression statistics
+    furl_purge      — Erase stored originals (one hash, or all)
+    furl_search     — Find stored originals by content substring
+    furl_list       — List stored entries (newest first)
 
 Usage:
     # As a standalone server (stdio transport, spawned by AI coding tools)
@@ -34,6 +37,7 @@ from pathlib import Path
 from typing import Any
 
 from furl_ctx import paths as _paths
+from furl_ctx._version import get_version
 from furl_ctx.ccr.compress_modes import (
     CompressionMode,
     SectionPatterns,
@@ -73,6 +77,9 @@ except ImportError:
 COMPRESS_TOOL_NAME = "furl_compress"
 STATS_TOOL_NAME = "furl_stats"
 READ_TOOL_NAME = "furl_read"
+PURGE_TOOL_NAME = "furl_purge"
+SEARCH_TOOL_NAME = "furl_search"
+LIST_TOOL_NAME = "furl_list"
 
 # Model this server compresses with — and therefore counts tokens with:
 # _handle_read's original_tokens must come from the same tokenizer
@@ -552,6 +559,94 @@ class SessionStats:
         }
 
 
+# ─── furl_search / furl_list: shared paging + preview helpers ───────────────
+#
+# Both discovery tools bound their output (invariant D): a positive-int limit
+# capped at ``_SEARCH_LIST_LIMIT_CAP``, previews trimmed to a fixed char budget,
+# and previews redacted with the SAME rules the cross-store search uses so a
+# match sitting next to a credential never surfaces it.
+_SEARCH_LIST_LIMIT_DEFAULT = 20
+_SEARCH_LIST_LIMIT_CAP = 100
+_MATCH_PREVIEW_RADIUS = 60  # chars of context each side of a furl_search match
+_MATCH_PREVIEW_MAX = 240  # hard char cap on a single furl_search preview
+_LIST_PREVIEW_CHARS = 120  # leading chars of a furl_list entry preview
+
+
+def _parse_bounded_limit(raw: Any, default: int, cap: int) -> tuple[int | None, str | None]:
+    """A search/list ``limit``: a positive int, silently capped at ``cap``.
+
+    Returns ``(value, None)`` or ``(None, error)``. ``bool`` is excluded (True is
+    not the int 1 here); a non-positive limit is a caller bug (a zero-row result
+    is meaningless), rejected rather than clamped. A value past the cap is clamped
+    DOWN to the cap (the documented ceiling) and the effective limit is echoed in
+    the response, so the truncation is never silent."""
+    if raw is None:
+        return default, None
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        return None, f"limit must be an integer, got {type(raw).__name__}"
+    if raw < 1:
+        return None, f"limit must be >= 1, got {raw}"
+    return min(raw, cap), None
+
+
+def _parse_offset(raw: Any) -> tuple[int | None, str | None]:
+    """A furl_list ``offset``: a non-negative int (``None``→0). ``bool`` excluded."""
+    if raw is None:
+        return 0, None
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        return None, f"offset must be an integer, got {type(raw).__name__}"
+    if raw < 0:
+        return None, f"offset must be >= 0, got {raw}"
+    return raw, None
+
+
+def _redact_preview_text(text: str) -> str:
+    """Redact a preview snippet with the store's credential rules.
+
+    Reuses ``_redact_retrieval_log_payload`` — the same primitive the cross-store
+    search preview uses — so furl_search / furl_list never surface a secret a
+    per-hash retrieval's log path would have masked. Imported lazily to keep the
+    compression_store module off the mcp_server import path until first use."""
+    from furl_ctx.cache.compression_store import _redact_retrieval_log_payload
+
+    return _redact_retrieval_log_payload(text)
+
+
+def _bounded(text: str, limit: int) -> str:
+    """Trim ``text`` to ``limit`` chars, marking truncation with an ellipsis."""
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "…"
+
+
+def _match_preview(original: str, needle_lower: str) -> str:
+    """A short REDACTED window of ``original`` around its first case-insensitive
+    match of ``needle_lower``.
+
+    Redacts the full original FIRST, then windows on the redacted text: a
+    credential is masked before it can appear in the snippet, and a window edge
+    can never sever a secret's head into the clear. If the match fell inside a
+    redacted secret it is absent from the redacted text — fall back to a redacted
+    head. Bounded to ``_MATCH_PREVIEW_MAX`` chars."""
+    redacted = _redact_preview_text(original)
+    ridx = redacted.lower().find(needle_lower)
+    if ridx < 0:
+        return _bounded(redacted, _MATCH_PREVIEW_MAX)
+    start = max(0, ridx - _MATCH_PREVIEW_RADIUS)
+    end = min(len(redacted), ridx + len(needle_lower) + _MATCH_PREVIEW_RADIUS)
+    prefix = "…" if start > 0 else ""
+    suffix = "…" if end < len(redacted) else ""
+    return _bounded(f"{prefix}{redacted[start:end]}{suffix}", _MATCH_PREVIEW_MAX)
+
+
+def _list_preview(original: str) -> str:
+    """A redacted leading-``_LIST_PREVIEW_CHARS`` preview of a stored original.
+
+    Redact FIRST, then take the head (matching the cross-store preview) so a
+    truncated head cannot leave a credential's recognizable prefix in the clear."""
+    return _bounded(_redact_preview_text(original), _LIST_PREVIEW_CHARS)
+
+
 class FurlMCPServer:
     """MCP Server exposing Furl's context engineering toolkit.
 
@@ -559,8 +654,14 @@ class FurlMCPServer:
         furl_compress — Compress content on demand. Stores original for
                            retrieval.
         furl_retrieve — Retrieve original uncompressed content by hash
-                           from the local CCR store.
+                           from the local CCR store (with optional query /
+                           pattern / line-range / fields / select_* filters).
         furl_stats    — Session statistics: compressions, savings, cost.
+        furl_purge    — Erase stored originals: one hash, or all.
+        furl_search   — Find stored originals by a content substring.
+        furl_list     — List stored entries, newest first.
+        furl_read     — File read with session caching (flag-gated:
+                           FURL_MCP_READ).
 
     Compression and retrieval happen locally in-process via the shared CCR
     compression store.
@@ -579,8 +680,15 @@ class FurlMCPServer:
         # Server-level instructions carry the CSV decode legend once per
         # conversation (FURL_MCP_LEGEND, default ON). ``None`` when gated
         # off — the SDK then omits the field from the initialize response.
+        # ``version=`` is load-bearing: the SDK's create_initialization_options
+        # falls back to ``importlib.metadata.version("mcp")`` when the Server has
+        # no version, so serverInfo would otherwise advertise the MCP SDK's own
+        # version as if it were Furl's. Report the furl-ctx distribution version
+        # instead (``get_version`` is total — "unknown" when the package is not
+        # installed, never raises).
         self.server: Server = Server(
             "furl",
+            version=get_version(),
             instructions=CSV_DECODE_LEGEND if _legend_enabled() else None,
         )
         self._setup_handlers()
@@ -788,6 +896,13 @@ class FurlMCPServer:
         have masked. Pure read — no retrieval is booked (the caller retrieves
         by hash next), so no ``record_retrieval`` here.
         """
+        # PERF-16: search_all is synchronous BM25 scoring over SQLite-backed
+        # rows; run it in a worker thread so the event loop is never blocked
+        # (the documented sqlite-backend invariant — backends/sqlite.py).
+        return await asyncio.to_thread(self._search_all_content_sync, query)
+
+    def _search_all_content_sync(self, query: str) -> dict[str, Any]:
+        """Blocking body of :meth:`_search_all_content` (runs off the loop)."""
         store = self._get_local_store()
         matches = store.search_all(query)
         return {
@@ -835,6 +950,19 @@ class FurlMCPServer:
         are mutually exclusive with ``query`` at the handler boundary, so a
         non-empty ``filters`` is only ever passed on the no-query path.
         """
+        # PERF-16: every store op below (search / exists / retrieve /
+        # get_entry_status) and the retrieval-stat file append are synchronous
+        # SQLite/file I/O; run the whole body in a worker thread so the event
+        # loop stays free (the documented sqlite-backend invariant).
+        return await asyncio.to_thread(self._retrieve_content_sync, hash_key, query, filters)
+
+    def _retrieve_content_sync(
+        self,
+        hash_key: str,
+        query: str | None,
+        filters: RetrieveFilters | None = None,
+    ) -> dict[str, Any]:
+        """Blocking body of :meth:`_retrieve_content` (runs off the loop)."""
         store = self._get_local_store()
         if query:
             results = store.search(hash_key, query)
@@ -1008,9 +1136,10 @@ class FurlMCPServer:
                         "markers like [N items compressed... hash=abc123].\n"
                         "Two extra modes: (1) OMIT hash and pass query to search across "
                         "ALL stored entries (returns ranked hash/score/preview matches to "
-                        "retrieve individually); (2) pass hash with pattern/fields/line_range "
-                        "to project just part of the original. Filters cannot be combined "
-                        "with query."
+                        "retrieve individually); (2) pass hash with pattern/fields/line_range, "
+                        "or a select_field row-filter (keep the rows of a JSON array by exact "
+                        "value or numeric range), to project just part of the original. "
+                        "Filters cannot be combined with query."
                     ),
                     inputSchema={
                         "type": "object",
@@ -1069,7 +1198,62 @@ class FurlMCPServer:
                                     "For a JSON-array original: project only these keys out "
                                     "of each object element (requires a hash, no query). "
                                     "Errors if the original is not a JSON array. Cannot be "
-                                    "combined with pattern/line_range."
+                                    "combined with pattern/line_range; composes with "
+                                    "select_field (projects the columns of the kept rows)."
+                                ),
+                            },
+                            "select_field": {
+                                "type": "string",
+                                "description": (
+                                    "Row-select over a JSON array of objects (requires a "
+                                    "hash, no query): the field/column name to match on. It "
+                                    "anchors the whole select family — select_equals / "
+                                    "select_min / select_max / limit are honored ONLY "
+                                    "alongside select_field (any of them without it is an "
+                                    "error). Reads a top-level JSON array of objects OR a "
+                                    "JSON object with exactly one dominant inner array (e.g. "
+                                    "a '{metadata, traceEvents:[...]}' trace). Composes with "
+                                    "'fields'; cannot be combined with pattern/line_range or "
+                                    "query."
+                                ),
+                            },
+                            "select_equals": {
+                                "type": ["string", "number", "boolean", "null"],
+                                "description": (
+                                    "Equality mode: keep rows whose select_field equals this "
+                                    "JSON scalar (string/number/boolean/null; a list or "
+                                    "object is rejected). Bool-safe — true never matches the "
+                                    "number 1. Mutually exclusive with select_min/select_max."
+                                ),
+                            },
+                            "select_min": {
+                                "type": "number",
+                                "description": (
+                                    "Numeric-range mode: keep rows whose select_field is a "
+                                    "number >= select_min (inclusive; open lower bound when "
+                                    "omitted). A row whose field is missing or non-numeric is "
+                                    "skipped, never an error. Mutually exclusive with "
+                                    "select_equals."
+                                ),
+                            },
+                            "select_max": {
+                                "type": "number",
+                                "description": (
+                                    "Numeric-range mode: keep rows whose select_field is a "
+                                    "number <= select_max (inclusive; open upper bound when "
+                                    "omitted). Must be >= select_min. Mutually exclusive with "
+                                    "select_equals."
+                                ),
+                            },
+                            "limit": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "description": (
+                                    "Max rows a select_field row-select returns (positive "
+                                    "integer; defaults to 1000 when a select is requested "
+                                    "without it). When more rows match, only the first "
+                                    "'limit' ship plus one explicit truncation-marker row. "
+                                    "Applies only to select_field row-selects."
                                 ),
                             },
                         },
@@ -1085,6 +1269,101 @@ class FurlMCPServer:
                     inputSchema={
                         "type": "object",
                         "properties": {},
+                    },
+                ),
+                Tool(
+                    name=PURGE_TOOL_NAME,
+                    description=(
+                        "Permanently erase stored originals from the CCR store — the "
+                        "data-erase escape hatch (offloaded content otherwise persists for "
+                        "the session TTL). Pass EXACTLY ONE of: 'hash' (delete one entry by "
+                        "its CCR hash) or 'all'=true (wipe every entry). Returns how many "
+                        "entries were deleted. A hash that is already absent deletes nothing "
+                        "and is not an error. There is no undo."
+                    ),
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "hash": {
+                                "type": "string",
+                                "description": (
+                                    "CCR hash of the single entry to erase (12 or 24 "
+                                    "lowercase-hex chars). Mutually exclusive with 'all'."
+                                ),
+                            },
+                            "all": {
+                                "type": "boolean",
+                                "description": (
+                                    "When true, erase EVERY stored entry. Mutually exclusive "
+                                    "with 'hash'."
+                                ),
+                            },
+                        },
+                    },
+                ),
+                Tool(
+                    name=SEARCH_TOOL_NAME,
+                    description=(
+                        "Find stored originals by a case-insensitive SUBSTRING of their "
+                        "content — for when you lost a <<ccr:HASH>> marker but remember some "
+                        "of the text. Returns per hit: hash, a short preview around the "
+                        "match, created-at, and size (characters), newest first. Substring "
+                        "only (NOT a regex). Then call furl_retrieve with a returned hash "
+                        "for the full original."
+                    ),
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "type": "string",
+                                "description": (
+                                    "Non-empty substring to look for (case-insensitive). "
+                                    "Matched literally — not a regex."
+                                ),
+                            },
+                            "limit": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "maximum": _SEARCH_LIST_LIMIT_CAP,
+                                "description": (
+                                    f"Max hits to return (default {_SEARCH_LIST_LIMIT_DEFAULT}, "
+                                    f"capped at {_SEARCH_LIST_LIMIT_CAP})."
+                                ),
+                            },
+                        },
+                        "required": ["query"],
+                    },
+                ),
+                Tool(
+                    name=LIST_TOOL_NAME,
+                    description=(
+                        "List stored CCR entries, newest first — a directory of what "
+                        "furl_compress / furl_read have stashed this session. Returns per "
+                        "entry: hash, created-at, size (characters), content-kind (the "
+                        "originating tool, when known), and a short preview. Page with "
+                        "limit/offset. Use furl_retrieve with a hash for the full original, "
+                        "or furl_search to find by content."
+                    ),
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "limit": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "maximum": _SEARCH_LIST_LIMIT_CAP,
+                                "description": (
+                                    f"Max entries to return (default {_SEARCH_LIST_LIMIT_DEFAULT}, "
+                                    f"capped at {_SEARCH_LIST_LIMIT_CAP})."
+                                ),
+                            },
+                            "offset": {
+                                "type": "integer",
+                                "minimum": 0,
+                                "description": (
+                                    "Number of newest entries to skip, for paging (default 0)."
+                                ),
+                            },
+                        },
                     },
                 ),
             ]
@@ -1145,6 +1424,12 @@ class FurlMCPServer:
                     result = await self._handle_retrieve(arguments)
                 elif name == STATS_TOOL_NAME:
                     result = await self._handle_stats()
+                elif name == PURGE_TOOL_NAME:
+                    result = await self._handle_purge(arguments)
+                elif name == SEARCH_TOOL_NAME:
+                    result = await self._handle_search(arguments)
+                elif name == LIST_TOOL_NAME:
+                    result = await self._handle_list(arguments)
                 elif name == READ_TOOL_NAME and _READ_ENABLED:
                     result = await self._handle_read(arguments)
                 else:
@@ -1235,6 +1520,23 @@ class FurlMCPServer:
             # stored entries. No hash AND no query stays the original loud
             # parameter error (a bare retrieve needs a target).
             if query:
+                # Schema honesty (symmetry with the with-hash path): filters
+                # project a SINGLE stored entry, so they require a hash. The
+                # with-hash path rejects query+filters loudly; silently ignoring
+                # the same keys here let {query, select_field} run a plain
+                # cross-store search as if the filter had been applied. Parse
+                # with the same smart constructor so a malformed filter gets its
+                # own structured error and a valid one gets the missing-hash one.
+                filters = RetrieveFilters.parse(arguments)
+                if isinstance(filters, FilterError):
+                    return _err(filters.reason)
+                if not filters.is_empty:
+                    return _err(
+                        "filters (pattern/fields/line_range/select_*) require a "
+                        "hash: they project a single stored entry. Pass the "
+                        "entry's hash to filter it, or drop the filters to "
+                        "search across all entries."
+                    )
                 logger.info("event=mcp_search_all_started")
                 logger.debug("event=mcp_search_all_started_detail query_len=%d", len(query))
                 result = await self._search_all_content(query)
@@ -1324,6 +1626,13 @@ class FurlMCPServer:
 
     async def _handle_stats(self) -> list[TextContent]:
         """Handle furl_stats tool call."""
+        # PERF-16: store.get_stats() and _read_shared_events() (an flock'd file
+        # read) are synchronous I/O — build the aggregate off the event loop.
+        stats = await asyncio.to_thread(self._compute_stats)
+        return [TextContent(type="text", text=json.dumps(stats, indent=2))]
+
+    def _compute_stats(self) -> dict[str, Any]:
+        """Blocking stats aggregation (store + shared-file reads), off the loop."""
         stats = self._stats.to_dict()
 
         # Add local store stats if available
@@ -1360,12 +1669,230 @@ class FurlMCPServer:
                 "estimated_cost_saved_usd": round(all_saved * _cost_rate_per_mtok() / 1_000_000, 4),
             }
 
-        return [TextContent(type="text", text=json.dumps(stats, indent=2))]
+        return stats
+
+    async def _handle_purge(self, arguments: dict[str, Any]) -> list[TextContent]:
+        """Handle furl_purge — erase one entry (by hash) or the whole store.
+
+        The data-erase escape hatch: offloaded originals otherwise persist for
+        the session TTL. Requires EXACTLY ONE of ``hash`` / ``all`` — both or
+        neither is a loud parameter error (API-15), never a silent no-op or an
+        accidental wipe.
+        """
+        hash_arg = arguments.get("hash")
+        all_arg = arguments.get("all", False)
+
+        # ``all`` must be a real boolean — a truthy non-bool (e.g. "yes", 1) is a
+        # caller bug, not an implicit wipe.
+        if not isinstance(all_arg, bool):
+            return _err(f"all parameter must be a boolean, got {type(all_arg).__name__}")
+
+        has_hash = hash_arg is not None
+        if has_hash and all_arg:
+            return _err("provide exactly one of 'hash' or 'all', not both")
+        if not has_hash and not all_arg:
+            return _err(
+                "provide exactly one of 'hash' (erase one entry) or 'all'=true (wipe the store)"
+            )
+
+        if all_arg:
+            deleted = await asyncio.to_thread(self._purge_all)
+            plural = "y" if deleted == 1 else "ies"
+            return [
+                TextContent(
+                    type="text",
+                    text=json.dumps(
+                        {
+                            "purged": "all",
+                            "deleted_count": deleted,
+                            "note": f"Erased {deleted} stored entr{plural} from the CCR store.",
+                        },
+                        indent=2,
+                    ),
+                )
+            ]
+
+        # Single-hash path: same width/charset guard the retrieve ingress applies,
+        # so a malformed key is a loud 400 here and never reaches the store.
+        if not isinstance(hash_arg, str):
+            return _err(f"hash parameter must be a string, got {type(hash_arg).__name__}")
+        if not is_valid_ccr_hash(hash_arg):
+            return _err("invalid hash format (expected 12 or 24 lowercase-hex chars)")
+        hash_key = hash_arg.lower()
+
+        deleted_one = await asyncio.to_thread(self._purge_one, hash_key)
+        return [
+            TextContent(
+                type="text",
+                text=json.dumps(
+                    {
+                        "purged": "hash",
+                        "hash": hash_key,
+                        "found": deleted_one,
+                        "deleted_count": 1 if deleted_one else 0,
+                        "note": (
+                            f"Entry {hash_key} erased from the CCR store."
+                            if deleted_one
+                            else (
+                                f"No entry {hash_key} in the store (already erased, "
+                                "evicted, or never stored); nothing to delete."
+                            )
+                        ),
+                    },
+                    indent=2,
+                ),
+            )
+        ]
+
+    def _purge_one(self, hash_key: str) -> bool:
+        """Delete one entry via the library purge primitive (runs off the loop).
+
+        ``CompressionStore.delete`` is exactly what ``furl_ctx.retrieve.purge``
+        delegates to; calling it on THIS server's store handle — the same one
+        the retrieve path reads — guarantees a purged hash is no longer
+        retrievable. Returns True when an entry went, False when it was already
+        absent.
+        """
+        return bool(self._get_local_store().delete(hash_key))
+
+    def _purge_all(self) -> int:
+        """Wipe every entry; return how many live entries were removed (off-loop).
+
+        Reads the live ``entry_count`` before ``clear()`` so the reported count
+        reflects what was actually erasable (get_stats prunes expired rows first).
+        """
+        store = self._get_local_store()
+        count = int(store.get_stats().get("entry_count", 0))
+        store.clear()
+        return count
+
+    async def _handle_search(self, arguments: dict[str, Any]) -> list[TextContent]:
+        """Handle furl_search — case-insensitive SUBSTRING search over originals.
+
+        For when a ``<<ccr:HASH>>`` marker was lost: find stored originals by a
+        substring of their content and get the hash back. Substring only (no
+        regex — no injection/ReDoS surface). Output is bounded: at most ``limit``
+        (<= 100) hits, each with a short redacted preview around the match.
+        """
+        query = arguments.get("query")
+        if query is None:
+            return _err("query parameter is required")
+        if not isinstance(query, str):
+            return _err(f"query parameter must be a string, got {type(query).__name__}")
+        if not query.strip():
+            return _err("query parameter must be a non-empty string")
+
+        limit, err = _parse_bounded_limit(
+            arguments.get("limit"), _SEARCH_LIST_LIMIT_DEFAULT, _SEARCH_LIST_LIMIT_CAP
+        )
+        if err is not None:
+            return _err(err)
+        assert limit is not None  # err is None ⇒ limit resolved
+
+        result = await asyncio.to_thread(self._search_substring, query, limit)
+        return [TextContent(type="text", text=json.dumps(result, indent=2))]
+
+    def _search_substring(self, query: str, limit: int) -> dict[str, Any]:
+        """Blocking substring scan over live originals (runs off the loop)."""
+        needle = query.lower()
+        matches: list[dict[str, Any]] = []
+        for hash_key, entry in self._live_entries():
+            original = entry.original_content
+            if needle not in original.lower():
+                continue
+            matches.append(
+                {
+                    "hash": hash_key,
+                    "preview": _match_preview(original, needle),
+                    "created_at": entry.created_at,
+                    "size": len(original),
+                }
+            )
+            if len(matches) >= limit:
+                break
+        return {
+            "query": query,
+            "count": len(matches),
+            "limit": limit,
+            "matches": matches,
+            "note": (
+                "Substring matches over stored originals (newest first). Call "
+                "furl_retrieve with a hash for the full original content."
+                if matches
+                else "No stored original contains that substring (case-insensitive)."
+            ),
+        }
+
+    async def _handle_list(self, arguments: dict[str, Any]) -> list[TextContent]:
+        """Handle furl_list — newest-first directory of stored CCR entries."""
+        limit, err = _parse_bounded_limit(
+            arguments.get("limit"), _SEARCH_LIST_LIMIT_DEFAULT, _SEARCH_LIST_LIMIT_CAP
+        )
+        if err is not None:
+            return _err(err)
+        offset, off_err = _parse_offset(arguments.get("offset"))
+        if off_err is not None:
+            return _err(off_err)
+        assert limit is not None and offset is not None
+
+        result = await asyncio.to_thread(self._list_entries, limit, offset)
+        return [TextContent(type="text", text=json.dumps(result, indent=2))]
+
+    def _list_entries(self, limit: int, offset: int) -> dict[str, Any]:
+        """Blocking newest-first entry listing (runs off the loop)."""
+        live = self._live_entries()
+        total = len(live)
+        page = live[offset : offset + limit]
+        entries = [
+            {
+                "hash": hash_key,
+                "created_at": entry.created_at,
+                "size": len(entry.original_content),
+                "content_kind": entry.tool_name,
+                "preview": _list_preview(entry.original_content),
+            }
+            for hash_key, entry in page
+        ]
+        return {
+            "count": len(entries),
+            "total": total,
+            "offset": offset,
+            "limit": limit,
+            "entries": entries,
+            "note": (
+                "Stored CCR entries, newest first. Retrieve one in full with "
+                "furl_retrieve, or find by content with furl_search."
+                if entries
+                else "No stored entries in the current session window."
+            ),
+        }
+
+    def _live_entries(self) -> list[tuple[str, Any]]:
+        """Live ``(hash, entry)`` pairs, newest ``created_at`` first.
+
+        Consumes the backend Protocol's ``items()`` — the same live-entry read
+        ``store.search_all`` performs — and drops expired-but-unreaped rows
+        against the wall clock. ``keys()`` is deliberately NOT used: it is not
+        part of the ``CompressionStoreBackend`` protocol (ARCH-10), whereas
+        ``items()`` is, so this stays backend-agnostic.
+
+        The snapshot is taken UNDER the store's own lock, exactly as
+        ``search_all`` does: without it, a concurrent ``store()``/``delete()``
+        from another worker thread (tool calls now run off the loop) can mutate
+        the backend mid-read — for the in-memory backend an unlocked
+        ``list(dict.items())`` racing a write raises "dictionary changed size
+        during iteration". The expiry filter and sort run on the local snapshot,
+        outside the lock, so the lock is held only for the materialization."""
+        store = self._get_local_store()
+        now = time.time()
+        with store._lock:
+            snapshot = list(store._backend.items())
+        live = [(hash_key, entry) for hash_key, entry in snapshot if not entry.is_expired(now)]
+        live.sort(key=lambda pair: (pair[1].created_at, pair[0]), reverse=True)
+        return live
 
     async def _handle_read(self, arguments: dict[str, Any]) -> list[TextContent]:
         """Handle furl_read tool call — file read with session caching."""
-        import hashlib
-
         file_path = arguments.get("file_path", "")
         fresh = arguments.get("fresh", False)
 
@@ -1376,6 +1903,15 @@ class FurlMCPServer:
         # jail below must only ever see real path strings (API-15).
         if not isinstance(file_path, str):
             return _err(f"file_path parameter must be a string, got {type(file_path).__name__}")
+
+        # PERF-16: the jail walk (resolve/openat), fstat, body read, fcntl-locked
+        # stats append and store.store are all synchronous file I/O — run the
+        # whole read off the event loop (the documented sqlite-backend invariant).
+        return await asyncio.to_thread(self._read_file_sync, file_path, fresh)
+
+    def _read_file_sync(self, file_path: str, fresh: bool) -> list[TextContent]:
+        """Blocking body of :meth:`_handle_read` (runs off the loop)."""
+        import hashlib
 
         path = Path(file_path).expanduser().resolve()
 
@@ -1569,8 +2105,13 @@ class FurlMCPServer:
             )
 
 
-async def main() -> None:
-    """Run the Furl MCP server."""
+async def main(argv: list[str] | None = None) -> None:
+    """Run the Furl MCP server.
+
+    ``argv`` defaults to ``sys.argv[1:]`` (the ``python -m furl_ctx.ccr.mcp_server``
+    entry point); the ``furl mcp`` CLI launcher passes an explicit list so both
+    the module entry point and the console script share one launch path.
+    """
     parser = argparse.ArgumentParser(description="Furl MCP Server — Context engineering toolkit")
     parser.add_argument(
         "--debug",
@@ -1578,7 +2119,7 @@ async def main() -> None:
         help="Enable debug logging",
     )
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     if args.debug:
         logging.basicConfig(level=logging.DEBUG)
