@@ -1,6 +1,6 @@
 ---
 name: furl
-description: How the Furl context-compression plugin works — the furl_compress / furl_retrieve / furl_stats MCP tools, the PostToolUse hook that shrinks large tool outputs, the <<ccr:HASH>> retrieval flow, and the FURL_* environment knobs to tune or disable it. Use when the user asks what Furl is doing, why a tool output looks compressed or contains <<ccr:...>> markers, how to retrieve original content, how to tune compression thresholds, or how to turn the hook off.
+description: How the Furl context-compression plugin works — the furl_compress / furl_retrieve / furl_stats / furl_purge / furl_search / furl_list MCP tools, the PostToolUse hook that shrinks large tool outputs, the <<ccr:HASH>> retrieval flow, and the FURL_* environment knobs to tune or disable it. Use when the user asks what Furl is doing, why a tool output looks compressed or contains <<ccr:...>> markers, how to retrieve original content, how to tune compression thresholds, or how to turn the hook off.
 version: 0.1.0
 ---
 
@@ -9,7 +9,7 @@ version: 0.1.0
 Furl reduces the tokens large tool outputs cost by compressing them, while keeping
 every dropped byte **retrievable on demand**. It ships two things to this session:
 
-1. An **MCP server** (`furl`) exposing three tools.
+1. An **MCP server** (`furl`) exposing six tools.
 2. A **PostToolUse hook** that compresses big tool outputs automatically.
 
 ## The MCP tools
@@ -25,6 +25,11 @@ every dropped byte **retrievable on demand**. It ships two things to this sessio
   ROWS of a large offloaded JSON array (or a dominant-array object like a Chrome
   trace) instead of the whole thing. A free-text `query` searches stored entries.
 - `furl_stats` — session compression statistics (compressions, tokens saved, cost).
+- `furl_purge` — permanently erase stored originals: one hash, or all of them. No undo.
+- `furl_search` — find stored originals by a case-insensitive content substring; returns a hash + preview per hit.
+- `furl_list` — list stored entries, newest first, for paging through what's been compressed this session.
+
+A seventh tool, `furl_read`, exists but is off by default — enable with `FURL_MCP_READ=1`.
 
 ## When the hook fires
 

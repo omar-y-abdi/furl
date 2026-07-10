@@ -2,7 +2,7 @@
 
 Bundles Furl's context compression into Claude Code as a single plugin:
 
-- **MCP server** (`furl`) → the `furl_compress`, `furl_retrieve`, `furl_stats` tools.
+- **MCP server** (`furl`) → the `furl_compress`, `furl_retrieve`, `furl_stats`, `furl_purge`, `furl_search`, `furl_list` tools. A seventh tool, `furl_read`, is off by default (enable with `FURL_MCP_READ=1`).
 - **PostToolUse hook** → automatically compresses large tool outputs before they
   enter context (fail-open; never breaks a tool call).
 - **Skill** (`furl`) → explains how it works, the `<<ccr:HASH>>` retrieval flow, and
