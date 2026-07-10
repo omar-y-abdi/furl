@@ -111,8 +111,7 @@ def assert_text_lossless_byte_exact(content: str, *, salt: str = ""):
     dangling = [h for h, v in payloads.items() if v is None]
     assert not dangling, f"dangling CCR pointer(s), original unrecoverable: {dangling}"
     assert content in set(payloads.values()), (
-        "whole original not byte-exact recoverable under any surfaced hash "
-        f"(hashes={hashes})"
+        f"whole original not byte-exact recoverable under any surfaced hash (hashes={hashes})"
     )
     return result
 
@@ -294,7 +293,7 @@ def sql_dump(n: int = 200, *, secret: str | None = None) -> str:
         inserts.append(
             "INSERT INTO events (id, user_id, kind, payload, created_at) VALUES "
             f"({i}, {i % 50}, 'evt_{i % 9}', "
-            f"'{{\"k\": {i}, \"v\": \"{val}\"}}', '2026-07-09 00:00:{i % 60:02d}');"
+            f'\'{{"k": {i}, "v": "{val}"}}\', \'2026-07-09 00:00:{i % 60:02d}\');'
         )
     return head + "\n".join(inserts) + "\nCOMMIT;\n"
 
@@ -314,7 +313,7 @@ def typescript_source(n: int = 60, *, secret: str | None = None) -> str:
 
 
 def go_source(n: int = 60, *, secret: str | None = None) -> str:
-    parts = ["package main\n\nimport (\n\t\"fmt\"\n\t\"net/http\"\n)\n"]
+    parts = ['package main\n\nimport (\n\t"fmt"\n\t"net/http"\n)\n']
     for i in range(n):
         cmt = f"\t// secret {secret}\n" if (secret is not None and i == 20) else ""
         parts.append(
@@ -397,7 +396,9 @@ def crlf_log(n: int = 300, *, secret: str | None = None) -> str:
     out = []
     for i in range(n):
         extra = f" secret={secret}" if (secret is not None and i == 40) else ""
-        out.append(f"line {i} field_a=val_{i} field_b={i * 7} status={'ok' if i % 3 else 'err'}{extra}")
+        out.append(
+            f"line {i} field_a=val_{i} field_b={i * 7} status={'ok' if i % 3 else 'err'}{extra}"
+        )
     return "\r\n".join(out) + "\r\n"
 
 

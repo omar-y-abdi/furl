@@ -106,7 +106,9 @@ def test_fields_projection_returns_all_rows_with_only_requested_keys() -> None:
 
 
 def test_limit_truncates_and_reports_true_match_count() -> None:
-    rows = json.loads(m.retrieve(_offload_rows(), select_field="name", select_equals="Layout", limit=2))
+    rows = json.loads(
+        m.retrieve(_offload_rows(), select_field="name", select_equals="Layout", limit=2)
+    )
     kept = [r for r in rows if "_truncated" not in r]
     marker = [r for r in rows if "_truncated" in r]
     assert len(kept) == 2  # bounded output
