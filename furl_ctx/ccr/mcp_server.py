@@ -1728,13 +1728,16 @@ class FurlMCPServer:
         """Blocking stats aggregation (store + shared-file reads), off the loop."""
         stats = self._stats.to_dict()
 
-        # Add local store stats if available
-        if self._local_store is not None:
-            store_stats = self._local_store.get_stats()
-            stats["store"] = {
-                "entries": store_stats.get("entry_count", 0),
-                "max_entries": store_stats.get("max_entries", 0),
-            }
+        # Add local store stats. Route through _get_local_store() (the accessor
+        # every other handler uses) so per-project isolation — the deployed
+        # default — reports the ACTIVE namespace store. Reading self._local_store
+        # directly saw None whenever a namespace store served (that path returns
+        # without populating the singleton slot), silently dropping the block.
+        store_stats = self._get_local_store().get_stats()
+        stats["store"] = {
+            "entries": store_stats.get("entry_count", 0),
+            "max_entries": store_stats.get("max_entries", 0),
+        }
 
         # Aggregate cross-process stats (main session + sub-agents)
         my_pid = os.getpid()

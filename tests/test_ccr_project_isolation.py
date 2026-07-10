@@ -81,6 +81,25 @@ def test_A_search_list_retrieve_isolated_across_projects(
     assert store_b.search_all("SECRET") == [], "project B's search surfaced project A's entry"
 
 
+def test_furl_stats_reports_store_block_under_project_isolation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """furl_stats must include the store block (with entry_count) when a project
+    namespace is active — the deployed default. Regression guard: _compute_stats
+    must resolve the ACTIVE store via _get_local_store(), not read the
+    self._local_store slot, which the namespace path never populates.
+    """
+    from furl_ctx.ccr.mcp_server import FurlMCPServer
+
+    monkeypatch.setenv(FURL_CCR_PROJECT_DIR_ENV, str(tmp_path / "proj"))
+    server = FurlMCPServer()
+    server._get_local_store().store("stored under the project namespace", "<<ccr:p>>")
+
+    stats = server._compute_stats()
+    assert "store" in stats, "furl_stats dropped the store block under per-project isolation"
+    assert stats["store"]["entries"] == 1
+
+
 # --------------------------------------------------------------------------- #
 # B. Data loss — eviction is scoped to the acting store's own backend
 # --------------------------------------------------------------------------- #
