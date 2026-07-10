@@ -29,8 +29,6 @@ bracket pointer whose target is gone → ``retrieve`` returns ``None`` = silent 
 
 from __future__ import annotations
 
-import pytest
-
 from furl_ctx import compress, retrieve
 from furl_ctx.cache.compression_store import reset_compression_store
 from tests.matrix import _matrix as m
@@ -58,11 +56,6 @@ def _cold_then_cache_hit_after_eviction(content: str):
     return bracket_form, retrieve(r2.ccr_hashes[0])
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="MATRIX-01: bracket CCR marker not re-backed on result-cache hit after "
-    "store eviction (extract_ccr_hashes blind to bracket form) -> retrieve None = silent loss",
-)
 def test_bracket_marker_survives_result_cache_hit_after_eviction() -> None:
     doc = m.yaml_document()  # offloads whole via the envelope/tabular BRACKET path
     bracket_form, recovered = _cold_then_cache_hit_after_eviction(doc)
