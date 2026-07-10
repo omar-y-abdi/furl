@@ -194,11 +194,28 @@ class CompressResult:
 
         Derived from ``messages`` so it can never drift from what shipped. Pass
         each to ``furl_ctx.retrieve`` / ``resolve_markers`` to recover the content.
+
+        Total over every message shape: string content is scanned directly;
+        non-string content (block lists, or the raw ``bytes`` ``compress()``
+        passes through untouched) is serialized via
+        ``json.dumps(..., default=str)`` and the RENDERING scanned — so a
+        marker embedded in a text block still surfaces, and bytes whose repr
+        carries literal marker text surface those hashes too (consistent with
+        foreign marker text appearing in string content). Only content that
+        fails to serialize even with ``default=str`` (circular references,
+        tuple dict keys) contributes nothing — skipped rather than raising,
+        mirroring the sibling scanner ``_surfaced_ccr_hashes``.
         """
         parts: list[str] = []
         for message in self.messages:
             content = message.get("content")
-            parts.append(content if isinstance(content, str) else json.dumps(content))
+            if isinstance(content, str):
+                parts.append(content)
+                continue
+            try:
+                parts.append(json.dumps(content, ensure_ascii=False, default=str))
+            except (TypeError, ValueError):
+                continue
         return hashes_in_text("\n".join(parts))
 
 
