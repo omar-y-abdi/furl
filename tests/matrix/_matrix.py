@@ -117,13 +117,16 @@ def assert_text_lossless_byte_exact(content: str, *, salt: str = ""):
     return result
 
 
-def assert_text_failopen_byte_exact(content: str):
+def assert_text_failopen_byte_exact(content: str, *, error_contains: str | None = None):
     """FAIL-OPEN contract: original returned byte-exact AND the failure is LOUD.
 
     Pins that a shape the pipeline cannot process is not silently mangled: the
     input comes back byte-identical, nothing is offloaded, and ``result.error``
     is set (surfaced, not swallowed). This documents a real caveat to the
     "everything gets compressed" claim without any silent loss.
+
+    ``error_contains`` optionally pins WHY it failed open (a stable substring of
+    ``result.error``), so an unrelated future decline cannot pass as this case.
     """
     result = run(content)
     assert output_of(result) == content, "fail-open must return the original byte-exact"
@@ -132,6 +135,11 @@ def assert_text_failopen_byte_exact(content: str):
         "compression declined but the failure was NOT surfaced in result.error — "
         "that would be a silent no-op indistinguishable from success"
     )
+    if error_contains is not None:
+        assert error_contains.lower() in result.error.lower(), (
+            f"fail-open fired for an unexpected reason: {result.error!r} "
+            f"(expected substring {error_contains!r})"
+        )
     return result
 
 

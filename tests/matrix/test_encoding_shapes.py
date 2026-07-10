@@ -104,12 +104,16 @@ def test_tiny_and_empty_inputs_are_byte_exact(content) -> None:
 
 def test_huge_single_line_fails_open_byte_exact() -> None:
     # A 2 MB single line trips tiktoken's regex (catastrophic backtracking).
-    m.assert_text_failopen_byte_exact(m.huge_single_line(megabytes=2))
+    m.assert_text_failopen_byte_exact(
+        m.huge_single_line(megabytes=2), error_contains="backtracking"
+    )
 
 
 def test_lone_surrogate_fails_open_byte_exact() -> None:
     # A lone surrogate cannot be UTF-8 encoded at the Rust FFI boundary.
-    m.assert_text_failopen_byte_exact(m.lone_surrogate_text())
+    m.assert_text_failopen_byte_exact(
+        m.lone_surrogate_text(), error_contains="surrogate"
+    )
 
 
 # ─── MATRIX-02 — bytes content is a public totality gap ──────────────────────
