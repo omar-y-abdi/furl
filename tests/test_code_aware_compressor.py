@@ -88,6 +88,21 @@ def _javascript_code(n_funcs: int = 8, body_lines: int = 14) -> str:
     return "\n".join(parts)
 
 
+def _python_class_code(n_methods: int = 6, body_lines: int = 12) -> str:
+    """A Python class with long method bodies — clears every floor and forces
+    body truncation, exercising the class-compression AST path (the shared
+    ``_python_code`` fixture is function-only)."""
+    parts = ["import os", "", "class Service:", '    """Service with many methods."""']
+    for i in range(n_methods):
+        parts.append(f"    def method_{i}(self, payload: dict, retries: int = {i}) -> int:")
+        parts.append(f'        """Handle variant {i}."""')
+        for j in range(body_lines):
+            parts.append(f"        value_{j} = payload.get('field_{j}', {j}) + retries * {i + 1}")
+        parts.append(f"        return value_{body_lines - 1}")
+        parts.append("")
+    return "\n".join(parts)
+
+
 @pytest.fixture
 def working_store() -> Any:
     real = CompressionStore(max_entries=500, enable_feedback=False)
@@ -470,3 +485,26 @@ class TestCompressPassthroughAndResult:
             compression_ratio=0.5,
         )
         assert result.lines_saved == expected_saved
+
+
+@requires_tree_sitter
+class TestClassCompression:
+    """A class with long method bodies compresses through the AST class path:
+    the render is valid Python, the class + method signatures survive, and the
+    marker recovers the byte-exact original."""
+
+    def test_class_render_is_valid_python_and_preserves_scaffold(self, working_store: Any) -> None:
+        code = _python_class_code()
+        result = CodeAwareCompressor().compress(code)
+        assert len(result.compressed) < len(code), "long class bodies must compress"
+        ast.parse(result.compressed)  # shipped render (incl. marker comment) parses
+        assert "class Service" in result.compressed
+        assert re.search(r"def method_\d\b", result.compressed), "method signatures must survive"
+
+    def test_class_marker_recovers_byte_exact_original(self, working_store: Any) -> None:
+        code = _python_class_code()
+        result = CodeAwareCompressor().compress(code)
+        marker_hash = _extract_marker_hash(result.compressed)
+        entry = working_store.retrieve(marker_hash)
+        assert entry is not None
+        assert entry.original_content == code
