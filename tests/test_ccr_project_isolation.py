@@ -91,6 +91,12 @@ def test_furl_stats_reports_store_block_under_project_isolation(
     must resolve the ACTIVE store via _get_local_store(), not read the
     self._local_store slot, which the namespace path never populates.
     """
+    # Scoped to THIS test only: it drives furl_stats through the MCP server, which
+    # needs the optional `mcp` extra (CI shard 1 runs without it). The A–E
+    # isolation tests hit the store layer directly and must still run here, so the
+    # guard stays at function level — never module level.
+    pytest.importorskip("mcp")
+
     from furl_ctx.ccr.mcp_server import FurlMCPServer
 
     monkeypatch.setenv(FURL_CCR_PROJECT_DIR_ENV, str(tmp_path / "proj"))
