@@ -812,19 +812,33 @@ class FurlMCPServer:
         input_tokens = result.tokens_before
         output_tokens = result.tokens_after
 
-        # Store original in local store for later retrieval
-        hash_key = store.store(
-            original=content,
-            compressed=compressed_content
-            if isinstance(compressed_content, str)
-            else json.dumps(compressed_content),
-            original_tokens=input_tokens,
-            compressed_tokens=output_tokens,
-            compression_strategy="mcp_compress",
-            ttl=MCP_SESSION_TTL,
-        )
+        # Store original in local store for later retrieval. require_durable:
+        # the MCP server's default backend is the durable sqlite store; a write
+        # that fell open to volatile in-process memory (degraded backend, or a
+        # lost lock race) must not be advertised as retrievable-later — a
+        # sub-agent process or a restart would miss, silently breaking the
+        # exact cross-process durability the sqlite backend exists to provide
+        # (review F2). Lazy import, matching this module's convention.
+        from furl_ctx.cache.compression_store import DurableWriteError
 
-        # Track stats
+        hash_key: str | None
+        try:
+            hash_key = store.store(
+                original=content,
+                compressed=compressed_content
+                if isinstance(compressed_content, str)
+                else json.dumps(compressed_content),
+                original_tokens=input_tokens,
+                compressed_tokens=output_tokens,
+                compression_strategy="mcp_compress",
+                ttl=MCP_SESSION_TTL,
+                require_durable=True,
+            )
+        except DurableWriteError as exc:
+            logger.error("event=mcp_compress_not_durable error=%s", exc)
+            hash_key = None
+
+        # Track stats (the compression itself succeeded on both paths)
         strategy = (
             ", ".join(result.transforms_applied) if result.transforms_applied else "passthrough"
         )
@@ -832,6 +846,26 @@ class FurlMCPServer:
 
         tokens_saved = max(0, input_tokens - output_tokens)
         savings_pct = round(tokens_saved / input_tokens * 100, 1) if input_tokens > 0 else 0
+
+        if hash_key is None:
+            # Durability veto: no hash, no retrieval promise. The caller still
+            # holds the original it sent; the compressed form is returned for
+            # it to use or discard, flagged in plain words.
+            return {
+                "compressed": compressed_content,
+                "original_tokens": input_tokens,
+                "compressed_tokens": output_tokens,
+                "tokens_saved": tokens_saved,
+                "savings_percent": savings_pct,
+                "transforms": result.transforms_applied,
+                "durably_stored": False,
+                "note": (
+                    "Original NOT durably stored: the durable store write fell "
+                    "open to volatile process-local memory, so no retrieval hash "
+                    "is provided. Keep your original content; later retrieval of "
+                    "it from this server is not guaranteed."
+                ),
+            }
 
         return {
             "compressed": compressed_content,
