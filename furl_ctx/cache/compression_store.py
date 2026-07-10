@@ -470,10 +470,12 @@ class CompressionStore:
 
         Returns:
             Hash key for retrieving this content. On a true hash collision
-            (same key, different live content) the store KEEPS the first
-            binding and refuses the overwrite — the returned key then
-            resolves to the earlier content and the refusal is logged at
-            ERROR.
+            (same key, different live content) the store DROPS the ambiguous
+            binding — the stored entry is deleted, the new one refused, and the
+            collision logged at ERROR — so a later ``retrieve`` of the key is a
+            LOUD, cause-honest miss (recompute) rather than a silent resolution
+            to the other producer's foreign content. The key is still returned
+            (signature unchanged); its marker simply no longer resolves.
         """
         # Reject a non-positive TTL loudly. ttl=0 (or negative) produces an
         # entry that is_expired() immediately (time.time()-created_at > 0), so it
@@ -555,26 +557,35 @@ class CompressionStore:
 
             # Hash collision handling. If the key already exists with
             # DIFFERENT content it is a true hash collision (astronomically
-            # rare at 96-/48-bit keys) — KEEP-FIRST: refuse the overwrite.
-            # Rebinding would silently corrupt the already-emitted marker that
-            # points at the existing entry; refusing means the NEW caller's
-            # marker dangles instead, and dangles LOUDLY (error log here,
-            # cause-honest miss on retrieval of the changed content) rather
-            # than resolving old markers to foreign content. An expired
-            # same-key entry never reaches this branch: _evict_if_needed()
-            # above already reaped it, so a dead binding cannot wedge its key.
+            # rare at 96-/48-bit keys). Both producers' ``<<ccr:HASH>>`` markers
+            # now point at the SAME key, and retrieval — a bare
+            # ``backend.get(hash_key)`` with no per-marker content identity —
+            # cannot tell them apart. Serving the stored entry would hand the
+            # SECOND producer the FIRST producer's bytes: foreign content, i.e.
+            # silent corruption, the exact outcome this store exists to prevent.
+            # We cannot safely serve EITHER binding, so we DROP the binding
+            # entirely: delete the stored entry and refuse the new one. Every
+            # marker on this key then resolves to a LOUD, cause-honest miss
+            # (recompute) instead of foreign content. An expired same-key entry
+            # never reaches this branch: _evict_if_needed() above already reaped
+            # it, so a dead binding cannot wedge its key.
             existing = self._backend.get(hash_key)
             if existing is not None:
                 if existing.original_content != original:
                     logger.error(
                         "Hash collision detected: hash=%s tool=%s (existing_len=%d, "
-                        "new_len=%d) — keeping first binding, refusing overwrite; "
-                        "the new content is NOT stored and its marker will miss",
+                        "new_len=%d) — dropping the ambiguous binding; NEITHER content "
+                        "is served (both markers now loud-miss) rather than resolving "
+                        "to foreign content",
                         hash_key,
                         tool_name,
                         len(existing.original_content),
                         len(original),
                     )
+                    # Drop the stored entry so retrieve() loud-misses instead of
+                    # serving foreign bytes; its heap tuple is now stale.
+                    self._backend.delete(hash_key)
+                    self._stale_heap_entries += 1
                     return hash_key
                 # Same content being stored again - this is fine, just update
                 logger.debug(
