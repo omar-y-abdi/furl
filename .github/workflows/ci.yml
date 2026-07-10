@@ -64,25 +64,26 @@ jobs:
               - 'Cargo.lock'
               - 'tests/**'
               - 'scripts/**'
-              # ALL workflow files, not just ci.yml: the main ruleset
-              # requires lint/build-wheel/test to CONCLUDE on every PR,
-              # and a skipped required check does NOT satisfy a ruleset
-              # — a workflow-only PR (e.g. release.yml) would otherwise
-              # sit BLOCKED forever with everything green-or-skipped
-              # (first hit: PR #15).
+              # Conclusion of the required checks (lint/build-wheel/test) no
+              # longer depends on this filter: those jobs ALWAYS run and short-
+              # circuit their heavy steps when code=='false' (step-level `if`
+              # in each job), so every PR — regardless of diff shape —
+              # CONCLUDES on all six required contexts. This filter now only
+              # decides whether the EXPENSIVE work runs: it keeps the full
+              # suite exercised for CI/plugin/docs changes, while config-only
+              # PRs not listed here (e.g. .release-please-config.json, PR #56)
+              # still CONCLUDE in seconds via the short-circuit.
+              # Deadlock history — do NOT re-add job-level gating: #15, #32, #56.
               - '.github/workflows/**'
-              # Same ruleset logic for plugin + docs PRs: the plugin ships
-              # executable code (the PostToolUse hook) plus the marketplace
-              # and manifest JSON, and any PR that only edits docs must still
-              # let the required checks CONCLUDE rather than sit skipped and
-              # BLOCKED forever (first hit: PR #32, plugin-readiness).
               - 'plugins/**'
               - '.claude-plugin/**'
               - '**/*.md'
 
   lint:
+    # Required check — always runs so it CONCLUDES on every PR (ruleset
+    # 18484290); the heavy steps below short-circuit when code=='false',
+    # so a docs/config-only PR still concludes SUCCESS in seconds.
     needs: changes
-    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -96,17 +97,23 @@ jobs:
           path: ~/.cache/pip
           key: ${{ runner.os }}-pip-lint-${{ hashFiles('pyproject.toml') }}
           restore-keys: ${{ runner.os }}-pip-lint-
-      - run: python -m pip install --upgrade pip ruff==0.15.19 mypy==1.14.1
+      - if: needs.changes.outputs.code == 'true'
+        run: python -m pip install --upgrade pip ruff==0.15.19 mypy==1.14.1
       - name: ruff check
+        if: needs.changes.outputs.code == 'true'
         run: ruff check .
       - name: ruff format --check
+        if: needs.changes.outputs.code == 'true'
         run: ruff format --check .
       - name: mypy
+        if: needs.changes.outputs.code == 'true'
         run: mypy furl_ctx --ignore-missing-imports
 
   build-wheel:
+    # Required check — always runs so it CONCLUDES on every PR (ruleset
+    # 18484290); the heavy steps below short-circuit when code=='false',
+    # so a docs/config-only PR still concludes SUCCESS in seconds.
     needs: changes
-    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -118,25 +125,31 @@ jobs:
       # action exports RUSTUP_TOOLCHAIN, which overrides the file — an
       # unpinned @stable would build with a different compiler than
       # rust.yml/local. Action ref stays @stable (see rust.yml note).
-      - uses: dtolnay/rust-toolchain@stable
+      - if: needs.changes.outputs.code == 'true'
+        uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.95.0  # keep in sync with rust-toolchain.toml
-      - uses: Swatinem/rust-cache@v2
+      - if: needs.changes.outputs.code == 'true'
+        uses: Swatinem/rust-cache@v2
         with:
           workspaces: ". -> target"
       - name: Build wheel once (fast CI cargo profile)
+        if: needs.changes.outputs.code == 'true'
         run: |
           python -m pip install --upgrade pip maturin
           maturin build --profile ci --out dist --interpreter "python${PY_VERSION}"
-      - uses: actions/upload-artifact@v7
+      - if: needs.changes.outputs.code == 'true'
+        uses: actions/upload-artifact@v7
         with:
           name: furl-wheel
           path: dist/*.whl
           retention-days: 1
 
   test:
+    # Required checks test (1..4) — always run so each shard CONCLUDES on
+    # every PR (ruleset 18484290); the heavy steps below short-circuit when
+    # code=='false', so a docs/config-only PR concludes SUCCESS in seconds.
     needs: [changes, build-wheel]
-    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
@@ -157,12 +170,14 @@ jobs:
           restore-keys: ${{ runner.os }}-pip-${{ env.PY_VERSION }}-
 
       - name: Download prebuilt wheel
+        if: needs.changes.outputs.code == 'true'
         uses: actions/download-artifact@v8
         with:
           name: furl-wheel
           path: dist
 
       - name: Install (prebuilt wheel + dev deps, no cargo rebuild)
+        if: needs.changes.outputs.code == 'true'
         run: |
           python -m pip install --upgrade pip
           WHEEL="$(ls dist/*.whl)"
@@ -174,6 +189,7 @@ jobs:
           python -c "from furl_ctx._core import DiffCompressor; print('furl_ctx._core OK')"
 
       - name: Run test shard ${{ matrix.shard }}/4
+        if: needs.changes.outputs.code == 'true'
         run: |
           pytest tests \
             --splits 4 --group ${{ matrix.shard }} \
