@@ -115,3 +115,74 @@ def test_redact_primitive_itself_unchanged_on_small_input() -> None:
     # only the call sites slice. A small credential still redacts identically.
     out = _redact_retrieval_log_payload(f'{{"token": "{_SECRET}"}}')
     assert _SECRET not in out and "[REDACTED]" in out
+
+
+# ── review F4: _match_preview window-edge straddle (partial-secret leak) ─────
+#
+# The first slice-before-redact cut of ``_match_preview`` redacted ONLY the
+# bare radius window (no margin, unlike the list/cross/log surfaces). A
+# prefix-anchored secret straddling a window edge then leaked a fragment:
+#   * FAR edge — the window truncated an ``sk-`` key below the 12-char body
+#     minimum, so the rule no-matched and the head (``sk-`` + entropy) leaked;
+#   * NEAR edge — the ``sk-`` anchor sat before the window start, so the
+#     un-anchored body tail inside the window leaked.
+# The fix redacts a MARGIN-widened window (straddling secrets are seen whole)
+# and re-finds the needle inside the REDACTED text before display-windowing.
+
+_STRADDLE_BODY = "Zq7Rw2Xt9Kp4Mn6B"  # 16 entropy chars (>= the 12-char rule floor)
+_STRADDLE_SECRET = "sk-" + _STRADDLE_BODY
+_STRADDLE_NEEDLE = "needleword"
+
+# Fragments that must NEVER appear in a preview: whole key, head, tail.
+_STRADDLE_FRAGMENTS = (_STRADDLE_SECRET, _STRADDLE_BODY[:5], _STRADDLE_BODY[-6:])
+
+
+def test_match_preview_masks_secret_straddling_far_edge() -> None:
+    # Secret STARTS inside the display window; its tail crosses the far edge
+    # (only 8 of its chars fit). Pre-fix, the redactor saw just "sk-Zq7Rw" —
+    # below the rule's 12-char body floor → no match → the head LEAKED. The
+    # secret is space-delimited (real content gives the ``\b`` the sk- rule
+    # anchors on); the leak was purely the window truncation.
+    from furl_ctx.ccr.mcp_server import _MATCH_PREVIEW_RADIUS, _match_preview
+
+    prefix = "A" * 100
+    raw_idx = len(prefix)
+    display_end = raw_idx + len(_STRADDLE_NEEDLE) + _MATCH_PREVIEW_RADIUS
+    secret_start = display_end - 8  # 8 chars of the key sit in-window
+    pad = secret_start - (raw_idx + len(_STRADDLE_NEEDLE)) - 1
+    original = prefix + _STRADDLE_NEEDLE + ("f" * pad) + " " + _STRADDLE_SECRET + " " + ("t" * 200)
+    assert original[secret_start : secret_start + 3] == "sk-", "fixture geometry drifted"
+
+    preview = _match_preview(original, _STRADDLE_NEEDLE)
+
+    for fragment in _STRADDLE_FRAGMENTS:
+        assert fragment not in preview, (
+            f"far-edge straddling secret leaked fragment {fragment!r}: {preview!r}"
+        )
+    assert _STRADDLE_NEEDLE in preview, "the match window must still show the needle"
+
+
+def test_match_preview_masks_secret_straddling_near_edge() -> None:
+    # Secret's ``sk-`` anchor sits BEFORE the display-window start; its body
+    # tail extends into the window. Pre-fix, the redactor saw only the
+    # un-anchored 14-char tail → no rule matched → the tail LEAKED. Space-
+    # delimited for the same ``\b`` reason as the far-edge twin.
+    from furl_ctx.ccr.mcp_server import _MATCH_PREVIEW_RADIUS, _match_preview
+
+    head = "B" * 100 + " "
+    secret_start = len(head)
+    # Put the match so the display window starts 5 chars INTO the secret.
+    raw_idx = secret_start + 5 + _MATCH_PREVIEW_RADIUS
+    gap = raw_idx - (secret_start + len(_STRADDLE_SECRET) + 1)
+    original = (
+        head + _STRADDLE_SECRET + " " + ("g" * gap) + _STRADDLE_NEEDLE + " tail " + ("C" * 100)
+    )
+    assert original.lower().find(_STRADDLE_NEEDLE) == raw_idx, "fixture geometry drifted"
+
+    preview = _match_preview(original, _STRADDLE_NEEDLE)
+
+    for fragment in _STRADDLE_FRAGMENTS:
+        assert fragment not in preview, (
+            f"near-edge straddling secret leaked fragment {fragment!r}: {preview!r}"
+        )
+    assert _STRADDLE_NEEDLE in preview, "the match window must still show the needle"

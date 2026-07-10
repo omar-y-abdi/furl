@@ -632,11 +632,16 @@ def _match_preview(original: str, needle_lower: str) -> str:
     Slice-before-redact (ReDoS guard, see ``_PREVIEW_REDACT_MARGIN``): the
     credential regexes are O(N^2) on long base64url/hex runs, so the redactor
     must never see the whole multi-MB original. The match is located in the RAW
-    text (a linear ``find``), a bounded window is cut around it, and ONLY that
-    window is redacted. If the match fell inside a secret it is absent from the
-    redacted window — fall back to a redacted head, preserving the original
-    "a match inside a credential does not reveal its location" property.
-    Bounded to ``_MATCH_PREVIEW_MAX`` chars."""
+    text (a linear ``find``); the redactor then sees a MARGIN-widened window
+    around it — the margin means a secret straddling either display edge is
+    seen WHOLE and masked before any cut can leave a recognizable fragment
+    (review F4: a bare radius window truncated a prefix-anchored key into an
+    unmatchable — and therefore leaked — head or un-anchored tail). The needle
+    is re-found inside the REDACTED text and the display window is cut around
+    that; if the match fell inside a now-masked credential it is absent from
+    the redacted text — fall back to a redacted head, so a match inside a
+    secret reveals neither its bytes nor its location. Bounded to
+    ``_MATCH_PREVIEW_MAX`` chars."""
     raw_idx = original.lower().find(needle_lower)
     if raw_idx < 0:
         # Defensive: callers only pass a needle already found in the original,
@@ -645,19 +650,25 @@ def _match_preview(original: str, needle_lower: str) -> str:
             _redact_preview_text(original[: _MATCH_PREVIEW_MAX + _PREVIEW_REDACT_MARGIN]),
             _MATCH_PREVIEW_MAX,
         )
-    start = max(0, raw_idx - _MATCH_PREVIEW_RADIUS)
-    end = min(len(original), raw_idx + len(needle_lower) + _MATCH_PREVIEW_RADIUS)
-    redacted = _redact_preview_text(original[start:end])
-    if needle_lower not in redacted.lower():
+    wstart = max(0, raw_idx - _MATCH_PREVIEW_RADIUS - _PREVIEW_REDACT_MARGIN)
+    wend = min(
+        len(original),
+        raw_idx + len(needle_lower) + _MATCH_PREVIEW_RADIUS + _PREVIEW_REDACT_MARGIN,
+    )
+    redacted = _redact_preview_text(original[wstart:wend])
+    ridx = redacted.lower().find(needle_lower)
+    if ridx < 0:
         # The match sat inside a credential now masked to [REDACTED]; windowing
         # around it would reveal its location — fall back to a redacted head.
         return _bounded(
             _redact_preview_text(original[: _MATCH_PREVIEW_MAX + _PREVIEW_REDACT_MARGIN]),
             _MATCH_PREVIEW_MAX,
         )
-    prefix = "…" if start > 0 else ""
-    suffix = "…" if end < len(original) else ""
-    return _bounded(f"{prefix}{redacted}{suffix}", _MATCH_PREVIEW_MAX)
+    start = max(0, ridx - _MATCH_PREVIEW_RADIUS)
+    end = min(len(redacted), ridx + len(needle_lower) + _MATCH_PREVIEW_RADIUS)
+    prefix = "…" if (wstart > 0 or start > 0) else ""
+    suffix = "…" if (wend < len(original) or end < len(redacted)) else ""
+    return _bounded(f"{prefix}{redacted[start:end]}{suffix}", _MATCH_PREVIEW_MAX)
 
 
 def _list_preview(original: str) -> str:
