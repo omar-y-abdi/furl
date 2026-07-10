@@ -80,6 +80,17 @@ def test_eval_requires_recall_flag(tmp_path) -> None:  # type: ignore[no-untyped
     assert "--recall" in proc.stderr
 
 
+def test_eval_missing_corpus_exits_1(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    # CAVEAT-14: a nonexistent corpus path used to silently "succeed" — the
+    # per-file OSError handler skipped it and eval still exited 0 with a
+    # bogus 0.0% ratio, as if the corpus were legitimately empty.
+    missing = tmp_path / "does-not-exist"
+    proc = _run(["eval", str(missing), "--recall"])
+    assert proc.returncode == 1
+    assert "not found" in proc.stderr
+    assert proc.stdout == ""
+
+
 # ── retrieve slice tests (in-process round-trips) ────────────────────────────
 #
 # The FURL_CCR_BACKEND=memory store is per-process, so the compress step and the
