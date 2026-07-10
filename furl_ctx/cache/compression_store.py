@@ -1400,6 +1400,28 @@ class CompressionStore:
             self._eviction_heap.clear()  # Clear heap too
             self._stale_heap_entries = 0  # CRITICAL FIX: Reset stale counter
 
+    def close(self) -> None:
+        """Release backend resources (sqlite connections / file descriptors).
+
+        Distinct from ``clear`` (which empties entries but keeps the backend
+        open): a dropped store — e.g. a per-namespace store retired by
+        ``reset_compression_store`` — must close its sqlite handles or they leak
+        as ``ResourceWarning``-flagged unclosed connections (P5). Idempotent and
+        fail-open: a backend without ``close`` (the in-memory default) is
+        skipped, and a close error is logged, never raised, so teardown always
+        proceeds. The spill tier is closed too, so no durable handle survives.
+        """
+        for backend in (self._backend, self._spill):
+            if backend is None:
+                continue
+            close = getattr(backend, "close", None)
+            if close is None:
+                continue
+            try:
+                close()
+            except Exception as exc:  # noqa: BLE001 — teardown must not raise
+                logger.warning("CCR backend close failed (non-fatal): %s", exc)
+
     def _spill_evicted(self, hash_key: str, entry: CompressionEntry) -> None:
         """Demote a capacity-evicted (still-live) entry to the spill tier.
 
@@ -1614,11 +1636,40 @@ def clear_request_compression_store() -> None:
 
 FURL_CCR_NAMESPACE_ENV = "FURL_CCR_NAMESPACE"
 
+# Per-project isolation (audit #4). When set — the plugin deployment exports it
+# from the project root — an otherwise un-namespaced call is scoped to a
+# per-project store instead of the process-global singleton, closing the
+# cross-project commingling + eviction hole with zero user config. Absent
+# (library / unit tests) the global singleton serves, byte-for-byte unchanged.
+FURL_CCR_PROJECT_DIR_ENV = "FURL_CCR_PROJECT_DIR"
+
 # Registry of namespace-key -> store, so identical (namespace, session, agent)
 # tuples converge on the SAME store across calls (cross-turn retrieval works)
 # and in-memory tenants do not lose their entries between compress() calls.
 _namespace_stores: dict[str, CompressionStore] = {}
 _namespace_lock = threading.Lock()
+
+
+def _project_scope_key() -> str | None:
+    """Per-project namespace key from ``FURL_CCR_PROJECT_DIR`` (audit #4).
+
+    Returns ``None`` when the variable is unset/blank, so the caller keeps
+    today's global-singleton behavior (library, unit tests). When set, the raw
+    project root is canonicalized (``expanduser().resolve()``) so the hook and
+    MCP processes — which may observe the same project via different spellings
+    or a symlink — converge on ONE key, and thus ONE sqlite file. The ``\\x01``
+    prefix marks this as a project-scope key so it can never alias an explicit
+    ``(namespace, session, agent)`` tuple; the value is opaque and only ever
+    hashed into the sqlite filename, never interpolated into a path.
+    """
+    raw = (os.environ.get(FURL_CCR_PROJECT_DIR_ENV) or "").strip()
+    if not raw:
+        return None
+    try:
+        resolved = str(Path(raw).expanduser().resolve())
+    except OSError:
+        resolved = raw
+    return "\x01".join(("furl-project", resolved))
 
 
 def _namespace_key(session_id: str | None, agent_id: str | None) -> str | None:
@@ -1627,15 +1678,18 @@ def _namespace_key(session_id: str | None, agent_id: str | None) -> str | None:
     The three segments together define the tenant boundary: an identical tuple
     maps to the same store (so a later turn recovers what an earlier turn
     stored), any difference maps to a different store. Blank/None segments
-    contribute an empty field. When NONE of the three is set the caller wants
-    today's global behavior, so this returns ``None`` — the resolver then
-    touches nothing and the global singleton serves.
+    contribute an empty field. When none of the three is set the call carries no
+    explicit tenant identity, so it falls back to the per-project scope
+    (``FURL_CCR_PROJECT_DIR``); with neither present this returns ``None`` and
+    the global singleton serves — today's behavior, byte-for-byte.
     """
     env_ns = (os.environ.get(FURL_CCR_NAMESPACE_ENV) or "").strip()
     session = (session_id or "").strip()
     agent = (agent_id or "").strip()
     if not env_ns and not session and not agent:
-        return None
+        # No explicit tenant identity: prefer per-project isolation when the
+        # deployment provides a project root, else None (global singleton).
+        return _project_scope_key()
     # NUL-joined so distinct segmentations cannot alias (``a`` + ``bc`` vs
     # ``ab`` + ``c``); the raw values are opaque and never touch a filesystem
     # path directly — the sqlite filename is derived by hashing this key.
@@ -1878,11 +1932,13 @@ def reset_compression_store() -> None:
     with _store_lock:
         if _compression_store is not None:
             _compression_store.clear()
+            _compression_store.close()  # release sqlite fds before dropping (P5 leak)
         _compression_store = None
 
     with _namespace_lock:
         for store in _namespace_stores.values():
             store.clear()
+            store.close()  # each per-namespace backend holds its own fds — close them
         _namespace_stores.clear()
 
 
