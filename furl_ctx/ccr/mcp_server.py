@@ -654,8 +654,14 @@ class FurlMCPServer:
         furl_compress — Compress content on demand. Stores original for
                            retrieval.
         furl_retrieve — Retrieve original uncompressed content by hash
-                           from the local CCR store.
+                           from the local CCR store (with optional query /
+                           pattern / line-range / fields / select_* filters).
         furl_stats    — Session statistics: compressions, savings, cost.
+        furl_purge    — Erase stored originals: one hash, or all.
+        furl_search   — Find stored originals by a content substring.
+        furl_list     — List stored entries, newest first.
+        furl_read     — File read with session caching (flag-gated:
+                           FURL_MCP_READ).
 
     Compression and retrieval happen locally in-process via the shared CCR
     compression store.
