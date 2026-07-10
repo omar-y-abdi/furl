@@ -1036,9 +1036,10 @@ class FurlMCPServer:
                         "markers like [N items compressed... hash=abc123].\n"
                         "Two extra modes: (1) OMIT hash and pass query to search across "
                         "ALL stored entries (returns ranked hash/score/preview matches to "
-                        "retrieve individually); (2) pass hash with pattern/fields/line_range "
-                        "to project just part of the original. Filters cannot be combined "
-                        "with query."
+                        "retrieve individually); (2) pass hash with pattern/fields/line_range, "
+                        "or a select_field row-filter (keep the rows of a JSON array by exact "
+                        "value or numeric range), to project just part of the original. "
+                        "Filters cannot be combined with query."
                     ),
                     inputSchema={
                         "type": "object",
@@ -1097,7 +1098,62 @@ class FurlMCPServer:
                                     "For a JSON-array original: project only these keys out "
                                     "of each object element (requires a hash, no query). "
                                     "Errors if the original is not a JSON array. Cannot be "
-                                    "combined with pattern/line_range."
+                                    "combined with pattern/line_range; composes with "
+                                    "select_field (projects the columns of the kept rows)."
+                                ),
+                            },
+                            "select_field": {
+                                "type": "string",
+                                "description": (
+                                    "Row-select over a JSON array of objects (requires a "
+                                    "hash, no query): the field/column name to match on. It "
+                                    "anchors the whole select family — select_equals / "
+                                    "select_min / select_max / limit are honored ONLY "
+                                    "alongside select_field (any of them without it is an "
+                                    "error). Reads a top-level JSON array of objects OR a "
+                                    "JSON object with exactly one dominant inner array (e.g. "
+                                    "a '{metadata, traceEvents:[...]}' trace). Composes with "
+                                    "'fields'; cannot be combined with pattern/line_range or "
+                                    "query."
+                                ),
+                            },
+                            "select_equals": {
+                                "type": ["string", "number", "boolean", "null"],
+                                "description": (
+                                    "Equality mode: keep rows whose select_field equals this "
+                                    "JSON scalar (string/number/boolean/null; a list or "
+                                    "object is rejected). Bool-safe — true never matches the "
+                                    "number 1. Mutually exclusive with select_min/select_max."
+                                ),
+                            },
+                            "select_min": {
+                                "type": "number",
+                                "description": (
+                                    "Numeric-range mode: keep rows whose select_field is a "
+                                    "number >= select_min (inclusive; open lower bound when "
+                                    "omitted). A row whose field is missing or non-numeric is "
+                                    "skipped, never an error. Mutually exclusive with "
+                                    "select_equals."
+                                ),
+                            },
+                            "select_max": {
+                                "type": "number",
+                                "description": (
+                                    "Numeric-range mode: keep rows whose select_field is a "
+                                    "number <= select_max (inclusive; open upper bound when "
+                                    "omitted). Must be >= select_min. Mutually exclusive with "
+                                    "select_equals."
+                                ),
+                            },
+                            "limit": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "description": (
+                                    "Max rows a select_field row-select returns (positive "
+                                    "integer; defaults to 1000 when a select is requested "
+                                    "without it). When more rows match, only the first "
+                                    "'limit' ship plus one explicit truncation-marker row. "
+                                    "Applies only to select_field row-selects."
                                 ),
                             },
                         },
