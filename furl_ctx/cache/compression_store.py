@@ -1514,15 +1514,18 @@ class CompressionStore:
     def _clean_expired(self) -> None:
         """Remove expired entries. Must be called with lock held.
 
-        CRITICAL FIX: Track stale heap entries when deleting to prevent memory leak.
+        Delegates to the backend's expiry GC (audit #2) instead of
+        materializing every row into Python just to find the expired keys —
+        this runs on the store() write hot path (via ``_evict_if_needed``), so
+        for the durable backend it is now an indexed range delete, not a full
+        scan + decode of the whole shared file. Each purged entry leaves a stale
+        ``(created_at, hash_key)`` tuple in the eviction heap; the counter bump
+        keeps the heap-staleness accounting exactly as the old per-key delete
+        loop did (the tuples are found stale on pop, or reaped by the
+        ratio-guard rebuild).
         """
-        now = self._now()
-        expired_keys = [key for key, entry in self._backend.items() if entry.is_expired(now)]
-        for key in expired_keys:
-            self._backend.delete(key)
-            # CRITICAL FIX: Increment stale counter - the heap still has an entry
-            # for this key that will be stale when we try to evict
-            self._stale_heap_entries += 1
+        purged = self._backend.purge_expired(self._now())
+        self._stale_heap_entries += purged
 
     def _rebuild_heap(self) -> None:
         """Rebuild heap from current store entries. Must be called with lock held.
@@ -1530,10 +1533,10 @@ class CompressionStore:
         CRITICAL FIX: This removes stale heap entries that accumulate when entries
         are deleted or replaced. Without this, the heap grows unboundedly.
         """
-        # Build new heap from current store entries only
-        self._eviction_heap = [
-            (entry.created_at, hash_key) for hash_key, entry in self._backend.items()
-        ]
+        # Build new heap from current store entries only. Uses the backend's
+        # projected (created_at, hash_key) read (audit #2) so a rebuild on the
+        # store() hot path does not decode every content BLOB out of the file.
+        self._eviction_heap = list(self._backend.created_at_index())
         heapq.heapify(self._eviction_heap)
         # Reset stale counter - heap is now clean
         self._stale_heap_entries = 0
