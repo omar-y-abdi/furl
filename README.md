@@ -63,9 +63,9 @@ Token reduction on real captured data — reproducible, inputs committed under `
 | logs          |    90 |  8,595 |    619 |       93% |           100% |
 | search        |    90 |  4,102 |    318 |       92% |           100% |
 | repeated logs |    90 |  3,621 |    120 |       97% |           100% |
-| disk          |     9 |    694 |    347 |       50% |           100% |
+| disk          |     9 |    694 |    279 |       60% |           100% |
 
-Across the corpus: **94% fewer tokens** (72,903 → 4,016) at 100% information retention. Full methodology and the 6-seed adversarial sweep: [BENCHMARKS.md](BENCHMARKS.md).
+Across the corpus: **95% fewer tokens** (72,903 → 3,880) at 100% information retention. Full methodology and the 6-seed adversarial sweep: [BENCHMARKS.md](BENCHMARKS.md).
 
 ## Also a Python library
 
