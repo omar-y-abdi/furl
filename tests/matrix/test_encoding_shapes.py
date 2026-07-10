@@ -130,11 +130,6 @@ def test_lone_surrogate_fails_open_byte_exact() -> None:
 # ─── MATRIX-02 — bytes content is a public totality gap ──────────────────────
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="MATRIX-02: CompressResult.ccr_hashes raises TypeError on raw bytes "
-    "message content (json.dumps of non-str) instead of returning []",
-)
 def test_bytes_content_ccr_hashes_is_total() -> None:
     payload = bytes([0xFF, 0xFE, 0x00, 0x01]) * 500  # non-str, non-JSON-serializable
     result = compress([{"role": "user", "content": payload}], model="gpt-4o")
