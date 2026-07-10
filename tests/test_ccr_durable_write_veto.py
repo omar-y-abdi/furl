@@ -21,7 +21,7 @@ from typing import Any
 
 import pytest
 
-from furl_ctx.cache.backends.sqlite import SqliteBackend, _SqliteOpFailed
+from furl_ctx.cache.backends.sqlite import SqliteBackend
 from furl_ctx.cache.compression_store import (
     CompressionStore,
     DurableWriteError,
@@ -30,23 +30,13 @@ from furl_ctx.cache.compression_store import (
 )
 from furl_ctx.transforms.diff_compressor import DiffCompressor, DiffCompressorConfig
 from furl_ctx.transforms.log_compressor import LogCompressor, LogCompressorConfig
-from tests._fixtures import make_large_diff
+from tests._fixtures import make_fail_open_sqlite_backend, make_large_diff
 
 
 def _fail_open_sqlite(tmp_path) -> SqliteBackend:
-    """A real SqliteBackend whose *set* op always loses the lock race — every
-    write fails open to the volatile in-process fallback (audit #3's scenario).
-    Reads/counts still hit the file so same-process retrieval still round-trips.
-    """
-    backend = SqliteBackend(db_path=tmp_path / "ccr.sqlite3")
-    real_run = backend._run
-
-    def failing_run(op_name: str, fn):
-        if op_name == "set":
-            raise _SqliteOpFailed()  # simulate busy_timeout×retries exhausted
-        return real_run(op_name, fn)
-
-    backend._run = failing_run  # type: ignore[method-assign]
+    """Thin wrapper over the shared canonical helper (TEST-19) — see
+    ``tests._fixtures.make_fail_open_sqlite_backend``."""
+    backend: SqliteBackend = make_fail_open_sqlite_backend(tmp_path / "ccr.sqlite3")
     return backend
 
 
