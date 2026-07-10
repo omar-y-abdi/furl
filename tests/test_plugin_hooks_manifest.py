@@ -5,9 +5,17 @@ handlers MUST be wrapped in a top-level ``"hooks"`` record keyed by event name.
 Shipping the bare ``{"PostToolUse": [...]}`` shape (no wrapper) made the loader
 reject the file with ``hooks: Invalid input: expected record, received undefined``
 and silently disabled the hook. These tests pin the valid shape and the exact
-runtime behavior (matcher, command, inlined env vars, timeout) so it cannot recur.
+runtime behavior (matcher, command, timeout) so it cannot recur.
 
-Pure JSON — no furl_ctx import — so the guard runs even without the built extension.
+Env contract: the manifest sets NO environment variables — neither a per-hook
+``env`` object (the loader ignores the field) nor inline ``VAR=value`` assignments
+in the command (``VAR=x cmd`` sets the child env unconditionally, which would
+override a user's exported values such as ``FURL_CCR_BACKEND=memory``). The CCR
+defaults (FURL_CCR_BACKEND=sqlite, FURL_CCR_TTL_SECONDS=86400) are owned by
+compress_tool_output.py via ``os.environ.setdefault``, which honors user overrides.
+
+Pure JSON/text checks — no furl_ctx import — so the guard runs even without the
+built extension.
 """
 
 from __future__ import annotations
@@ -16,16 +24,24 @@ import json
 from pathlib import Path
 from typing import Any
 
-_HOOKS_JSON = Path(__file__).resolve().parents[1] / "plugins" / "furl" / "hooks" / "hooks.json"
+_PLUGIN_HOOKS_DIR = Path(__file__).resolve().parents[1] / "plugins" / "furl" / "hooks"
+_HOOKS_JSON = _PLUGIN_HOOKS_DIR / "hooks.json"
+_HOOK_SCRIPT = _PLUGIN_HOOKS_DIR / "compress_tool_output.py"
 
 # Only event Furl ships. The loader rejects unknown event keys ("Invalid key in
 # record"), so keeping this pinned also guards against typo'd event names.
 _EVENT = "PostToolUse"
 
+# The exact command the plugin ships — byte-identical to the pre-schema-fix
+# command; only the wrapper around it changed. Any edit here must be deliberate.
+_EXPECTED_COMMAND = (
+    'sh -lc \'uv run --no-project --with "furl-ctx[mcp]" '
+    'python3 "${CLAUDE_PLUGIN_ROOT}/hooks/compress_tool_output.py" || true\''
+)
+
 # Fields the schema does not honor where the old manifest wrongly placed them:
 # the host silently ignores ``description``/``id`` at the matcher level and ``env``
-# per command hook. They must not reappear — the two env vars are inlined into the
-# command string instead, which is where they actually take effect.
+# per command hook. They must not reappear.
 _FORBIDDEN_MATCHER_KEYS = {"description", "id"}
 _FORBIDDEN_HOOK_KEYS = {"env"}
 
@@ -74,8 +90,17 @@ def test_runtime_behavior_preserved() -> None:
     hook = group["hooks"][0]
     assert hook["timeout"] == 30
     command = hook["command"]
-    # env vars preserved verbatim, inlined into the shell command (no `env` block)
-    assert "FURL_CCR_BACKEND=sqlite" in command
-    assert "FURL_CCR_TTL_SECONDS=86400" in command
-    # still invokes the bundled hook script via the plugin-root placeholder
+    assert command == _EXPECTED_COMMAND
+    # No inline env pins: `VAR=x cmd` would clobber a user's exported override
+    # (e.g. FURL_CCR_BACKEND=memory). Defaults belong to the script's setdefault.
+    assert "FURL_CCR" not in command
+    # Still invokes the bundled hook script via the plugin-root placeholder.
     assert "${CLAUDE_PLUGIN_ROOT}/hooks/compress_tool_output.py" in command
+
+
+def test_env_defaults_owned_by_hook_script_setdefault() -> None:
+    # The user-overridable defaults must stay in the script; the manifest carries
+    # none. Together with test_runtime_behavior_preserved this pins the contract.
+    src = _HOOK_SCRIPT.read_text(encoding="utf-8")
+    assert 'os.environ.setdefault("FURL_CCR_BACKEND", "sqlite")' in src
+    assert 'os.environ.setdefault("FURL_CCR_TTL_SECONDS", "86400")' in src

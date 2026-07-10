@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh -lc 'FURL_CCR_BACKEND=sqlite FURL_CCR_TTL_SECONDS=86400 uv run --no-project --with \"furl-ctx[mcp]\" python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/compress_tool_output.py\" || true'",
+            "command": "sh -lc 'uv run --no-project --with \"furl-ctx[mcp]\" python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/compress_tool_output.py\" || true'",
             "timeout": 30
           }
         ]

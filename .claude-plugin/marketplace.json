@@ -13,7 +13,7 @@
     {
       "name": "furl",
       "source": "./plugins/furl",
-      "description": "Furl context compression: the Furl MCP server (furl_compress / furl_retrieve / furl_stats) plus a fail-open PostToolUse hook that shrinks large tool outputs before they enter context. Originals stay byte-exactly retrievable via <<ccr:HASH>> markers.",
+      "description": "Furl context compression: the Furl MCP server (furl_compress / furl_retrieve / furl_stats / furl_purge / furl_search / furl_list) plus a fail-open PostToolUse hook that shrinks large tool outputs before they enter context. Originals stay byte-exactly retrievable via <<ccr:HASH>> markers.",
       "version": "1.0.1",
       "author": {
         "name": "Omar Y. Abdi",
