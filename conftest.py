@@ -18,8 +18,9 @@ import importlib.util
 import pytest
 
 _UNBUILT_EXTENSION_MESSAGE = (
-    "furl_ctx._core (the native Rust extension) is not built, so the test "
-    "suite cannot import furl_ctx.\n"
+    "furl_ctx._core (the native Rust extension) is not importable from this "
+    "checkout: the local furl_ctx/ sources shadow any installed furl-ctx "
+    "wheel, and the extension is not built here.\n"
     "Build the extension first, then re-run pytest:\n\n"
     "    pip install maturin && maturin develop --release\n\n"
     "See CONTRIBUTING.md ('Development setup') for the full quickstart."
