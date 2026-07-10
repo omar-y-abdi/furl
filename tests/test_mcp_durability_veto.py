@@ -24,6 +24,8 @@ Requires the optional ``mcp`` extra, mirroring test_mcp_server_handlers.py.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 pytest.importorskip("mcp")
@@ -98,3 +100,41 @@ def test_compress_healthy_store_still_returns_hash_and_note(server, tmp_path, mo
     assert "furl_retrieve" in out["note"] or "hash=" in out["note"]
     entry = store.retrieve(out["hash"])
     assert entry is not None and entry.original_content == content
+
+
+# ── F3: furl_read ────────────────────────────────────────────────────────────
+
+
+async def test_read_veto_serves_content_but_skips_cache(server, tmp_path, monkeypatch) -> None:
+    _with_fail_open_store(server, tmp_path, monkeypatch)
+    f = tmp_path / "sample.txt"
+    f.write_text("line one\nline two\n")
+
+    result = await server._handle_read({"file_path": str(f)})
+
+    # Full content still served (numbered) — nothing is lost on a fresh read.
+    assert len(result) == 1
+    assert "line one" in result[0].text and "line two" in result[0].text
+    # But NO cache entry: a later unchanged read must not advertise a
+    # furl_retrieve hash whose only backing is volatile process memory.
+    assert not server._file_cache, (
+        "furl_read cached a volatile-only hash — a later read would advertise "
+        "furl_retrieve for an unbacked entry (F3)"
+    )
+
+
+async def test_read_healthy_store_caches_and_advertises_hash(server, tmp_path, monkeypatch) -> None:
+    store = _with_healthy_store(server, tmp_path, monkeypatch)
+    f = tmp_path / "sample.txt"
+    f.write_text("alpha\nbeta\n")
+
+    first = await server._handle_read({"file_path": str(f)})
+    assert "alpha" in first[0].text
+    assert server._file_cache, "healthy durable store must cache the hash"
+
+    # Second (unchanged) read returns the cached envelope with a resolvable hash.
+    second = await server._handle_read({"file_path": str(f)})
+    envelope = json.loads(second[0].text)
+    assert envelope["status"] == "cached"
+    entry = store.retrieve(envelope["hash"])
+    assert entry is not None and entry.original_content == "alpha\nbeta\n"

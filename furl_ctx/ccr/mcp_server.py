@@ -2130,16 +2130,27 @@ class FurlMCPServer:
         token_estimate = get_tokenizer(_MCP_TOKEN_MODEL).count_text(content)
 
         store = self._get_local_store()
-        ccr_hash = store.store(
-            original=content,
-            compressed=f"[File: {path.name}, {line_count} lines]",
-            original_tokens=token_estimate,
-            compressed_tokens=5,
-            tool_name="furl_read",
-            ttl=MCP_SESSION_TTL,
-        )
+        # require_durable (review F3, symmetry with furl_compress): the full
+        # content is served below regardless — nothing is lost on a fresh read —
+        # but a write that only reached volatile process memory must not seed
+        # ``_file_cache``, or a later unchanged-read response would advertise
+        # ``furl_retrieve(hash=...)`` backed by nothing durable.
+        from furl_ctx.cache.compression_store import DurableWriteError
 
-        self._file_cache[str_path] = (content_hash, ccr_hash, line_count, token_estimate)
+        try:
+            ccr_hash = store.store(
+                original=content,
+                compressed=f"[File: {path.name}, {line_count} lines]",
+                original_tokens=token_estimate,
+                compressed_tokens=5,
+                tool_name="furl_read",
+                ttl=MCP_SESSION_TTL,
+                require_durable=True,
+            )
+        except DurableWriteError as exc:
+            logger.warning("event=mcp_read_not_durable file=%s error=%s", path.name, exc)
+        else:
+            self._file_cache[str_path] = (content_hash, ccr_hash, line_count, token_estimate)
 
         # Return full content with line numbers (like Claude Code's Read tool)
         numbered_lines = []
