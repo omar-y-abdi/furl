@@ -5,6 +5,40 @@ All notable changes to Furl will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.0](https://github.com/omar-y-abdi/furl/compare/v0.27.0...v1.0.0) (2026-07-10)
+
+
+### Features
+
+* CCR spill tier — retention past eviction (Q10, default off) ([#30](https://github.com/omar-y-abdi/furl/issues/30)) ([e29dcc4](https://github.com/omar-y-abdi/furl/commit/e29dcc43dc3c38be775caccc0fe3b80ca4470ad2))
+* **ccr:** sliceable retrieve — row-select by value/range for offloaded arrays ([84f0775](https://github.com/omar-y-abdi/furl/commit/84f077546cdf51feb4a62519d4b817f12cd26a85))
+* **cli:** furl retrieve slice flags matching the sliceable library retrieve ([6da8796](https://github.com/omar-y-abdi/furl/commit/6da879624218e6042ab18ddfa98e23ccebb07d0e))
+* Furl Claude Code plugin — MCP + compression hook + skill (C7-P7) ([#29](https://github.com/omar-y-abdi/furl/issues/29)) ([866d8ee](https://github.com/omar-y-abdi/furl/commit/866d8ee206f918f57ac8f22b6a9e99620cbd918d))
+* harness big-bets, perf, and signal-aware CCR offload preview ([4c4e22e](https://github.com/omar-y-abdi/furl/commit/4c4e22e8ad2d9732726830edb5c118594a85f273))
+* harness expansion — quick wins (Q1-Q8) ([#36](https://github.com/omar-y-abdi/furl/issues/36)) ([179380f](https://github.com/omar-y-abdi/furl/commit/179380ffbd165725341ed16cdd5c6a7137bfb00e))
+* **plugin:** make Furl installable as a Claude Code plugin end-to-end ([#32](https://github.com/omar-y-abdi/furl/issues/32)) ([5d06a6d](https://github.com/omar-y-abdi/furl/commit/5d06a6da0aaff9fa17e2893f1e584987790666e5))
+* **plugin:** zero-step install — 2 slash commands, uv self-bootstrap, lean README ([#33](https://github.com/omar-y-abdi/furl/issues/33)) ([baa988c](https://github.com/omar-y-abdi/furl/commit/baa988ce762bc4b22acc6fa4e7e9442c7336ed51))
+* **router:** HTML main-content extraction (B1) ([#37](https://github.com/omar-y-abdi/furl/issues/37)) ([8759e32](https://github.com/omar-y-abdi/furl/commit/8759e326ed0eecd8d5e2783a67c910d2b214b728))
+* **security:** B3 core — fail-closed redactor + purge ([fefd4ab](https://github.com/omar-y-abdi/furl/commit/fefd4ab1451e782dd9ceaf63cf2a279a90bdbec2))
+
+
+### Bug Fixes
+
+* **ccr:** close MATRIX-01/02/03 — bracket-pointer re-backing, ccr_hashes totality, deterministic loud decline ([#52](https://github.com/omar-y-abdi/furl/issues/52)) ([58a0aa9](https://github.com/omar-y-abdi/furl/commit/58a0aa96e7b471abff50f270efa2b2ae731ffd21))
+* **store:** close audit ship-blockers — ReDoS, silent-loss durability veto, collision phantom, write-path perf ([#54](https://github.com/omar-y-abdi/furl/issues/54)) ([071e675](https://github.com/omar-y-abdi/furl/commit/071e675f98e136c2d3401c92cfb2c628691eed50))
+* **store:** per-project isolation by default — close cross-project content leak (audit [#4](https://github.com/omar-y-abdi/furl/issues/4)) ([#55](https://github.com/omar-y-abdi/furl/issues/55)) ([7ef6ac6](https://github.com/omar-y-abdi/furl/commit/7ef6ac6e9dcb5ea1bf11c1448d5b627149562556))
+
+
+### Dependencies
+
+* bump criterion from 0.5.1 to 0.8.2 ([#12](https://github.com/omar-y-abdi/furl/issues/12)) ([bfe8dc5](https://github.com/omar-y-abdi/furl/commit/bfe8dc574190b4cfa1852f2cf0c1e0f90f1951a1))
+
+
+### Code Refactoring
+
+* extract ContentRouter.apply() into router_engine (byte-identical) ([#31](https://github.com/omar-y-abdi/furl/issues/31)) ([8f04f73](https://github.com/omar-y-abdi/furl/commit/8f04f73dffe3fd3d8727a67fd5d4add29f27e801))
+* repo-wide dead-code excision and LoC reduction (multi-agent audit) ([#46](https://github.com/omar-y-abdi/furl/issues/46)) ([7d3976f](https://github.com/omar-y-abdi/furl/commit/7d3976f05a5ed40b4483674399340f99c1262a10))
+
 ## [0.27.0](https://github.com/omar-y-abdi/furl/compare/v0.26.0...v0.27.0) (2026-07-03)
 
 
