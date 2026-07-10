@@ -30,7 +30,7 @@ result = compress(messages, model="claude-sonnet-4")
 
 ```bash
 # Or run the MCP server for Claude Code / Cursor / any MCP host
-python3 -m furl_ctx.ccr.mcp_server      # exposes furl_compress / _retrieve / _stats
+python3 -m furl_ctx.ccr.mcp_server      # exposes furl_compress / _retrieve / _stats / _purge / _search / _list
 ```
 
 | Your setup     | Hook in with                                  |
@@ -199,7 +199,9 @@ psql -c 'table events' | furl compress        # FILE, or stdin, -> compressed st
 furl compress big.json --json                 # compressed text + token stats as JSON
 furl retrieve <hash>                          # original content for a <<ccr:HASH>> marker
 furl purge <hash>                             # delete a stored original by hash (0 if removed, 1 if absent)
+furl eval <corpus> --recall                   # corpus compression ratio + needle-recall gate
 furl doctor                                   # check the install: native core, tokenizer, store
+furl mcp                                      # run the stdio MCP server for AI coding tools
 ```
 
 ## Configuration (environment variables)

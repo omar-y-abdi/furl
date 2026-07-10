@@ -211,6 +211,13 @@ def _cmd_eval(args: argparse.Namespace) -> int:
     """
     from furl_ctx import compress
 
+    if not os.path.exists(args.corpus):
+        sys.stderr.write(f"furl: corpus not found: {args.corpus}\n")
+        return 1
+    if not os.access(args.corpus, os.R_OK):
+        sys.stderr.write(f"furl: corpus not readable: {args.corpus}\n")
+        return 1
+
     files = _corpus_files(args.corpus)
     if not files:
         sys.stderr.write(f"furl: no files found in corpus {args.corpus}\n")
