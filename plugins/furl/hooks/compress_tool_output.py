@@ -194,41 +194,51 @@ def _mode_kwargs() -> dict[str, object]:
     return {}
 
 
-def _compress_text(text: str) -> str | None:
+def _compress_text(text: str) -> tuple[str | None, str | None]:
     """Compress one tool-output blob via Furl's public pipeline.
 
-    Returns the compressed text only when compression genuinely helped
-    (no fail-open error AND the result is shorter). Returns ``None`` otherwise,
-    signalling "leave the original alone". Never raises.
+    Returns ``(compressed, None)`` only when compression genuinely helped
+    (no fail-open error AND the result is shorter). Returns ``(None, reason)``
+    otherwise, signalling "leave the original alone" — where ``reason`` is a
+    distinct diagnostic label for the FURL_HOOK_VERBOSE no-op line, so an
+    import failure is never mislabeled as "no savings":
+
+      * ``import-failed``  -> furl_ctx is not importable in the hook's env.
+      * ``compress-error`` -> compress() raised (caught here; fail-open).
+      * ``engine-error``   -> compress() reported an internal fail-open error.
+      * ``empty-result``   -> engine returned no messages / non-text content.
+      * ``no-savings``     -> compression succeeded but did not shrink the text.
+
+    Never raises.
     """
     try:
         from furl_ctx import compress
     except Exception:
-        return None
+        return None, "import-failed"
 
     model = os.environ.get(_MODEL_ENV, "").strip() or _DEFAULT_MODEL
     try:
         result = compress([{"role": "tool", "content": text}], model=model, **_mode_kwargs())
     except Exception:
-        return None
+        return None, "compress-error"
 
     # compress() is fail-open: on internal failure it returns the ORIGINAL
     # messages with ``error`` set. Treat that as "do nothing".
     if getattr(result, "error", None):
-        return None
+        return None, "engine-error"
 
     messages = getattr(result, "messages", None)
     if not messages:
-        return None
+        return None, "empty-result"
 
     compressed = messages[0].get("content")
     if not isinstance(compressed, str):
-        return None
+        return None, "empty-result"
 
     # Only replace when we actually saved characters.
     if len(compressed) >= len(text):
-        return None
-    return compressed
+        return None, "no-savings"
+    return compressed, None
 
 
 def _passthrough(reason: str | None = None) -> NoReturn:
@@ -296,10 +306,10 @@ def main() -> None:
     if len(text) < _min_chars():
         _passthrough("below-min-chars")
 
-    # --- compress (returns None unless it genuinely helped) ---
-    compressed = _compress_text(text)
+    # --- compress (returns None + a distinct reason unless it genuinely helped) ---
+    compressed, compress_fail_reason = _compress_text(text)
     if compressed is None:
-        _passthrough("no-savings")
+        _passthrough(compress_fail_reason or "no-savings")
 
     # --- optional one-line stderr annotation (FURL_HOOK_VERBOSE) ---
     if _flag_enabled(os.environ.get(_VERBOSE_ENV)):

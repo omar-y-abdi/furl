@@ -234,6 +234,25 @@ def test_verbose_reports_disabled() -> None:
     assert "no-op (disabled)" in proc.stderr
 
 
+def test_verbose_reports_import_failed_not_no_savings(tmp_path) -> None:
+    """Compress-stage failures carry distinct labels: an unimportable furl_ctx must
+    surface as ``import-failed``, never the umbrella ``no-savings`` (F1)."""
+    poison = tmp_path / "furl_ctx"
+    poison.mkdir()
+    (poison / "__init__.py").write_text("raise ImportError('poisoned for test')\n")
+    proc = _run_hook(
+        {
+            "tool_name": "Bash",
+            "tool_response": {"stdout": "x" * 5000, "stderr": "", "interrupted": False},
+        },
+        # PYTHONPATH precedes site-packages, so the poisoned package wins the import.
+        {"FURL_HOOK_VERBOSE": "1", "PYTHONPATH": str(tmp_path)},
+    )
+    assert proc.returncode == 0 and proc.stdout == ""
+    assert "no-op (import-failed)" in proc.stderr
+    assert "no-savings" not in proc.stderr
+
+
 def test_quiet_by_default_no_noop_line() -> None:
     """Without FURL_HOOK_VERBOSE the hook stays silent on a no-op (stderr empty)."""
     proc = _run_hook({"tool_name": "Bash", "tool_response": {"foo": "bar"}}, {})
