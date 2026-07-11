@@ -84,6 +84,22 @@ A human maintainer reviews every dep change. PRs that add or bump a package must
 
 **Review:** CI green, one maintainer review, coverage held/improved.
 
+## Releasing / version bumps
+
+Two versions ship independently, and each has files that must move together — the guards
+in `tests/test_plugin_version_pins.py` fail CI (including the release-please release PR)
+until they agree:
+
+- **Library version** (`pyproject.toml` `project.version`): release-please bumps it on the
+  release PR. release-please has **no updater that can rewrite a version embedded inside a
+  shell command**, so hand-sync the `furl-ctx[mcp]==X.Y.Z` pins in
+  `plugins/furl/hooks/hooks.json` and `plugins/furl/.mcp.json` to the new version on that
+  same PR before merging.
+- **Plugin version** (`plugins/furl/.claude-plugin/plugin.json` `version`): bump it together
+  with both `version` fields in `.claude-plugin/marketplace.json`, the `version:` in
+  `plugins/furl/skills/furl/SKILL.md` frontmatter, and the baked `furl <version> active`
+  string in the SessionStart hook of `plugins/furl/hooks/hooks.json`.
+
 ## Development setup
 
 ```bash

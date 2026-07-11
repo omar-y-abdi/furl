@@ -47,7 +47,7 @@ through `uv`, which fetches Furl on first use — no prior install:
 ```json
 { "mcpServers": { "furl": {
   "command": "sh",
-  "args": ["-lc", "exec uv run --no-project --with 'furl-ctx[mcp]' python -m furl_ctx.ccr.mcp_server"],
+  "args": ["-lc", "exec uv run --no-project --with 'furl-ctx[mcp]==1.0.2' python -m furl_ctx.ccr.mcp_server"],
   "env": { "FURL_CCR_BACKEND": "sqlite", "FURL_CCR_TTL_SECONDS": "86400" }
 }}}
 ```
@@ -58,7 +58,9 @@ failure mode — install [`uv`](https://docs.astral.sh/uv/) and it resolves). `e
 hands stdio and signals straight to the server. `FURL_CCR_BACKEND=sqlite` makes the
 CCR store durable at `~/.furl/ccr.sqlite3`, so originals survive across processes.
 `FURL_CCR_TTL_SECONDS=86400` keeps each offloaded original retrievable for 24 hours
-(the plugin default); raise or lower it to widen or shrink the retention window.
+(the plugin default); raise or lower it to widen or shrink the retention window. The
+`furl-ctx[mcp]==1.0.2` pin is deterministic — every launch resolves the same wheel instead
+of whatever `uv`'s cache last held; upgrades ship through plugin updates, which bump the pin.
 
 ### Compression hook (`hooks/hooks.json` + `hooks/compress_tool_output.py`)
 
@@ -88,6 +90,7 @@ output), so a compression problem can never break your tool call.
 | `FURL_HOOK_EXCLUDE_TOOLS` | (none) | Comma-separated tools never to compress — exact or `mcp__db__*` globs. |
 | `FURL_HOOK_MODE` | `normal` | `aggressive` compresses more (code + smaller outputs). |
 | `FURL_HOOK_VERBOSE` | off | `1` prints a one-line per-compression savings summary to stderr. |
+| `FURL_STATUS_LINE` | on | `0` silences the one-line SessionStart status signal. Export it in the environment Claude Code launches from — the status hook runs `sh -c`, which does not source login profiles. |
 
 The full `FURL_*` reference is in [`LIBRARY.md`](../../LIBRARY.md) → "Configuration".
 

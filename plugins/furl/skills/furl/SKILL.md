@@ -1,7 +1,7 @@
 ---
 name: furl
 description: How the Furl context-compression plugin works — the furl_compress / furl_retrieve / furl_stats / furl_purge / furl_search / furl_list MCP tools, the PostToolUse hook that shrinks large tool outputs, the <<ccr:HASH>> retrieval flow, and the FURL_* environment knobs to tune or disable it. Use when the user asks what Furl is doing, why a tool output looks compressed or contains <<ccr:...>> markers, how to retrieve original content, how to tune compression thresholds, or how to turn the hook off.
-version: 1.0.3
+version: 1.0.4
 ---
 
 # Furl — context compression for Claude Code
@@ -107,6 +107,7 @@ Set these in the plugin's `hooks/hooks.json` / `.mcp.json` env, or your shell:
 | `FURL_HOOK_EXCLUDE_TOOLS` | (none) | Comma-separated tool names never to compress — exact (`Bash`) or fnmatch globs (`mcp__db__*`). Furl's own tools are always excluded. |
 | `FURL_HOOK_MODE` | `normal` | `aggressive` also compresses code in the blob and squeezes smaller outputs; `normal` keeps the default behavior. |
 | `FURL_HOOK_VERBOSE` | off | `1`/`true` prints a one-line savings summary per compression to stderr (`furl: Bash 12.4 KB -> 0.3 KB  -97%`). |
+| `FURL_STATUS_LINE` | on | Set `0` to silence the one-line `furl … active` SessionStart status signal. Must be exported in the environment Claude Code launches from — the status hook runs `sh -c`, which does not source login profiles. |
 | `FURL_CCR_BACKEND` | `sqlite` (set by the plugin) | CCR store backend. Must match between the hook and the `furl` server for retrieval to work. |
 | `FURL_CCR_TTL_SECONDS` | `86400` = 24h (set by the plugin) | How long offloaded originals stay retrievable before they expire. Lower to reclaim disk sooner; raise for a longer retrieval window. |
 | `FURL_CCR_PROJECT_DIR` | auto, per project (set by the plugin) | Scopes the CCR store to the current project so one machine-global `~/.furl` store never surfaces or evicts another project's entries. Derived automatically from the project root; set to `""` to share one store across all projects — this is also how you read a pre-1.0 global store after upgrading. |
@@ -122,7 +123,9 @@ is in [`LIBRARY.md`](../../../../LIBRARY.md) → "Configuration".
 ## Prerequisite
 
 Both the hook and the MCP server launch through [`uv`](https://docs.astral.sh/uv/)
-(`uv run --with "furl-ctx[mcp]" …`), which fetches Furl from PyPI on first use — no
-`pip install`, no Rust toolchain. The
+(`uv run --with "furl-ctx[mcp]==1.0.2" …`), which fetches Furl from PyPI on first use — no
+`pip install`, no Rust toolchain. The version is pinned so every launch resolves the same
+wheel deterministically instead of whatever `uv`'s cache last held; upgrades arrive through
+plugin updates, which bump the pin. The
 only requirement is `uv` on the PATH. If `uv` is missing, the MCP server won't start
 and the hook fails open (passes output through unchanged).
