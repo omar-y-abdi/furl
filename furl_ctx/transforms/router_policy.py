@@ -21,6 +21,7 @@ importing it.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from enum import Enum
 from typing import Protocol
 
@@ -137,3 +138,46 @@ def adaptive_min_ratio(config: RatioPolicyConfig, context_pressure: float) -> fl
     aggressive: float = config.min_ratio_aggressive
     min_ratio = relaxed + (aggressive - relaxed) * context_pressure
     return max(relaxed, min(aggressive, min_ratio))
+
+
+# Route-count lanes that explain an all-passthrough router result, paired with
+# the machine-readable reason each contributes. Order is the deterministic
+# tie-break ``noop_transform`` applies when several lanes are non-zero across a
+# multi-message batch: the dominant (highest-count) lane wins; ties fall to this
+# declaration order. Protection lanes (excluded_tool / user_msg / … ) are absent
+# by construction — they each book a ``router:protected:*`` transform, so a
+# protected message is never a no-op. Cache bookkeeping (cache_hit / cache_miss)
+# is absent too: it records HOW a lane resolved, not WHY nothing shipped.
+_NOOP_REASON_BY_COUNTER: tuple[tuple[str, str], ...] = (
+    ("ratio_too_high", "no_savings"),
+    ("small", "below_min_tokens"),
+    ("net_mutation_gate", "net_mutation_gate"),
+    ("non_string", "non_string"),
+    ("already_compressed", "already_compressed"),
+)
+
+
+def noop_transform(route_counts: Mapping[str, int]) -> str:
+    """The self-explaining ``router:noop:{reason}`` transform label.
+
+    ``run_router_passes`` books a router no-op only when NO transform —
+    compression OR protection — fired for any message. ``route_counts`` still
+    records WHY every message shipped through untouched (the lane each hit);
+    collapse it to the single dominant reason so ``transforms_applied`` explains
+    a 0% result instead of a bare, silent ``router:noop`` (the evaluator saw the
+    bare form and read the tool as broken).
+
+    The ``router:noop`` PREFIX is preserved, so ``summarize_routing_markers``
+    and every ``startswith("router:")`` consumer stay byte-unaffected. Total: an
+    all-zero or unrecognised ``route_counts`` (a fully-frozen prefix, empty
+    input, or content-block messages that shipped every block verbatim) yields
+    ``router:noop:no_eligible_content``.
+    """
+    dominant = "no_eligible_content"
+    best = 0
+    for counter, reason in _NOOP_REASON_BY_COUNTER:
+        count = route_counts.get(counter, 0)
+        if count > best:
+            best = count
+            dominant = reason
+    return f"router:noop:{dominant}"
