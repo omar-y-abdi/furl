@@ -250,6 +250,7 @@ async def test_list_expires_in_reflects_short_ttl(server) -> None:
         (3600, "1h"),
         (3599, "59m"),
         (90, "1m"),
+        (60, "1m"),  # exact minute boundary
         (59, "59s"),
         (30, "30s"),
         (0, "0s"),

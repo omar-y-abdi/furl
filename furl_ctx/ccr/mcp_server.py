@@ -279,7 +279,7 @@ CSV_DECODE_LEGEND = (
     "Header `[N]{col:type,...}` = N rows; later lines give each row's non-constant columns as CSV. "
     "`<<ccr:HASH>>` = rows offloaded, not lost; furl_retrieve it first — never guess dropped data. "
     # 2) One worked micro-example: input line → compact row → read it back.
-    "Example: `[2]{lvl:string=INFO,ms:float%3}` + line `53` = {lvl:INFO, ms:0.053} — "
+    "Example: `[1]{lvl:string=INFO,ms:float%3}` + line `53` = {lvl:INFO, ms:0.053} — "
     "constant col re-attaches, float%3 = ×10^-3 (53 -> 0.053, not 53). "
     # 3) Compact grammar reference.
     "GRAMMAR: type=V constant V; int=B+S row i=B+S*i (0-based); float%k cell/10^k; "
