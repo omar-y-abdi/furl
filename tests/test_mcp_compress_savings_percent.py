@@ -13,6 +13,10 @@ Fix: derive savings_percent from the same source as tokens_saved
 (``max(0, input - output) / input``). Single-site change; the sibling stats
 sites already computed from tokens directly.
 
+Round 6 adds finding D: a zero-savings response must NAME its reason — the
+note carries the engine's raw ``transforms_applied`` strings verbatim, so a
+0% is never unexplained.
+
 Compression-neutral (metric/observability plane only).
 """
 
@@ -45,11 +49,19 @@ def _stub_server():
     )
 
 
-def _patch_compress(monkeypatch, *, tokens_before: int, tokens_after: int) -> None:
+def _patch_compress(
+    monkeypatch,
+    *,
+    tokens_before: int,
+    tokens_after: int,
+    transforms: list[str] | None = None,
+) -> None:
     """Force compress() to return a known CompressResult.
 
     compression_ratio is set to the SAVINGS fraction (its real semantics) so
     the test exercises the exact value the buggy formula mis-read.
+    ``transforms`` overrides the stubbed ``transforms_applied`` list (finding
+    D tests); ``None`` keeps the original stub value.
     """
     saved = tokens_before - tokens_after
     ratio = saved / tokens_before if tokens_before else 0.0
@@ -59,7 +71,7 @@ def _patch_compress(monkeypatch, *, tokens_before: int, tokens_after: int) -> No
         tokens_after=tokens_after,
         tokens_saved=saved,
         compression_ratio=ratio,
-        transforms_applied=["log_compressor"],
+        transforms_applied=transforms if transforms is not None else ["log_compressor"],
     )
     monkeypatch.setattr(compress_mod, "compress", lambda *a, **k: result)
 
@@ -94,3 +106,43 @@ def test_zero_savings_reports_zero(monkeypatch) -> None:
     out = FurlMCPServer._compress_content(_stub_server(), "x")
     assert out["tokens_saved"] == 0
     assert out["savings_percent"] == 0
+
+
+# ─── round-6 finding D: zero-savings responses name their reason ─────────────
+
+
+def test_zero_savings_note_names_the_raw_transforms(monkeypatch) -> None:
+    """A bare 0% reads as a malfunction. The response note must carry the
+    engine's own transforms_applied strings VERBATIM — no parsing or
+    rewriting (the router owns their taxonomy; a parallel branch is enriching
+    'router:noop' into 'router:noop:<reason>' and this surface must render
+    whatever arrives)."""
+    _patch_compress(
+        monkeypatch,
+        tokens_before=50,
+        tokens_after=50,
+        transforms=["router:noop:high-entropy"],
+    )
+    out = FurlMCPServer._compress_content(_stub_server(), "x")
+    assert out["savings_percent"] == 0
+    # The structured field carries the raw strings...
+    assert out["transforms"] == ["router:noop:high-entropy"]
+    # ...and the model-facing note names them too, verbatim.
+    assert "router:noop:high-entropy" in out["note"]
+
+
+def test_zero_savings_with_empty_transforms_reports_passthrough(monkeypatch) -> None:
+    # Totality: an empty transforms list still yields an explanation.
+    _patch_compress(monkeypatch, tokens_before=50, tokens_after=50, transforms=[])
+    out = FurlMCPServer._compress_content(_stub_server(), "x")
+    assert out["savings_percent"] == 0
+    assert out["transforms"] == []
+    assert "passthrough" in out["note"]
+
+
+def test_nonzero_savings_note_stays_clean(monkeypatch) -> None:
+    # The zero-savings explainer must not spam successful compressions.
+    _patch_compress(monkeypatch, tokens_before=100, tokens_after=30)
+    out = FurlMCPServer._compress_content(_stub_server(), "x")
+    assert out["savings_percent"] == 70.0
+    assert "No token savings" not in out["note"]

@@ -241,6 +241,48 @@ async def test_list_expires_in_reflects_short_ttl(server) -> None:
     assert env["entries"][0]["expires_in"] == "25m"
 
 
+# ─── furl_list: age + ttl beside expires_in (round-6 misread fix) ──────────
+
+
+async def test_list_entry_carries_humanized_age_and_ttl(server) -> None:
+    # A 30-min-old entry on the plugin's 24h TTL: age and ttl land beside
+    # expires_in so all three read together at a glance.
+    now = time.time()
+    _seed(server, "a" * 24, "body", created_at=now - 1800)
+    server._get_local_store()._backend.get("a" * 24).ttl = 86400
+    env = _envelope(await server._handle_list({}))
+    entry = env["entries"][0]
+    assert entry["age"] == "30m"
+    assert entry["ttl"] == "24h"
+    assert entry["expires_in"] == "23h"
+
+
+async def test_list_age_and_ttl_disambiguate_equal_expires_in(server) -> None:
+    """The round-6 misread: a nearly-fresh short-TTL entry and an old long-TTL
+    entry can show the SAME expires_in — pre-fix they were indistinguishable,
+    so a healthy 24h store read as if everything died in an hour. age + ttl
+    split the two cases at a glance."""
+    now = time.time()
+    # ~1 min old, 90-min TTL → expires_in "1h".
+    _seed(server, "f" * 24, "fresh short-ttl entry", created_at=now - 60)
+    server._get_local_store()._backend.get("f" * 24).ttl = 5400
+    # 22.5 h old, 24 h TTL → the SAME expires_in "1h".
+    _seed(server, "0" * 24, "old long-ttl entry", created_at=now - 81000)
+    server._get_local_store()._backend.get("0" * 24).ttl = 86400
+
+    env = _envelope(await server._handle_list({}))
+    by_hash = {e["hash"]: e for e in env["entries"]}
+    fresh, old = by_hash["f" * 24], by_hash["0" * 24]
+
+    # The ambiguity: identical time-left readings...
+    assert fresh["expires_in"] == old["expires_in"] == "1h"
+    # ...disambiguated by age and ttl.
+    assert fresh["age"] == "1m"
+    assert fresh["ttl"] == "1h"
+    assert old["age"] == "22h"
+    assert old["ttl"] == "24h"
+
+
 @pytest.mark.parametrize(
     "seconds, expected",
     [

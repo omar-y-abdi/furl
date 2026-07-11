@@ -338,8 +338,7 @@ def _mcp_session_ttl() -> int:
         ttl_seconds = int(raw_value)
     except ValueError:
         logger.warning(
-            "FURL_CCR_TTL_SECONDS must be a positive integer number of seconds, "
-            "got %r; using %s",
+            "FURL_CCR_TTL_SECONDS must be a positive integer number of seconds, got %r; using %s",
             raw_value,
             MCP_SESSION_TTL,
         )

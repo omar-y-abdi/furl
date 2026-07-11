@@ -230,10 +230,13 @@ furl mcp                                      # run the stdio MCP server for AI 
 ```
 
 Unlike the library default (in-memory), the `furl` CLI defaults its CCR store to the
-durable **sqlite** backend (`~/.furl/ccr.sqlite3`) so a hash from `furl compress` is
-retrievable by a later `furl retrieve` in a separate process; override with
-`FURL_CCR_BACKEND` (e.g. `=memory` for an ephemeral store) and retention with
-`FURL_CCR_TTL_SECONDS` (default 30 min).
+durable **sqlite** backend (the global `~/.furl/ccr.sqlite3`) so a hash from `furl
+compress` is retrievable by a later `furl retrieve` in a separate process; override
+with `FURL_CCR_BACKEND` (e.g. `=memory` for an ephemeral store) and retention with
+`FURL_CCR_TTL_SECONDS` (CLI default `86400` / 24 h, matching the Claude Code plugin's
+window; the bare library default is 30 min). Hashes minted inside Claude Code live in
+that project's PER-PROJECT store, not the global one — set
+`FURL_CCR_PROJECT_DIR=<project root>` to point the CLI at it.
 
 ## Configuration (environment variables)
 
@@ -242,7 +245,7 @@ Every live `FURL_*` knob. All are optional — the defaults are the shipped beha
 | Variable | Default | What it does |
 |----------|---------|--------------|
 | `FURL_WORKSPACE_DIR` | `~/.furl` | Workspace root: home of the durable CCR SQLite store and the shared session-stats file. Also the **security boundary for `furl_read`** — file reads are jailed to it (the jail alone defaults to the server's working directory when unset). |
-| `FURL_CCR_TTL_SECONDS` | `1800` (30 min) | CCR retention window in seconds — how long "reversible" lasts before an entry expires (an expired/evicted retrieval is a loud miss, never silent). Positive integer; invalid values warn and fall back. The Claude Code plugin overrides this to `86400` (24h) via its MCP env. |
+| `FURL_CCR_TTL_SECONDS` | `1800` (30 min) | CCR retention window in seconds — how long "reversible" lasts before an entry expires (an expired/evicted retrieval is a loud miss, never silent). Positive integer; invalid values warn and fall back. The Claude Code plugin overrides this to `86400` (24h) via its MCP env — honored by the MCP tools' own stores too — and the `furl` CLI defaults to `86400` as well; a bare MCP server launched without the env uses a 1 h session TTL for its writes. |
 | `FURL_CCR_BACKEND` | unset → in-memory for the library; the **`furl` CLI** and the **MCP server** default to `sqlite` | CCR store backend: `memory`, `sqlite`, or the name of a third-party `furl_ctx.ccr_backend` entry point. Split by surface: a plain `from furl_ctx import compress` stays in-memory (a library must not write disk unbidden), while the `furl` CLI (`cli.py`) and the plugin's MCP server opt into durable `sqlite` so their separate-process `compress`→`retrieve` composes. Explicitly selecting a backend that cannot be loaded **raises at startup** — no silent downgrade to memory. |
 | `FURL_CCR_BACKEND_OPTS` | unset (`{}`) | JSON object of keyword arguments passed to a third-party backend factory, e.g. `{"url": "..."}`. |
 | `FURL_CCR_SQLITE_PATH` | `<workspace>/ccr.sqlite3` | File path of the durable SQLite CCR store. |
