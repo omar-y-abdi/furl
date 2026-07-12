@@ -338,14 +338,18 @@ def _mcp_session_ttl() -> int:
         ttl_seconds = int(raw_value)
     except ValueError:
         logger.warning(
-            "FURL_CCR_TTL_SECONDS must be a positive integer number of seconds, got %r; using %s",
+            "FURL_CCR_TTL_SECONDS must be a positive integer number of seconds, got %r; "
+            "MCP-stored entries fall back to %s s (the library store resolver falls back "
+            "to its own 1800 s default separately, so hook/dropped-row entries diverge)",
             raw_value,
             MCP_SESSION_TTL,
         )
         return MCP_SESSION_TTL
     if ttl_seconds <= 0:
         logger.warning(
-            "FURL_CCR_TTL_SECONDS must be greater than 0, got %s; using %s",
+            "FURL_CCR_TTL_SECONDS must be greater than 0, got %s; MCP-stored entries fall "
+            "back to %s s (the library store resolver falls back to its own 1800 s default "
+            "separately, so hook/dropped-row entries diverge)",
             ttl_seconds,
             MCP_SESSION_TTL,
         )
@@ -815,7 +819,15 @@ class FurlMCPServer:
         window — and at the 3600 s fallback the MCP store stays at least as
         durable as the library default. The compress path still passes its
         own per-entry ``ttl`` at store time — the same ``_mcp_session_ttl()``
-        value, so wrapper hash and dropped rows stay in lockstep.
+        value, so ON THIS SINGLETON PATH wrapper hash and dropped rows stay
+        in lockstep by construction. Under an active NAMESPACE store (the
+        early return below) the dropped-row default is instead env-derived
+        at store construction (``_build_namespace_store``; library fallback
+        1800 s), so there the two surfaces are in lockstep only when
+        FURL_CCR_TTL_SECONDS is set AND valid — the plugin's shipped
+        configuration. Unset or invalid env leaves wrapper 3600 s vs
+        dropped rows 1800 s on the namespace path (pre-existing corner,
+        see ``_compress_content``).
 
         Backend (Engine P1-7): the MCP deployment defaults to the durable
         SQLite backend so originals survive a server restart and sub-agent
@@ -877,8 +889,11 @@ class FurlMCPServer:
         # into a session-long window. Under an active NAMESPACE store the
         # default is env-derived at construction instead (see
         # compression_store._build_namespace_store) — with
-        # FURL_CCR_TTL_SECONDS set, the plugin's shipped configuration, both
-        # surfaces carry the same env TTL there too.
+        # FURL_CCR_TTL_SECONDS set AND valid, the plugin's shipped
+        # configuration, both surfaces carry the same env TTL there too.
+        # Unset or INVALID env splits them on the namespace path (each
+        # resolver falls back separately: 3600 s here, 1800 s in the
+        # library) — pre-existing corner, see _get_local_store.
         store = self._get_local_store()
 
         # Section filtering (non-empty patterns) → run-by-run path. Delegated
@@ -974,11 +989,13 @@ class FurlMCPServer:
             f"Original stored with hash={hash_key}. "
             f"Use mcp__furl__{CCR_TOOL_NAME} to get full content later."
         )
-        if savings_pct == 0:
+        if tokens_saved == 0:
             # A bare "0%" reads as a malfunction. Name the engine's own
             # reason(s): the raw transforms_applied strings (e.g. a router
             # noop tag), rendered generically — their taxonomy belongs to
-            # the router, not to this handler.
+            # the router, not to this handler. Gated on tokens_saved, not
+            # the ROUNDED savings_pct: a real sub-0.05% saving displays as
+            # 0.0 but "No token savings" would be false for it.
             note += f" No token savings on this content — engine transforms: {strategy}."
 
         return {
@@ -1046,10 +1063,11 @@ class FurlMCPServer:
             f"protected lines passed through verbatim. Retrieve any run via "
             f"mcp__furl__{CCR_TOOL_NAME} with its hash."
         )
-        if savings_pct == 0:
+        if tokens_saved == 0:
             # Same zero-savings honesty as the single-unit path: name the
             # engine's raw per-run transform strings rather than shipping an
-            # unexplained 0%.
+            # unexplained 0%. Gated on tokens_saved, not the rounded
+            # savings_pct (see the single-unit path).
             strategy = ", ".join(transforms) if transforms else "passthrough"
             note += f" No token savings on this content — engine transforms: {strategy}."
 

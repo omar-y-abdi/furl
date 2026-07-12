@@ -54,7 +54,7 @@ That's it — this installs the compression hook, the MCP tools, and the skill. 
 - **MCP tools** — `furl_compress`, `furl_retrieve`, `furl_stats`, `furl_purge` (erase stored originals), `furl_search` (find by content substring), `furl_list` (list stored entries). A seventh tool, `furl_read`, exists but is off by default — enable with `FURL_MCP_READ=1` (see [LIBRARY.md](LIBRARY.md)).
 - **Skill** — explains the `<<ccr:HASH>>` retrieval flow and how to tune or disable it.
 
-Tuning, disabling (`FURL_HOOK_ENABLED=0`), and the full reference: [`plugins/furl/README.md`](plugins/furl/README.md). Retrieval TTL differs by surface: the library defaults to 30 minutes; this Claude Code plugin ships a 24 h window (`FURL_CCR_TTL_SECONDS=86400`) governing both the hook's offloads and the MCP tools' stores; the `furl` CLI defaults to the same 24 h. (A bare MCP server launched without that env keeps a 1 h session TTL.)
+Tuning, disabling (`FURL_HOOK_ENABLED=0`), and the full reference: [`plugins/furl/README.md`](plugins/furl/README.md). Retrieval TTL differs by surface: the library defaults to 30 minutes; this Claude Code plugin ships a 24 h window (`FURL_CCR_TTL_SECONDS=86400`) governing both the hook's offloads and the MCP tools' stores; the `furl` CLI defaults to the same 24 h. (A bare MCP server without a valid `FURL_CCR_TTL_SECONDS` keeps a 1 h session TTL for its tool-stored entries, while dropped-row originals embedded in compressed output follow the library's 30-minute default — the full 24 h window needs the env set, as the plugin ships it.)
 
 ## Proof
 

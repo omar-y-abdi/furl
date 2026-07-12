@@ -177,7 +177,9 @@ def _get_env_default_ttl_seconds() -> int:
         ttl_seconds = int(raw_value)
     except ValueError:
         logger.warning(
-            "%s must be a positive integer number of seconds, got %r; using %s",
+            "%s must be a positive integer number of seconds, got %r; using %s "
+            "(library-store fallback; the MCP server's own writes fall back to 3600 s "
+            "separately — see furl_ctx.ccr.mcp_server._mcp_session_ttl)",
             CCR_TTL_SECONDS_ENV,
             raw_value,
             DEFAULT_CCR_TTL_SECONDS,
@@ -186,7 +188,9 @@ def _get_env_default_ttl_seconds() -> int:
 
     if ttl_seconds <= 0:
         logger.warning(
-            "%s must be greater than 0, got %s; using %s",
+            "%s must be greater than 0, got %s; using %s "
+            "(library-store fallback; the MCP server's own writes fall back to 3600 s "
+            "separately — see furl_ctx.ccr.mcp_server._mcp_session_ttl)",
             CCR_TTL_SECONDS_ENV,
             ttl_seconds,
             DEFAULT_CCR_TTL_SECONDS,

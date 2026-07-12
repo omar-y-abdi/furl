@@ -146,3 +146,16 @@ def test_nonzero_savings_note_stays_clean(monkeypatch) -> None:
     out = FurlMCPServer._compress_content(_stub_server(), "x")
     assert out["savings_percent"] == 70.0
     assert "No token savings" not in out["note"]
+
+
+def test_tiny_real_savings_not_mislabeled_as_zero(monkeypatch) -> None:
+    """F5 boundary: 1 token saved on a huge input rounds to a DISPLAYED
+    savings_percent of 0.0, but the note must not claim "No token savings" —
+    that statement would be false (the gate is tokens_saved == 0, not the
+    rounded percentage). The transforms field is still rendered."""
+    _patch_compress(monkeypatch, tokens_before=10000, tokens_after=9999)
+    out = FurlMCPServer._compress_content(_stub_server(), "x")
+    assert out["tokens_saved"] == 1
+    assert out["savings_percent"] == 0.0  # rounded display value
+    assert "No token savings" not in out["note"]
+    assert out["transforms"] == ["log_compressor"]  # still present in the response
