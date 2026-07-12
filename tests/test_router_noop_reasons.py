@@ -6,8 +6,9 @@ Two properties are pinned:
 
 1. **No silent no-op.** Whenever the router ships everything through untouched,
    ``transforms_applied`` carries a machine-readable reason suffix (never the
-   bare ``router:noop``), drawn from a fixed vocabulary that maps 1:1 to the
-   route-count lane that fired.
+   bare ``router:noop``), drawn from a fixed vocabulary derived from the
+   route-count lanes that fired (the transform-less shape/pinning lanes fold
+   into the umbrella ``no_eligible_content``).
 2. **Structured content that CAN compress still does.** A realistic KEY=value
    env dump and a 60x-repeated line are reduced (via TEXT / SmartCrusher), so
    the reason work did not silence real compression. Only genuinely
@@ -137,6 +138,10 @@ class TestNoopTransformPure:
             ({"net_mutation_gate": 1}, "router:noop:net_mutation_gate"),
             ({"non_string": 1}, "router:noop:non_string"),
             ({"already_compressed": 1}, "router:noop:already_compressed"),
+            # shape/pinning lanes booked without a transform → umbrella reason
+            ({"content_blocks": 1}, "router:noop:no_eligible_content"),
+            ({"nested_blocks": 1}, "router:noop:no_eligible_content"),
+            ({"cache_control_protected": 1}, "router:noop:no_eligible_content"),
             ({}, "router:noop:no_eligible_content"),
             # all-zero pre-seeded lanes (a fully-frozen prefix) → catch-all
             ({"small": 0, "ratio_too_high": 0}, "router:noop:no_eligible_content"),
@@ -156,6 +161,20 @@ class TestNoopTransformPure:
         # 3 small vs 1 ratio_too_high → the small lane dominates.
         assert noop_transform({"small": 3, "ratio_too_high": 1}) == "router:noop:below_min_tokens"
         assert noop_transform({"small": 1, "ratio_too_high": 3}) == "router:noop:no_savings"
+
+    def test_shape_lane_dominance_is_over_all_noop_lanes(self) -> None:
+        # Review F1's failing scenario: 10 content-block messages shipped
+        # verbatim vs 1 small string message. The shape lane dominates, so the
+        # umbrella reason wins — NOT below_min_tokens, which described only
+        # 1 of 11 messages.
+        assert (
+            noop_transform({"content_blocks": 10, "small": 1}) == "router:noop:no_eligible_content"
+        )
+
+    def test_granular_lane_beats_shape_lane_on_ties(self) -> None:
+        # The umbrella is vacuously true of every no-op; on equal counts the
+        # specific gate that stopped content is the better explanation.
+        assert noop_transform({"content_blocks": 3, "small": 3}) == "router:noop:below_min_tokens"
 
     def test_suffix_is_always_known_vocabulary(self) -> None:
         for rc in (
@@ -185,6 +204,36 @@ class TestNoBareNoopEndToEnd:
         # Honest 0% — and no lossy deletion snuck in (bytes preserved).
         assert res.tokens_after == res.tokens_before
         assert res.messages[0]["content"] == content
+
+    def test_block_message_batch_reasoned_no_eligible_content(self) -> None:
+        # Review F1 end-to-end: assistant text-block messages are protected by
+        # default in the block walk, so each books ONLY the content_blocks
+        # shape lane; one small tool string books small=1. The umbrella reason
+        # must win over below_min_tokens — and the no-op stays byte-neutral.
+        block_messages = [
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": (
+                            f"Design note {i}: this module owns its own retry "
+                            "budget and reports upstream saturation through the "
+                            "shared telemetry channel, so the scheduler can "
+                            "rebalance work before queue depth breaches the "
+                            "alerting threshold operations monitors."
+                        ),
+                    }
+                ],
+            }
+            for i in range(10)
+        ]
+        messages = block_messages + [{"role": "tool", "content": "All checks passed."}]
+        res = compress(messages, model=_MODEL)
+        assert not res.error
+        assert res.transforms_applied == ["router:noop:no_eligible_content"]
+        assert res.messages == messages
+        assert res.tokens_after == res.tokens_before
 
     def test_changelog_head_never_bare_noop(self) -> None:
         # The repo CHANGELOG head is prose+headers the extractor can't shrink;

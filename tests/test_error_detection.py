@@ -121,7 +121,10 @@ class TestUnstructuredErrorOutputBoundary:
         # ``test_valueerror_substring_is_load_bearing``). The cost is bounded —
         # protection ships the bytes verbatim (no data loss) and now surfaces as
         # an EXPLAINED ``router:protected:error_output`` transform, not a silent
-        # 0%. If a structural distinguisher is ever added, this pin flips.
+        # 0%. This pin is ONE-directional: it fails only when the FP is fixed
+        # (a structural distinguisher lands), forcing that fix to be a
+        # deliberate flip to a negative assertion — it does NOT guard against
+        # new false positives elsewhere.
         changelog_prose = (
             "## v1.2.0\n"
             "- Improved error handling for upstream timeouts\n"
