@@ -75,6 +75,11 @@ Trade-offs:
 - **Unterminated heredoc** (malformed input): bare bash is lenient, but the wrapped
   command fails with a shell syntax error (exit 2, empty output). No wrapper text or
   tempfile is leaked.
+- **Trailing odd backslashes** (pathological input): the command still runs with its
+  exact exit code, but the wrapper's line continuation means a literal trailing
+  backslash is not preserved in stdout — and bare-bash behavior itself differs between
+  versions here (GNU bash 5 `-c` keeps the dangling backslash literal; macOS bash 3.2
+  drops it).
 - **Permission allowlists:** the rewritten command no longer matches a user's
   `Bash(...)` allowlist entries, so permission prompts can differ with the pipe on.
 - **Cold-start cost:** with the pipe and the PostToolUse hook both enabled, one Bash

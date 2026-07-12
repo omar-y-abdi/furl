@@ -248,27 +248,37 @@ def _run_forced_fallback(rewritten: str, tmp_path) -> subprocess.CompletedProces
 
 def test_odd_trailing_backslashes_survive_both_branches(tmp_path) -> None:
     """Review R1 pin: a command ending in an ODD number of trailing backslashes
-    line-continues onto the next wrapper line. Pre-fix, the else branch
+    line-continues onto the next wrapper line. Pre-R1, the else branch
     interpolated the ORIGINAL bare, so the continuation glued into ``fi`` →
     unterminated ``if`` → the WHOLE rewritten script was a parse error (rc 2,
     empty output — the command never ran in EITHER branch, both die at parse).
-    The else branch now wraps the original in a subshell exactly like the then
+    The else branch wraps the original in a subshell exactly like the then
     branch: the ``)`` on its own line absorbs the continuation, and the subshell
-    is the branch's last statement so the exit code still flows exactly."""
-    for n in (1, 3):
+    is the branch's last statement so the exit code still flows exactly.
+
+    PLATFORM NOTE — do NOT "fix" this back to a bare-bash stdout comparison:
+    ``bash -c 'echo foo \\'`` (odd trailing backslash at END OF INPUT) is
+    bash-version-dependent — GNU bash 5 (Linux/CI) keeps the dangling backslash
+    literal (``foo \\``), macOS bash 3.2 drops it (``foo``) — so a bare stdout
+    reference fails on one platform or the other. The WRAPPED result is
+    deterministic on every version because the wrapper structurally eliminates
+    the ambiguous backslash-at-EOF: the interpolated original is always followed
+    by a newline and the ``)`` line, making the odd trailing backslash an
+    unambiguous POSIX line continuation. n=1 → ``foo\\n``; n=3 → the leading
+    backslash PAIR is an ordinary escape (one literal backslash) and only the
+    third continues, → ``foo \\\\n``."""
+    wrapped_expected = {1: "foo\n", 3: "foo \\\n"}
+    for n, expected_stdout in wrapped_expected.items():
         original = "echo foo " + "\\" * n
-        expected = _bare_bash(original)
         rewritten = _rewrite(original, str(tmp_path))
         # Normal branch (tempfile fine; stub compressor = cat → raw passthrough).
         normal = _run(_with_stub_compressor(rewritten, "cat"))
-        assert normal.returncode == expected.returncode, f"n={n}: normal-branch rc"
-        assert normal.stdout == expected.stdout, f"n={n}: normal-branch stdout"
-        # Forced-fallback branch (tempfile unavailable → unwrapped-in-subshell).
+        assert normal.returncode == 0, f"n={n}: normal rc (stderr: {normal.stderr!r})"
+        assert normal.stdout == expected_stdout, f"n={n}: normal-branch stdout"
+        # Forced-fallback branch (tempfile unavailable → subshell-wrapped original).
         fallback = _run_forced_fallback(rewritten, tmp_path)
-        assert fallback.returncode == expected.returncode, (
-            f"n={n}: fallback rc (stderr: {fallback.stderr!r})"
-        )
-        assert fallback.stdout == expected.stdout, f"n={n}: fallback stdout"
+        assert fallback.returncode == 0, f"n={n}: fallback rc (stderr: {fallback.stderr!r})"
+        assert fallback.stdout == expected_stdout, f"n={n}: fallback stdout"
 
 
 def test_even_trailing_backslashes_stay_correct(tmp_path) -> None:
