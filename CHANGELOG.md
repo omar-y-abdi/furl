@@ -5,6 +5,14 @@ All notable changes to Furl will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.5](https://github.com/omar-y-abdi/furl/compare/v1.0.4...v1.0.5) (2026-07-12)
+
+
+### Bug Fixes
+
+* contention-robust durable writes + honest durability status ([#75](https://github.com/omar-y-abdi/furl/issues/75)) ([47e58af](https://github.com/omar-y-abdi/furl/commit/47e58af6b3143695d8e2dfa22b1d0886716243f5))
+* llms.txt anchor sync + CI guard, version-relation clarity, make test, prose-pin guard ([#74](https://github.com/omar-y-abdi/furl/issues/74)) ([9543da3](https://github.com/omar-y-abdi/furl/commit/9543da36d2733e73c2eb5937dd8c1ba60cbbd68d))
+
 ## [1.0.4](https://github.com/omar-y-abdi/furl/compare/v1.0.3...v1.0.4) (2026-07-12)
 
 
