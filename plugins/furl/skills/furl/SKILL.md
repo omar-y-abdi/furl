@@ -32,7 +32,11 @@ your context still shows raw tool output, the harness is dropping the replacemen
 compresses a `Bash` command's stdout at the source (so the tool result *is* the
 compressed form, original retrievable via `furl_retrieve`) — it doesn't use
 `updatedToolOutput`, so it works today. Bash-only; the rewrite is transcript-visible
-(a `# furl-pipe` comment); exit code preserved, stderr untouched, fail-open. Default off.
+(a `# furl-pipe` comment); exit code preserved exactly; stderr is not captured and flows
+live, but stderr/stdout interleaving is not preserved (all stderr precedes the
+compressed stdout; `2>&1` merges); fail-open (worst case the command runs unwrapped,
+uncompressed). Default off. Known limitations (redaction gaps on fail-open paths,
+`Bash(...)` allowlist mismatch, heredoc edge): see the plugin README.
 
 ## The MCP tools
 

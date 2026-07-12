@@ -319,13 +319,19 @@ through the durable SQLite backend.
 truthy, a **PreToolUse** hook rewrites a `Bash` command so its stdout is piped through the
 Furl compressor **before** it becomes the tool result — so the model-visible output *is*
 the compressed form, with the original stored under a `<<ccr:HASH>>` marker in the same
-per-project store (same TTL and redaction as the PostToolUse path). It does not use
+per-project store (same TTL as the PostToolUse path; `FURL_REDACT_PATTERNS` redaction
+applies on the normal path but **not** to binary/undecodable output or when the engine
+cannot load — see the plugin README's "Known limitations"). It does not use
 `updatedToolOutput`, so it is unaffected by #68951. Trade-offs: **Bash-only**; the command
 mutation is **visible in the transcript** (a `# furl-pipe (FURL_PRETOOL_PIPE=1)` comment,
-never a silent substitution); the original command's **exit code is preserved exactly**,
-its **stderr passes through untouched**, small outputs pass through raw, and it is
-**fail-open** (a compressor that cannot start falls back to the raw captured output — never
-a broken command). Default off is a byte-identical no-op.
+never a silent substitution); the original command's **exit code is preserved exactly**;
+its **stderr is not captured and flows live** — but stdout is buffered for compression, so
+stderr/stdout **interleaving is not preserved** (in a merged view all stderr precedes the
+possibly-compressed stdout; `cmd 2>&1` merges both into the compressed stream); small
+outputs pass through raw; and it is **fail-open** (a compressor that cannot start falls
+back to the raw captured output, and a tempfile that cannot be created means the original
+command runs unwrapped, uncompressed — never a broken command). Default off is a
+byte-identical no-op.
 
 ## CLI
 

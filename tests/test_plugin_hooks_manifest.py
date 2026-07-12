@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -63,10 +64,13 @@ _EXPECTED_COMMAND = (
 
 # The opt-in PreToolUse pipe hook (default OFF). The command is SHELL-GATED on
 # FURL_PRETOOL_PIPE so the default-off path never spends a ``uv`` resolve — only a
-# truthy flag launches the rewrite script. Bash-only. Any edit here must be
-# deliberate.
+# truthy flag launches the rewrite script. The flag value is NORMALIZED
+# (lowercased + whitespace-stripped via ``tr``, review F3) so the shell gate
+# accepts the same value set as the python ``_flag_enabled`` gate — ``TRUE``,
+# ``On``, ``" 1"`` all enable. Bash-only. Any edit here must be deliberate.
 _EXPECTED_PRETOOL_COMMAND = (
-    'sh -lc \'case "$FURL_PRETOOL_PIPE" in 1|true|yes|on|enabled) '
+    'sh -lc \'case "$(printf %s "$FURL_PRETOOL_PIPE" | '
+    'tr "[:upper:]" "[:lower:]" | tr -d "[:space:]")" in 1|true|yes|on|enabled) '
     "uv run --no-project --with "
     f'"furl-ctx[mcp]=={_LIB_VERSION}" '
     'python3 "${CLAUDE_PLUGIN_ROOT}/hooks/pretool_pipe.py" ;; esac; true\''
@@ -177,8 +181,10 @@ def test_pretool_command_is_env_gated_and_pinned() -> None:
     assert hook["timeout"] == 30
     command = hook["command"]
     assert command == _EXPECTED_PRETOOL_COMMAND
-    # Shell-gated on the opt-in flag so the default-off path costs no `uv` resolve.
-    assert 'case "$FURL_PRETOOL_PIPE"' in command
+    # Shell-gated on the opt-in flag so the default-off path costs no `uv` resolve;
+    # the gate normalizes the value (F3) so it matches python's _flag_enabled set.
+    assert '"$FURL_PRETOOL_PIPE"' in command
+    assert 'tr "[:upper:]" "[:lower:]"' in command
     # Invokes the bundled rewrite script via the plugin-root placeholder.
     assert "${CLAUDE_PLUGIN_ROOT}/hooks/pretool_pipe.py" in command
     # No inline env pins on the hooks.json command itself (the rewrite bakes the
@@ -201,6 +207,56 @@ def test_pretool_falsey_flag_stays_off() -> None:
         proc = _run(command, {"FURL_PRETOOL_PIPE": value})
         assert proc.returncode == 0
         assert proc.stdout == "", f"flag {value!r} must NOT enable the pipe"
+
+
+# The uv-launch body inside the shipped PreToolUse command. Swapped for a marker
+# echo by the gate-probe tests below, so the GATE itself (the part before the
+# body) is exercised from the shipped string without a real `uv` resolve.
+_PRETOOL_UV_BODY_RE = re.compile(
+    r'uv run --no-project --with "furl-ctx\[mcp\]==[^"]*" '
+    r'python3 "\$\{CLAUDE_PLUGIN_ROOT\}/hooks/pretool_pipe\.py"'
+)
+
+
+def _pretool_gate_probe() -> str:
+    command = _load()["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+    probe = _PRETOOL_UV_BODY_RE.sub("echo GATE-OPEN", command)
+    assert "echo GATE-OPEN" in probe, f"probe substitution failed on: {command!r}"
+    return probe
+
+
+def test_pretool_gate_accepts_python_equivalent_variants() -> None:
+    """Review F3 pin: the SHELL gate must accept the SAME value set as the python
+    ``_flag_enabled`` gate — case-insensitive, whitespace-stripped. Pre-fix the
+    shell `case` was case-sensitive/no-strip, so ``FURL_PRETOOL_PIPE=TRUE`` (or
+    ``On``, ``" 1"``) kept the pipe off while python would have enabled it."""
+    probe = _pretool_gate_probe()
+    for value in (
+        "1",
+        "true",
+        "yes",
+        "on",
+        "enabled",
+        "TRUE",
+        "On",
+        "YES",
+        "Enabled",
+        " 1",
+        "true ",
+    ):
+        proc = _run(probe, {"FURL_PRETOOL_PIPE": value})
+        assert proc.returncode == 0, proc.stderr
+        assert "GATE-OPEN" in proc.stdout, f"shell gate must open for {value!r} (python does)"
+
+
+def test_pretool_gate_rejects_falsey_variants() -> None:
+    """The falsey half of gate parity: values python rejects stay off in the shell
+    gate too — including uppercase falsey spellings."""
+    probe = _pretool_gate_probe()
+    for value in ("", " ", "0", "false", "FALSE", "off", "OFF", "no", "No", "disabled"):
+        proc = _run(probe, {"FURL_PRETOOL_PIPE": value})
+        assert proc.returncode == 0, proc.stderr
+        assert "GATE-OPEN" not in proc.stdout, f"shell gate must stay closed for {value!r}"
 
 
 # --- SessionStart status signal ---------------------------------------------------

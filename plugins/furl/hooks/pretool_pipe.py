@@ -18,10 +18,15 @@ Contract (PreToolUse):
            "PreToolUse", "updatedInput": {...tool_input, "command": <rewritten>}}}
   stdout empty + exit 0 : the original command runs unchanged.
 
-The rewrite preserves the original command's EXIT CODE exactly, passes its STDERR
-through untouched, lets small outputs through raw (the compressor's own
-threshold), and is FAIL-OPEN at the shell level (a compressor that cannot even
-start falls back to ``cat`` of the captured output — never a broken command).
+The rewrite preserves the original command's EXIT CODE exactly. STDERR is never
+captured and flows live — but because stdout is buffered for compression,
+stderr/stdout interleaving is not preserved: in a merged view all stderr appears
+before the (possibly compressed) stdout; ``cmd 2>&1`` merges both into the
+compressed stream. Small outputs pass through raw (the compressor's own
+threshold). FAIL-OPEN at the shell level twice over: a compressor that cannot
+even start falls back to ``cat`` of the captured output, and if the stdout
+tempfile cannot even be created the original command runs UNWRAPPED
+(uncompressed, uncounted) — never a broken command.
 FAIL-OPEN here too: any error emits nothing (exit 0) → original command runs.
 """
 
@@ -63,10 +68,20 @@ def _rewrite_command(original: str, project_dir: str, compressor: str) -> str:
     """Build the exit-code-preserving, fail-open pipe rewrite of *original*.
 
     Design:
-      * ``( <orig>\\n) >"$f"`` — a SUBSHELL captures only stdout to a tempfile;
+      * ``if [ -n "$f" ] && : >"$f"`` — review F1 guard: PROBE that the tempfile
+        is actually creatable/writable BEFORE any capture redirect touches the
+        original. If the probe fails (mktemp unavailable AND the ``${TMPDIR}``
+        fallback path unwritable), the ``else`` branch runs the ORIGINAL COMMAND
+        UNWRAPPED — bare, as the branch's last statement, so its stdout and exit
+        code flow through naturally (fail-open: no compression rather than no
+        command). Pre-fix, the redirect sat unprobed on the subshell and a
+        tempfile failure meant the command NEVER RAN (fail-closed).
+      * ``( <orig>\\n) >"$f"`` — a SUBSHELL captures only stdout to the tempfile;
         the closing ``)`` on its own line survives an *orig* that ends in a
-        comment/``&``/heredoc. STDERR is never redirected, so it passes through
-        untouched and live.
+        comment/``&``/heredoc. STDERR is never redirected — it flows live — but
+        since stdout is buffered here and emitted at the end, stderr/stdout
+        interleaving is NOT preserved: merged views show all stderr before the
+        (possibly compressed) stdout; ``2>&1`` merges into the compressed stream.
       * ``__furl_ec=$?`` right after captures the original's exact exit code
         (the subshell's = its last command's), restored by the final ``exit``.
       * the compressor reads the tempfile; ``|| cat "$f"`` is the shell-level
@@ -82,6 +97,10 @@ def _rewrite_command(original: str, project_dir: str, compressor: str) -> str:
         f"{_PIPE_MARKER}\n"
         "__furl_f=$(mktemp 2>/dev/null || mktemp -t furlpipe 2>/dev/null"
         ' || printf %s "${TMPDIR:-/tmp}/furl-pipe.$$")\n'
+        # NOTE: ``2>/dev/null`` BEFORE ``>"$f"`` — redirections process left to
+        # right, so suppression must be in place before the probe redirect can
+        # fail, or the failure message would leak to the live stderr stream.
+        'if [ -n "$__furl_f" ] && : 2>/dev/null >"$__furl_f"; then\n'
         f"( {original}\n"
         ') >"$__furl_f"\n'
         "__furl_ec=$?\n"
@@ -89,7 +108,11 @@ def _rewrite_command(original: str, project_dir: str, compressor: str) -> str:
         f'uv run --no-project --with "{_FURL_CTX_PIN}" python3 {qcomp} <"$__furl_f"'
         ' || cat "$__furl_f"\n'
         'rm -f "$__furl_f"\n'
-        "exit $__furl_ec"
+        "exit $__furl_ec\n"
+        "else\n"
+        'rm -f "$__furl_f" 2>/dev/null\n'
+        f"{original}\n"
+        "fi"
     )
 
 

@@ -7,8 +7,13 @@ silently DROPS — anthropics/claude-code#68951), this rewrites what the model
 sees at the SOURCE: it reads the command's stdout on STDIN and writes a
 COMPRESSED form to STDOUT, storing the original under a ``<<ccr:HASH>>`` marker
 in the SAME durable per-project CCR store the PostToolUse hook and MCP server
-use — so ``furl_retrieve`` resolves it. Same size threshold, same env redaction,
-same store / TTL semantics as the PostToolUse path.
+use — so ``furl_retrieve`` resolves it. Same size threshold and same store / TTL
+semantics as the PostToolUse path; the same env redaction
+(``FURL_REDACT_PATTERNS``) applies on the NORMAL path only — the fail-open paths
+skip it (review F5): binary/undecodable stdin and the furl_ctx-unavailable
+fallback pass through raw and UNREDACTED, and the raw stdout also transits the
+rewrite's ``0600`` tempfile for the command's runtime (see the plugin README's
+"Known limitations").
 
 Contract:
   stdin  : raw bytes (a command's stdout).

@@ -54,10 +54,30 @@ Trade-offs:
 - **Bash-only** — it rewrites a command's stdout; other tools are untouched.
 - **The command mutation is visible in the transcript** — the rewrite carries a
   `# furl-pipe (FURL_PRETOOL_PIPE=1)` comment so it is never a silent substitution.
-- **Exit code preserved exactly**, **stderr passes through untouched**, small outputs
-  pass through raw, and it is **fail-open** — a compressor that cannot even start falls
-  back to the raw captured output; never a broken command.
+- **Exit code preserved exactly**; small outputs pass through raw; **fail-open** twice
+  over — a compressor that cannot start falls back to the raw captured output, and if
+  the stdout tempfile cannot even be created the original command runs **unwrapped**
+  (uncompressed); never a broken command.
+- **stderr is not captured and flows live** — but because stdout is buffered for
+  compression, stderr/stdout **interleaving is not preserved**: in a merged view all
+  stderr appears before the (possibly compressed) stdout. `cmd 2>&1` merges both into
+  the compressed stream.
 - Default **OFF** is a byte-identical no-op (the default-off path spends no `uv` resolve).
+
+#### Known limitations
+
+- **Redaction gaps on fail-open paths:** `FURL_REDACT_PATTERNS` applies on the normal
+  path (same builder as the PostToolUse hook), but **not** to binary/undecodable stdout
+  or when `furl_ctx` cannot load — those pass through raw and unredacted. The raw
+  stdout also sits in a `0600` tempfile for the command's runtime.
+- **Unterminated heredoc** (malformed input): bare bash is lenient, but the wrapped
+  command fails with a shell syntax error (exit 2, empty output). No wrapper text or
+  tempfile is leaked.
+- **Permission allowlists:** the rewritten command no longer matches a user's
+  `Bash(...)` allowlist entries, so permission prompts can differ with the pipe on.
+- **Cold-start cost:** with the pipe and the PostToolUse hook both enabled, one Bash
+  call can spend up to 3 `uv` resolves before caches warm.
+- **Cosmetic:** bash error messages gain a `line N:` prefix from the multi-line wrapper.
 
 ## Scope (global install, per-project opt-out)
 

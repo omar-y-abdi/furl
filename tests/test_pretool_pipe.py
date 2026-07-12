@@ -8,9 +8,13 @@ invariants pinned here:
 
 * DEFAULT OFF is a byte-identical no-op (the flag must be a deliberate opt-in).
 * the rewrite preserves the ORIGINAL command's EXIT CODE exactly (proved with a
-  stub compressor so the property is isolated to the shell wrapper), passes
-  STDERR through untouched, lets small output through raw, and is FAIL-OPEN even
-  when the compressor cannot start (``|| cat`` of the captured output).
+  stub compressor so the property is isolated to the shell wrapper); stderr is
+  never captured and flows live — but stdout is buffered, so stderr/stdout
+  interleaving is NOT preserved (pinned as documented behavior below); small
+  output passes through raw; FAIL-OPEN twice over — when the compressor cannot
+  start (``|| cat`` of the captured output) AND when the stdout tempfile cannot
+  even be created (review F1: the original command must run UNWRAPPED, never be
+  fail-closed).
 * the compressor shrinks large output, stores the original under a retrievable
   ``<<ccr:HASH>>`` marker in the shared per-project store, and is byte-safe +
   fail-open on binary / undecodable / furl_ctx-missing input.
@@ -22,6 +26,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -153,7 +158,10 @@ def test_failing_command_keeps_its_code(tmp_path) -> None:
     assert proc.stdout.strip() == "hi"
 
 
-def test_stderr_passes_through_untouched(tmp_path) -> None:
+def test_stderr_flows_live_on_its_own_stream(tmp_path) -> None:
+    """stderr is never captured: its CONTENT arrives intact on the stderr stream
+    (ordering relative to stdout is a separate, documented property — see
+    ``test_stderr_stdout_interleaving_not_preserved`` below)."""
     cmd = _with_stub_compressor(
         _rewrite("echo to-out; echo to-err >&2; exit 3", str(tmp_path)), "cat"
     )
@@ -161,6 +169,24 @@ def test_stderr_passes_through_untouched(tmp_path) -> None:
     assert proc.returncode == 3
     assert proc.stdout.strip() == "to-out"
     assert proc.stderr.strip() == "to-err"
+
+
+def test_stderr_stdout_interleaving_not_preserved(tmp_path) -> None:
+    """Review F2 — pinned DOCUMENTED BEHAVIOR, not a bug: stdout is buffered to
+    the tempfile and emitted at the end while stderr flows live, so in a MERGED
+    view ALL stderr precedes ALL stdout (bare bash would interleave A, MIDERR, B).
+    If a future change alters this ordering, it must be deliberate — and the docs
+    (README/SKILL/LIBRARY 'interleaving is not preserved') updated with it."""
+    cmd = _with_stub_compressor(_rewrite("echo A; echo MIDERR >&2; echo B", str(tmp_path)), "cat")
+    proc = subprocess.run(
+        ["bash", "-c", cmd],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,  # merge, as a terminal view would
+        text=True,
+        env={**os.environ},
+    )
+    assert proc.returncode == 0
+    assert proc.stdout.split() == ["MIDERR", "A", "B"]  # stderr first, then stdout
 
 
 def test_fail_open_when_compressor_cannot_start(tmp_path) -> None:
@@ -172,6 +198,62 @@ def test_fail_open_when_compressor_cannot_start(tmp_path) -> None:
     proc = _run(cmd)
     assert proc.returncode == 5  # original exit code still preserved
     assert proc.stdout.strip() == "raw-line"  # raw output survived
+
+
+def test_fail_open_when_tempfile_unavailable(tmp_path) -> None:
+    """Review F1 pin: if the stdout tempfile cannot be created (mktemp unavailable
+    on a stripped PATH AND the ``${TMPDIR}`` fallback path unwritable), the
+    ORIGINAL command must still run — unwrapped — with stdout intact and its exit
+    code exact. The pre-fix rewrite put the capture redirect on the subshell with
+    no probe, so a tempfile failure meant the command NEVER RAN (fail-closed:
+    rc=1, empty stdout — reproduced in review)."""
+    rewritten = _rewrite("echo HELLO_MUST_RUN; exit 9", str(tmp_path))
+    bash = shutil.which("bash")
+    assert bash is not None
+    shim = tmp_path / "empty-bin"  # no mktemp, no rm, no cat — bash builtins only
+    shim.mkdir()
+    proc = subprocess.run(
+        [bash, "-c", rewritten],
+        capture_output=True,
+        text=True,
+        env={"PATH": str(shim), "TMPDIR": str(tmp_path / "no-such-dir")},
+    )
+    assert proc.returncode == 9, f"original exit code lost (stderr: {proc.stderr!r})"
+    assert proc.stdout.strip() == "HELLO_MUST_RUN", "original command must still run"
+    # The fallback must be silent plumbing: every wrapper-internal failure
+    # (mktemp lookup, probe redirect, rm) is stderr-suppressed, so the user sees
+    # only the original command's own streams.
+    assert proc.stderr == "", f"wrapper noise leaked to stderr: {proc.stderr!r}"
+
+
+def test_heredoc_command_survives_rewrite(tmp_path) -> None:
+    """A well-formed heredoc must survive the wrapper structure (guards the
+    if/else fallback shape: heredoc bodies parse inside compound commands)."""
+    cmd = _with_stub_compressor(
+        _rewrite("cat <<EOF\nhello-heredoc\nEOF\nexit 4", str(tmp_path)), "cat"
+    )
+    proc = _run(cmd)
+    assert proc.returncode == 4
+    assert proc.stdout.strip() == "hello-heredoc"
+
+
+def test_trailing_comment_command_survives_rewrite(tmp_path) -> None:
+    """A command ending in a comment must not swallow the wrapper's next token."""
+    cmd = _with_stub_compressor(_rewrite("echo done # trailing comment", str(tmp_path)), "cat")
+    proc = _run(cmd)
+    assert proc.returncode == 0
+    assert proc.stdout.strip() == "done"
+
+
+def test_truthy_flag_variants_enable_python_gate() -> None:
+    """Review F3 parity (python half): ``_flag_enabled`` accepts case-insensitive,
+    whitespace-stripped truthy values. The hooks.json SHELL gate must accept the
+    same set — pinned in test_plugin_hooks_manifest.py
+    ::test_pretool_gate_accepts_python_equivalent_variants."""
+    for value in ("TRUE", "On", " 1", "YES", "Enabled"):
+        proc = _pretool({"tool_name": "Bash", "tool_input": {"command": "echo hi"}}, flag=value)
+        assert proc.returncode == 0
+        assert "updatedInput" in proc.stdout, f"python gate must enable for {value!r}"
 
 
 # --- full pipe: real compressor against local furl_ctx --------------------------

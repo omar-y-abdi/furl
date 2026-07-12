@@ -18,7 +18,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh -lc 'case \"$FURL_PRETOOL_PIPE\" in 1|true|yes|on|enabled) uv run --no-project --with \"furl-ctx[mcp]==1.1.0\" python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/pretool_pipe.py\" ;; esac; true'",
+            "command": "sh -lc 'case \"$(printf %s \"$FURL_PRETOOL_PIPE\" | tr \"[:upper:]\" \"[:lower:]\" | tr -d \"[:space:]\")\" in 1|true|yes|on|enabled) uv run --no-project --with \"furl-ctx[mcp]==1.1.0\" python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/pretool_pipe.py\" ;; esac; true'",
             "timeout": 30
           }
         ]
