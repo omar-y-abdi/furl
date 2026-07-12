@@ -72,9 +72,11 @@ The `sh -lc` wrapper runs a login shell so `uv` is found on PATH even when Claud
 Code launches with a minimal environment (a login shell that lacks `uv` is the one
 failure mode — install [`uv`](https://docs.astral.sh/uv/) and it resolves). `exec`
 hands stdio and signals straight to the server. `FURL_CCR_BACKEND=sqlite` makes the
-CCR store durable at `~/.furl/ccr.sqlite3`, so originals survive across processes.
-`FURL_CCR_TTL_SECONDS=86400` keeps each offloaded original retrievable for 24 hours
-(the plugin default); raise or lower it to widen or shrink the retention window. The
+CCR store durable on disk under `~/.furl/` (a per-project `ccr-ns-<hash>.sqlite3`),
+so originals survive across processes. `FURL_CCR_TTL_SECONDS=86400` keeps each
+offloaded original retrievable for 24 hours (the plugin default) — governing the
+hook's offloads and the MCP tools' stores alike; raise or lower it to widen or
+shrink the retention window. The
 `furl-ctx[mcp]==1.0.3` pin is deterministic — every launch resolves the same wheel instead
 of whatever `uv`'s cache last held; upgrades ship through plugin updates, which bump the pin.
 
@@ -95,6 +97,11 @@ pins the **same** `FURL_CCR_BACKEND=sqlite` as the server, so markers it creates
 are retrievable through `furl_retrieve`. It is **fail-open**: any error — including
 `uv` being unavailable — passes the original output through unchanged (exit 0, no
 output), so a compression problem can never break your tool call.
+
+**Very large outputs.** When a tool result is so large that Claude Code itself
+persists it to a file and hands the model a file reference instead of the inline
+text, the hook has no inline output to compress — compression applies to tool
+output that actually enters context.
 
 **Tuning / disabling** (env vars):
 
