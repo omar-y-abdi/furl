@@ -61,10 +61,19 @@ never a silent wrong answer. The hook and the `furl` MCP server share one durabl
 SQLite store (`~/.furl/ccr.sqlite3`), so markers the hook creates are retrievable
 through `furl_retrieve`.
 
-When a marker offloaded a large JSON array (an `_ccr_summary` preview shows its
-schema, per-field value histograms, and numeric ranges), you usually want a
-**slice, not the whole array**. The summary carries a `retrieve` hint telling you
-which fields to filter on. Pass a row-select to `furl_retrieve`:
+What a marker leaves in place depends on the offloaded **input shape** — the
+columnar table is not the universal case:
+
+- A **structured JSON array of objects** compresses to a compact columnar table
+  (`[N]{col:type,...}`, decoded by the MCP legend) with the full rows behind the marker.
+- A **JSON object with one dominant inner array** (e.g. a Chrome trace) leaves an
+  `_ccr_summary` preview: schema, per-field value histograms, and numeric ranges.
+- **Line-oriented text** (logs, stack traces) is *not* tabled — it leaves a head+tail
+  excerpt with the full text behind the marker.
+
+For the array and summary cases you usually want a **slice, not the whole thing**.
+The summary carries a `retrieve` hint telling you which fields to filter on. Pass a
+row-select to `furl_retrieve`:
 `select_field=<a categorical field>, select_equals=<one of its values>` for just
 those rows, or `select_field=<a numeric field>, select_min=…, select_max=…` for a
 range window (add `fields=[…]` to project columns, `limit` to cap). The slice is

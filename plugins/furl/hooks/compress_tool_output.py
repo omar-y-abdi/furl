@@ -197,7 +197,7 @@ def _mode_kwargs() -> dict[str, object]:
     return {}
 
 
-def _compress_text(text: str) -> tuple[str | None, str | None]:
+def _compress_text(text: str, tool_name: str | None = None) -> tuple[str | None, str | None]:
     """Compress one tool-output blob via Furl's public pipeline.
 
     Returns ``(compressed, None)`` only when compression genuinely helped
@@ -221,7 +221,12 @@ def _compress_text(text: str) -> tuple[str | None, str | None]:
 
     model = os.environ.get(_MODEL_ENV, "").strip() or _DEFAULT_MODEL
     try:
-        result = compress([{"role": "tool", "content": text}], model=model, **_mode_kwargs())
+        result = compress(
+            [{"role": "tool", "content": text}],
+            model=model,
+            tool_name=tool_name,
+            **_mode_kwargs(),
+        )
     except Exception:
         return None, "compress-error"
 
@@ -253,6 +258,55 @@ def _passthrough(reason: str | None = None) -> NoReturn:
     reaches the model and never blocks the tool call — exit stays 0 (fail-open)."""
     if reason and _noop_verbose_enabled():
         sys.stderr.write(f"furl: no-op ({reason})\n")
+    sys.exit(0)
+
+
+def _apply_env_redaction(text: str) -> str:
+    """Scrub ``FURL_REDACT_PATTERNS`` secrets from *text* before any gate.
+
+    Applied here (not only inside ``compress()``) so a below-threshold output
+    that never reaches the compressor still has configured secrets removed from
+    what the model sees — matching the library redactor, which redacts every
+    message regardless of whether anything compresses. One env var
+    (``FURL_REDACT_PATTERNS``) governs the hook, the MCP server, and the library
+    via the shared ``furl_ctx.redaction`` builder.
+
+    Fail-open and total: if ``furl_ctx`` is not importable (the same degraded
+    env where compression itself no-ops) or the redactor is off, the text is
+    returned unchanged — so with no patterns configured the hook is
+    byte-identical. Never raises."""
+    try:
+        from furl_ctx.redaction import build_env_redactor
+    except Exception:
+        return text
+    try:
+        redactor = build_env_redactor()
+        if redactor is None:
+            return text
+        return redactor(text)
+    except Exception:
+        # Compiled-pattern re.sub does not raise, but stay fail-open on any
+        # surprise: the durable copy is redacted by compress() downstream, and a
+        # broken hook must never break the tool call.
+        return text
+
+
+def _emit(output_text: str) -> NoReturn:
+    """Replace the model-visible tool output with *output_text* and exit 0.
+
+    The single writer of the PostToolUse ``updatedToolOutput`` contract, used by
+    the compression path AND the redaction-only paths (a scrubbed-but-not-shrunk
+    output). Serialization failure falls back to passthrough (fail-open)."""
+    output = {
+        "hookSpecificOutput": {
+            "hookEventName": "PostToolUse",
+            "updatedToolOutput": output_text,
+        }
+    }
+    try:
+        sys.stdout.write(json.dumps(output))
+    except Exception:
+        _passthrough("serialize-failed")
     sys.exit(0)
 
 
@@ -305,36 +359,43 @@ def main() -> None:
     if _CCR_MARKER in text:
         _passthrough("already-compressed")
 
+    # --- secret redaction (FURL_REDACT_PATTERNS), BEFORE the size gate ---
+    # Scrub configured secrets from what the model sees even when the output is
+    # too small to compress. With no patterns set this returns text unchanged,
+    # so the hook stays byte-identical when redaction is off.
+    redacted = _apply_env_redaction(text)
+
     # --- size gate ---
-    if len(text) < _min_chars():
+    if len(redacted) < _min_chars():
+        # Below the compression threshold. If redaction changed the bytes, still
+        # emit the scrubbed form so the secret never reaches the model.
+        if redacted != text:
+            _emit(redacted)
         _passthrough("below-min-chars")
 
     # --- compress (returns None + a distinct reason unless it genuinely helped) ---
-    compressed, compress_fail_reason = _compress_text(text)
+    # The originating tool (from the payload, already read above) rides through
+    # compress() so the CCR entry it stores records content_kind (audit: hook
+    # entries previously all showed content_kind=null).
+    tool_label = tool_name if isinstance(tool_name, str) and tool_name else None
+    compressed, compress_fail_reason = _compress_text(redacted, tool_label)
     if compressed is None:
+        # Compression did not help. Emit the redacted text if it changed;
+        # otherwise leave the original untouched (byte-identical passthrough).
+        if redacted != text:
+            _emit(redacted)
         _passthrough(compress_fail_reason or "no-savings")
 
     # --- optional one-line stderr annotation (FURL_HOOK_VERBOSE) ---
     if _flag_enabled(os.environ.get(_VERBOSE_ENV)):
-        saved_pct = round((1 - len(compressed) / len(text)) * 100)
+        saved_pct = round((1 - len(compressed) / len(redacted)) * 100)
         sys.stderr.write(
             f"furl: {tool_name or '?'} "
-            f"{len(text) / 1024:.1f} KB -> {len(compressed) / 1024:.1f} KB  -{saved_pct}%\n"
+            f"{len(redacted) / 1024:.1f} KB -> {len(compressed) / 1024:.1f} KB  -{saved_pct}%\n"
         )
 
     # --- replace the tool output the model sees ---
-    output = {
-        "hookSpecificOutput": {
-            "hookEventName": "PostToolUse",
-            "updatedToolOutput": compressed,
-        }
-    }
-    try:
-        sys.stdout.write(json.dumps(output))
-    except Exception:
-        # If we somehow cannot serialize, fall back to passthrough.
-        _passthrough("serialize-failed")
-    sys.exit(0)
+    _emit(compressed)
 
 
 if __name__ == "__main__":

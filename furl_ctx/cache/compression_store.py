@@ -554,6 +554,14 @@ class CompressionStore:
             to the other producer's foreign content. The key is still returned
             (signature unchanged); its marker simply no longer resolves.
         """
+        # content_kind threading: a writer that did not attribute a tool (the
+        # router CCR offload, SmartCrusher on a single wrapped tool output)
+        # inherits the request-scoped originating tool that compress() bound for
+        # this call, so its entry still surfaces a content_kind. An explicit
+        # tool_name is never overridden; unbound context => None, unchanged.
+        if tool_name is None:
+            tool_name = _request_tool_name.get()
+
         # Reject a non-positive TTL loudly. ttl=0 (or negative) produces an
         # entry that is_expired() immediately (time.time()-created_at > 0), so it
         # would be stored in the backend + heap, never retrievable, and leak until
@@ -1690,6 +1698,18 @@ class CompressionStore:
 _request_ccr_store: ContextVar[CompressionStore | None] = ContextVar(
     "furl_request_ccr_store", default=None
 )
+
+# Request-scoped ORIGINATING TOOL NAME (content_kind threading). ``compress()``
+# binds this to the tool whose output it is compressing (e.g. "Bash" from the
+# PostToolUse hook, "mcp:furl_compress" from the MCP server). ``store()`` reads
+# it as the DEFAULT ``tool_name`` when a writer does not supply one — so the
+# router's CCR offload and SmartCrusher (which have no per-message tool
+# attribution for a single wrapped tool output) still label their entries,
+# surfacing as ``content_kind`` in furl_list / furl_retrieve. A writer that
+# DOES pass a concrete ``tool_name`` (read_lifecycle's "Read", dedup's
+# message-derived name) is never overridden. Default ``None`` => today's
+# behavior, byte-identical.
+_request_tool_name: ContextVar[str | None] = ContextVar("furl_request_tool_name", default=None)
 
 # Global store instance (lazy initialization)
 _compression_store: CompressionStore | None = None

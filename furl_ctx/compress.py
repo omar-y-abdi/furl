@@ -65,6 +65,7 @@ from typing import TYPE_CHECKING, Any
 from .ccr.marker_grammar import hashes_in_text
 from .config import DEFAULT_MIN_TOKENS_TO_COMPRESS
 from .pipeline import PipelineExtensionManager, PipelineStage, summarize_routing_markers
+from .redaction import build_env_redactor, compose_redactors
 from .utils import extract_user_query as _extract_user_query
 
 if TYPE_CHECKING:
@@ -475,6 +476,7 @@ def compress(
     pipeline: Any | None = None,
     session_id: str | None = None,
     agent_id: str | None = None,
+    tool_name: str | None = None,
     **kwargs: Any,
 ) -> CompressResult:
     """Compress messages using Furl's full compression pipeline.
@@ -505,6 +507,13 @@ def compress(
         agent_id: Optional sub-agent identifier, combined with ``session_id``
             and ``FURL_CCR_NAMESPACE`` to form the CCR isolation boundary. Same
             zero-change default as ``session_id``.
+        tool_name: Originating tool for this content (e.g. "Bash",
+            "mcp:furl_compress"). Bound request-scoped for the call so CCR
+            entries this compression writes — including the router's offload and
+            SmartCrusher, which have no per-message tool attribution for a single
+            wrapped tool output — record it as their ``content_kind`` (surfaced
+            by furl_list / furl_retrieve). Default ``None`` leaves entries
+            unlabeled exactly as before.
         **kwargs: Shorthand for CompressConfig fields. These override config:
             compress_user_messages, compress_system_messages, protect_recent,
             protect_analysis_context, min_tokens_to_compress.
@@ -576,9 +585,17 @@ def compress(
     # invariant: on redactor error, no output rather than a leak. When redaction
     # succeeds, every downstream step (pipeline, offload, store) only ever sees
     # redacted content — so a later retrieve() returns the REDACTED original.
-    # No redactor configured => this is a no-op and behavior is byte-identical.
-    if cfg.redactor is not None:
-        messages = _redact_messages(messages, cfg.redactor)
+    #
+    # Two redactors compose here (both apply, defense in depth): the
+    # env-expressible ``FURL_REDACT_PATTERNS`` redactor — the ONLY redaction
+    # channel the env-configured Claude Code plugin (hook + MCP server) can
+    # reach — runs FIRST, then the library ``CompressConfig.redactor`` callback.
+    # ``build_env_redactor()`` is ``None`` when the var is unset/empty, so with
+    # no env patterns AND no callback this whole block is a no-op and behavior
+    # is byte-identical.
+    _active_redactor = compose_redactors(build_env_redactor(), cfg.redactor)
+    if _active_redactor is not None:
+        messages = _redact_messages(messages, _active_redactor)
 
     # Per-tenant CCR isolation (B2). When a namespace is active
     # (``session_id`` / ``agent_id`` / ``FURL_CCR_NAMESPACE``) bind that
@@ -591,11 +608,19 @@ def compress(
     # restored, and reset-always keeps the fail-open path clean.
     from .cache.compression_store import (
         _request_ccr_store,
+        _request_tool_name,
         resolve_ccr_namespace_store,
     )
 
     _ccr_token = None
+    _tool_name_token = None
     try:
+        # content_kind threading: bind the originating tool for the whole call
+        # so every store.store() this compression triggers (router offload,
+        # SmartCrusher, dedup) inherits it as its default tool_name. RESET (not
+        # cleared) in finally so a nested/outer compress() binding is restored.
+        if tool_name is not None:
+            _tool_name_token = _request_tool_name.set(tool_name)
         # Namespace resolution + the ContextVar bind sit INSIDE the fail-open
         # boundary too: this is the first place compress() constructs a store,
         # and a store-construction failure (e.g. a bad workspace path) must
@@ -859,6 +884,9 @@ def compress(
         # past this call and an outer middleware store is preserved.
         if _ccr_token is not None:
             _request_ccr_store.reset(_ccr_token)
+        # Same discipline for the request-scoped originating tool name.
+        if _tool_name_token is not None:
+            _request_tool_name.reset(_tool_name_token)
 
 
 def _get_pipeline() -> Any:

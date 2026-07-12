@@ -87,6 +87,11 @@ LIST_TOOL_NAME = "furl_list"
 # understates content by roughly the words-per-token factor).
 _MCP_TOKEN_MODEL = "claude-sonnet-4-5-20250929"
 
+# content_kind label for entries the MCP furl_compress tool stores, so
+# furl_list / furl_retrieve show where an entry came from (distinct from the
+# hook's tool names like "Bash" and furl_read's "furl_read").
+_MCP_COMPRESS_TOOL_NAME = "mcp:furl_compress"
+
 logger = logging.getLogger("furl_ctx.ccr.mcp")
 
 
@@ -273,15 +278,20 @@ _READ_ENABLED = os.environ.get("FURL_MCP_READ", "off").lower().strip() in (
 # comprehension risk is ``%k``: a cell ``53`` under ``time_ms:float%3``
 # decodes to 0.053, NOT 53 — the worked example leads with exactly that.
 CSV_DECODE_LEGEND = (
-    # 1) Plain-English summary: what the format is, what a marker means, and
-    #    the retrieve-before-reasoning rule.
-    "Furl packs long tool outputs into small tables — read one before you reason. "
+    # 1) Plain-English summary: which INPUT produces the table, what a marker
+    #    means, and the retrieve-before-reasoning rule. The columnar table is
+    #    for STRUCTURED JSON ARRAYS; line-oriented text (the common case) ships
+    #    head+tail with a marker, NOT tabled — so an agent reasoning from this
+    #    grammar never assumes a log was tabled when it was actually offloaded.
+    "Furl tables a structured JSON array of objects — read one before you reason. "
     "Header `[N]{col:type,...}` = N rows; later lines give each row's non-constant columns as CSV. "
-    "`<<ccr:HASH>>` = rows offloaded, not lost; furl_retrieve it first — never guess dropped data. "
-    # 2) One worked micro-example: input line → compact row → read it back.
-    "Example: `[1]{lvl:string=INFO,ms:float%3}` + line `53` = {lvl:INFO, ms:0.053} — "
+    "Line-oriented text (logs, traces) is NOT tabled — it ships head+tail + a `<<ccr:HASH>>` marker: "
+    "content offloaded, not lost; furl_retrieve it first — never guess dropped data. "
+    # 2) One worked micro-example — a JSON-array ROW (not a raw log line):
+    #    input cell → decoded row → read it back.
+    "Example: array row `[1]{lvl:string=INFO,ms:float%3}` + line `53` = {lvl:INFO, ms:0.053} — "
     "constant col re-attaches, float%3 = ×10^-3 (53 -> 0.053, not 53). "
-    # 3) Compact grammar reference.
+    # 3) Compact grammar reference (the table form only).
     "GRAMMAR: type=V constant V; int=B+S row i=B+S*i (0-based); float%k cell/10^k; "
     "string~ ISO ts then ±sec[/tz] deltas; string^ +__affix:col=P,S value=P+cell+S; "
     "string@ +__head:col=<d>h0,h1 cell 1<d>tail=h1+tail; __dict:col=v0,v1 cell indexes it; "
@@ -878,6 +888,19 @@ class FurlMCPServer:
         Returns dict with compressed text, token counts, hash, etc.
         """
         from furl_ctx.compress import compress
+        from furl_ctx.redaction import build_env_redactor
+
+        # Env-expressible redaction (FURL_REDACT_PATTERNS): scrub secrets from
+        # the content BEFORE it is compressed, previewed, OR stored. compress()
+        # redacts its own message copy, but this tool stores ``original=content``
+        # verbatim (and _compress_filtered stores runs of it), so the redaction
+        # MUST also happen here or the raw secret would persist in the CCR store
+        # — the exact leak the plugin-reachable redaction closes. Shares the
+        # builder with the hook and library so one env var governs all three;
+        # no patterns set => None => content unchanged (byte-identical).
+        _redactor = build_env_redactor()
+        if _redactor is not None:
+            content = _redactor(content)
 
         # Acquire (and thereby configure) the store singleton BEFORE running
         # the pipeline: compress() persists marker-hash dropped rows through
@@ -910,7 +933,12 @@ class FurlMCPServer:
         # Wrap content as a tool message (most common compression target)
         messages = [{"role": "tool", "content": content}]
 
-        result = compress(messages, model=_MCP_TOKEN_MODEL, pipeline=pipeline)
+        result = compress(
+            messages,
+            model=_MCP_TOKEN_MODEL,
+            pipeline=pipeline,
+            tool_name=_MCP_COMPRESS_TOOL_NAME,
+        )
 
         if result.error:
             # COR-36: compress() failed open — result.messages are the
@@ -949,6 +977,7 @@ class FurlMCPServer:
                 else json.dumps(compressed_content),
                 original_tokens=input_tokens,
                 compressed_tokens=output_tokens,
+                tool_name=_MCP_COMPRESS_TOOL_NAME,
                 compression_strategy="mcp_compress",
                 ttl=_mcp_session_ttl(),
                 require_durable=True,
@@ -1247,6 +1276,10 @@ class FurlMCPServer:
                 return {
                     "hash": hash_key,
                     "source": "local",
+                    # Originating tool (content_kind) — surfaced here too, not
+                    # just in furl_list, so a retrieve caller can see where the
+                    # content came from ("Bash", "mcp:furl_compress", ...).
+                    "content_kind": entry.tool_name,
                     "original_content": entry.original_content,
                     "original_item_count": entry.original_item_count,
                     "compressed_item_count": entry.compressed_item_count,
@@ -1296,6 +1329,7 @@ class FurlMCPServer:
         return {
             "hash": hash_key,
             "source": "local",
+            "content_kind": entry.tool_name,
             "filtered": True,
             "filter_kind": outcome.kind,
             "filtered_content": outcome.content,
@@ -2227,6 +2261,8 @@ class FurlMCPServer:
         """Blocking body of :meth:`_handle_read` (runs off the loop)."""
         import hashlib
 
+        from furl_ctx.redaction import build_env_redactor
+
         path = Path(file_path).expanduser().resolve()
 
         # Path jail: confine reads to the workspace root (resolve() above already
@@ -2335,6 +2371,18 @@ class FurlMCPServer:
         # is for tool output display, not SSE/wire path, so a replacement
         # char on invalid bytes is acceptable).
         content = _safe_decode_for_logging(raw)
+
+        # Env-expressible redaction (FURL_REDACT_PATTERNS), applied AFTER decode
+        # and BEFORE the hash / cache / store / served output — furl_read stored
+        # and served the raw file verbatim, bypassing the redaction the other
+        # store paths got (review F1). Redacting before the content_hash keeps
+        # the file cache coherent: same file + same patterns hash identically
+        # (cache hit), while a pattern change hashes differently and forces a
+        # fresh (re-redacted) read. The served numbered output is scrubbed too,
+        # consistent with the hook. Unset patterns => None => byte-identical.
+        _read_redactor = build_env_redactor()
+        if _read_redactor is not None:
+            content = _read_redactor(content)
 
         content_hash = hashlib.sha256(content.encode()).hexdigest()[:24]
         line_count = content.count("\n") + (1 if content and not content.endswith("\n") else 0)
