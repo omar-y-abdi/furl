@@ -123,7 +123,7 @@ is in [`LIBRARY.md`](../../../../LIBRARY.md) → "Configuration".
 ## Prerequisite
 
 Both the hook and the MCP server launch through [`uv`](https://docs.astral.sh/uv/)
-(`uv run --with "furl-ctx[mcp]==1.0.3" …`), which fetches Furl from PyPI on first use — no
+(`uv run --with "furl-ctx[mcp]==1.0.4" …`), which fetches Furl from PyPI on first use — no
 `pip install`, no Rust toolchain. The version is pinned so every launch resolves the same
 wheel deterministically instead of whatever `uv`'s cache last held; upgrades arrive through
 plugin updates, which bump the pin. The
