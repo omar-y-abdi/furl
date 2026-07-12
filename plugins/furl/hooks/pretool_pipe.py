@@ -72,10 +72,14 @@ def _rewrite_command(original: str, project_dir: str, compressor: str) -> str:
         is actually creatable/writable BEFORE any capture redirect touches the
         original. If the probe fails (mktemp unavailable AND the ``${TMPDIR}``
         fallback path unwritable), the ``else`` branch runs the ORIGINAL COMMAND
-        UNWRAPPED — bare, as the branch's last statement, so its stdout and exit
-        code flow through naturally (fail-open: no compression rather than no
-        command). Pre-fix, the redirect sat unprobed on the subshell and a
-        tempfile failure meant the command NEVER RAN (fail-closed).
+        with no redirect — inside a SUBSHELL whose ``)`` sits on its own line
+        (review R1), exactly like the then branch: a bare interpolation would let
+        an original ending in an ODD number of trailing backslashes line-continue
+        into ``fi``, making the WHOLE script a parse error (rc 2, command never
+        runs in either branch). The subshell is the branch's last statement, so
+        stdout and the exit code still flow through exactly (fail-open: no
+        compression rather than no command). Pre-F1, the redirect sat unprobed on
+        the subshell and a tempfile failure meant the command NEVER RAN.
       * ``( <orig>\\n) >"$f"`` — a SUBSHELL captures only stdout to the tempfile;
         the closing ``)`` on its own line survives an *orig* that ends in a
         comment/``&``/heredoc. STDERR is never redirected — it flows live — but
@@ -111,7 +115,8 @@ def _rewrite_command(original: str, project_dir: str, compressor: str) -> str:
         "exit $__furl_ec\n"
         "else\n"
         'rm -f "$__furl_f" 2>/dev/null\n'
-        f"{original}\n"
+        f"( {original}\n"
+        ")\n"
         "fi"
     )
 

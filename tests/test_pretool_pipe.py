@@ -226,6 +226,74 @@ def test_fail_open_when_tempfile_unavailable(tmp_path) -> None:
     assert proc.stderr == "", f"wrapper noise leaked to stderr: {proc.stderr!r}"
 
 
+def _bare_bash(command: str) -> subprocess.CompletedProcess[str]:
+    """Reference behavior: *command* run by bash directly, no wrapper."""
+    return subprocess.run(["bash", "-c", command], capture_output=True, text=True)
+
+
+def _run_forced_fallback(rewritten: str, tmp_path) -> subprocess.CompletedProcess[str]:
+    """Run *rewritten* in the tempfile-unavailable env (mktemp absent on a
+    stripped PATH, ``${TMPDIR}`` fallback unwritable) — forces the else branch."""
+    bash = shutil.which("bash")
+    assert bash is not None
+    shim = tmp_path / "fallback-empty-bin"
+    shim.mkdir(exist_ok=True)
+    return subprocess.run(
+        [bash, "-c", rewritten],
+        capture_output=True,
+        text=True,
+        env={"PATH": str(shim), "TMPDIR": str(tmp_path / "no-such-dir")},
+    )
+
+
+def test_odd_trailing_backslashes_survive_both_branches(tmp_path) -> None:
+    """Review R1 pin: a command ending in an ODD number of trailing backslashes
+    line-continues onto the next wrapper line. Pre-fix, the else branch
+    interpolated the ORIGINAL bare, so the continuation glued into ``fi`` →
+    unterminated ``if`` → the WHOLE rewritten script was a parse error (rc 2,
+    empty output — the command never ran in EITHER branch, both die at parse).
+    The else branch now wraps the original in a subshell exactly like the then
+    branch: the ``)`` on its own line absorbs the continuation, and the subshell
+    is the branch's last statement so the exit code still flows exactly."""
+    for n in (1, 3):
+        original = "echo foo " + "\\" * n
+        expected = _bare_bash(original)
+        rewritten = _rewrite(original, str(tmp_path))
+        # Normal branch (tempfile fine; stub compressor = cat → raw passthrough).
+        normal = _run(_with_stub_compressor(rewritten, "cat"))
+        assert normal.returncode == expected.returncode, f"n={n}: normal-branch rc"
+        assert normal.stdout == expected.stdout, f"n={n}: normal-branch stdout"
+        # Forced-fallback branch (tempfile unavailable → unwrapped-in-subshell).
+        fallback = _run_forced_fallback(rewritten, tmp_path)
+        assert fallback.returncode == expected.returncode, (
+            f"n={n}: fallback rc (stderr: {fallback.stderr!r})"
+        )
+        assert fallback.stdout == expected.stdout, f"n={n}: fallback stdout"
+
+
+def test_even_trailing_backslashes_stay_correct(tmp_path) -> None:
+    """Even-count guard: two trailing backslashes are an escaped literal
+    backslash (no line continuation) — both branches must match bare bash."""
+    original = "echo foo " + "\\" * 2
+    expected = _bare_bash(original)
+    assert expected.returncode == 0  # sanity: bare bash handles it fine
+    rewritten = _rewrite(original, str(tmp_path))
+    normal = _run(_with_stub_compressor(rewritten, "cat"))
+    assert (normal.returncode, normal.stdout) == (expected.returncode, expected.stdout)
+    fallback = _run_forced_fallback(rewritten, tmp_path)
+    assert (fallback.returncode, fallback.stdout) == (expected.returncode, expected.stdout)
+
+
+def test_fallback_branch_exit_code_matrix(tmp_path) -> None:
+    """Re-assert the exit-code contract THROUGH the else branch after the R1
+    subshell change: 0/1/42/127/130 all flow exactly, stdout intact."""
+    for code in (0, 1, 42, 127, 130):
+        rewritten = _rewrite(f"echo x; exit {code}", str(tmp_path))
+        proc = _run_forced_fallback(rewritten, tmp_path)
+        assert proc.returncode == code, f"exit {code} lost (stderr: {proc.stderr!r})"
+        assert proc.stdout.strip() == "x", f"exit {code}: stdout lost"
+
+
 def test_heredoc_command_survives_rewrite(tmp_path) -> None:
     """A well-formed heredoc must survive the wrapper structure (guards the
     if/else fallback shape: heredoc bodies parse inside compound commands)."""

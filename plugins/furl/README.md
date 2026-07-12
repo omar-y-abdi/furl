@@ -40,6 +40,8 @@ raw tool output, the harness is dropping the replacements — see
 [#68951](https://github.com/anthropics/claude-code/issues/68951). The first hook run per
 project also prints a one-line stderr heads-up. (These activate once the runtime
 `furl-ctx` engine ships the store counter API; the hook is armed for them now.)
+Once the opt-in pipe has run, `pipe_invocations_seen` / `pipe_compressions_applied` /
+`pipe_noop_reasons` appear in the same `store.hook_activity` block.
 
 ### `FURL_PRETOOL_PIPE` — real savings on today's harness (opt-in, default OFF)
 
@@ -190,7 +192,7 @@ output that actually enters context.
 | `FURL_HOOK_EXCLUDE_TOOLS` | (none) | Comma-separated tools never to compress — exact or `mcp__db__*` globs. |
 | `FURL_HOOK_MODE` | `normal` | `aggressive` compresses more (code + smaller outputs). |
 | `FURL_HOOK_VERBOSE` | off | `1` prints a one-line per-compression savings summary to stderr. |
-| `FURL_PRETOOL_PIPE` | off | `1`/`true`/`on` enables the opt-in PreToolUse pipe (Bash-only, real savings on today's harness — see "Current harness status"). Default off is a byte-identical no-op. |
+| `FURL_PRETOOL_PIPE` | off | `1`/`true`/`on` enables the opt-in PreToolUse pipe (Bash-only, real savings on today's harness — see "Current harness status"). Default off is a byte-identical no-op. The gate runs via `sh -lc` (a login shell), so an export in your login profile or in the environment Claude Code launches from takes effect. |
 | `FURL_STATUS_LINE` | on | `0` silences the one-line SessionStart status signal. Export it in the environment Claude Code launches from — the status hook runs `sh -c`, which does not source login profiles. |
 
 The full `FURL_*` reference is in [`LIBRARY.md`](../../LIBRARY.md) → "Configuration".

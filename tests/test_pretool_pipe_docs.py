@@ -64,3 +64,27 @@ def test_redaction_claim_is_qualified() -> None:
     # LIBRARY's pipe paragraph must qualify its redaction mention too.
     library = _read(_LIBRARY)
     assert "same TTL and redaction as the PostToolUse path" not in library
+
+
+def test_pretool_pipe_env_row_has_where_to_set_guidance() -> None:
+    """D2: the FURL_PRETOOL_PIPE env-table row tells the user WHERE the flag must
+    be set — the gate runs via ``sh -lc`` (a login shell), so an export in the
+    login profile or in the environment Claude Code launches from takes effect
+    (mirroring the FURL_STATUS_LINE row's where-to-set pattern)."""
+    text = _read(_README)
+    rows = [line for line in text.splitlines() if line.startswith("| `FURL_PRETOOL_PIPE`")]
+    assert rows, "README env table lost its FURL_PRETOOL_PIPE row"
+    row = rows[0]
+    assert "sh -lc" in row, "row lacks the login-shell (`sh -lc`) gate detail"
+    assert "login" in row, "row lacks where-to-set (login profile / launch env) guidance"
+
+
+def test_pipe_counters_named_in_observability_section() -> None:
+    """D3: once the pipe has run, its counters appear in the same furl_stats
+    ``store.hook_activity`` block — the Observability counters section must name
+    them so a pipe user knows where to look."""
+    text = _read(_README)
+    assert "### Observability counters" in text
+    section = text.split("### Observability counters", 1)[1].split("### ", 1)[0]
+    for name in ("pipe_invocations_seen", "pipe_compressions_applied", "pipe_noop_reasons"):
+        assert name in section, f"Observability section missing {name}"
