@@ -7,6 +7,7 @@ loads fonts.css rather than the files directly, so they arrive at CSS parse time
 with no separate request and no font-swap layout shift, under file:// and http.
 Fetch the woff2 first (see FONTS.md), then run this to regenerate fonts.css.
 """
+
 import base64
 import pathlib
 

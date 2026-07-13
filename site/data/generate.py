@@ -20,6 +20,7 @@ roughly two thousand tokens the router leaves error-like content untouched
 (it is not worth folding), so the samples are sized to cross that line, the
 way a real agent's tool output does.
 """
+
 from __future__ import annotations
 
 import json
@@ -113,7 +114,9 @@ def build_crash() -> Sample:
         f.append('  File "/srv/app/pipeline/stage.py", line 118, in run_stage')
         f.append("    return run_stage(next_ctx)")
     f.append('  File "/srv/app/pipeline/stage.py", line 121, in run_stage')
-    f.append('    raise RecursionError("stage graph did not terminate: cycle via node reduce to reduce")')
+    f.append(
+        '    raise RecursionError("stage graph did not terminate: cycle via node reduce to reduce")'
+    )
     f.append("RecursionError: stage graph did not terminate: cycle via node reduce to reduce")
     return Sample(
         id="crash",
@@ -216,7 +219,18 @@ def build_ci() -> Sample:
         "#1 [internal] load build definition",
         "#2 resolving provenance for metadata",
     ]
-    crates = ["serde", "tokio", "hyper", "regex", "syn", "quote", "clap", "anyhow", "thiserror", "rayon"]
+    crates = [
+        "serde",
+        "tokio",
+        "hyper",
+        "regex",
+        "syn",
+        "quote",
+        "clap",
+        "anyhow",
+        "thiserror",
+        "rayon",
+    ]
     for i in range(1, 166):
         c = crates[i % len(crates)]
         if i == 140:
@@ -307,7 +321,9 @@ def primary_hash(res: CompressResult, compressed: str) -> str:
     return hashes[0]
 
 
-def classify_before_lines(original: str, compressed: str, anomaly_regex: str) -> list[dict[str, Any]]:
+def classify_before_lines(
+    original: str, compressed: str, anomaly_regex: str
+) -> list[dict[str, Any]]:
     """Tag each original line: kept (survives in compressed) and/or anomaly."""
     kept_set = set(compressed.split("\n"))
     anomaly = re.compile(anomaly_regex)
@@ -325,7 +341,9 @@ def classify_before_lines(original: str, compressed: str, anomaly_regex: str) ->
     return out
 
 
-MARKER_RE = re.compile(r"<<ccr:|hash=|matches compressed to|lines omitted|rows_offloaded|_chunks|_ccr_")
+MARKER_RE = re.compile(
+    r"<<ccr:|hash=|matches compressed to|lines omitted|rows_offloaded|_chunks|_ccr_"
+)
 
 
 def build_after_lines(compressed: str) -> list[dict[str, Any]]:
@@ -487,14 +505,20 @@ def main() -> None:
     payload = {**manifest, "samples": records}
 
     for r in records:
-        (DATA_DIR / f"{r['id']}.json").write_text(json.dumps(r, indent=2, ensure_ascii=False) + "\n")
-    (DATA_DIR / "manifest.json").write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n")
+        (DATA_DIR / f"{r['id']}.json").write_text(
+            json.dumps(r, indent=2, ensure_ascii=False) + "\n"
+        )
+    (DATA_DIR / "manifest.json").write_text(
+        json.dumps(manifest, indent=2, ensure_ascii=False) + "\n"
+    )
     js = "window.__FURL_DATA__ = " + json.dumps(payload, ensure_ascii=False) + ";\n"
     (DATA_DIR / "furl-data.js").write_text(js)
 
     # Self-verifying honesty summary.
     print(f"furl {__version__}  model {MODEL}")
-    print(f"{'id':8s} {'transform':26s} {'before':>7s} {'after':>6s} {'saved%':>7s}  full_exact  retr")
+    print(
+        f"{'id':8s} {'transform':26s} {'before':>7s} {'after':>6s} {'saved%':>7s}  full_exact  retr"
+    )
     for r in records:
         rr = r["retrieval"]
         print(
