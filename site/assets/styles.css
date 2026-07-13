@@ -365,6 +365,7 @@ main { max-width: var(--maxw); margin: 0 auto; padding: 0 var(--gut); }
 .foot-links { display: flex; gap: 20px; font-size: .8rem; }
 .foot-links a { color: var(--ink-2); transition: color .16s var(--ease); }
 .foot-links a:hover { color: var(--accent); }
+.foot-note { flex-basis: 100%; margin: 0; color: var(--ink-3); font-size: .74rem; line-height: 1.6; max-width: 82ch; }
 
 /* ---- Skeleton ----------------------------------------------------------- */
 .skeleton { border: 1px solid var(--line); border-radius: var(--r); overflow: hidden; background: var(--panel); }
@@ -378,9 +379,14 @@ main { max-width: var(--maxw); margin: 0 auto; padding: 0 var(--gut); }
   background-size: 200% 100%; animation: shimmer 1.4s linear infinite;
 }
 @keyframes shimmer { to { background-position: -200% 0; } }
-.demo-fallback { display: none; color: var(--ink-3); font-size: .82rem; margin-top: 16px; }
+.demo-facts { display: none; width: 100%; margin-top: 18px; border-collapse: collapse; font-size: .8rem; color: var(--ink-2); }
+.demo-facts caption { text-align: left; color: var(--ink-3); font-size: .82rem; margin-bottom: 12px; }
+.demo-facts th, .demo-facts td { text-align: left; padding: 9px 12px; border: 1px solid var(--line); }
+.demo-facts thead th { color: var(--ink); font-weight: 700; background: var(--panel-2); }
+.demo-facts tbody th { color: var(--ink); font-weight: 600; }
+.demo-facts td { font-variant-numeric: tabular-nums; }
 .no-js .skeleton { display: none; }
-.no-js .demo-fallback { display: block; }
+.no-js .demo-facts { display: table; }
 
 /* ---- Reveal on load / scroll ------------------------------------------- */
 .reveal { opacity: 0; transform: translateY(16px); transition: opacity .7s var(--ease), transform .7s var(--ease); }
