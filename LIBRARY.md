@@ -38,6 +38,35 @@ python3 -m furl_ctx.ccr.mcp_server      # exposes furl_compress / _retrieve / _s
 | Any Python app | `compress(messages, model=…)`                 |
 | MCP clients    | `python3 -m furl_ctx.ccr.mcp_server`          |
 
+## Docker
+
+A `Dockerfile` at the repo root runs the MCP server on stdio inside a container.
+Build the image once:
+
+```bash
+docker build -t furl-mcp .
+```
+
+The server speaks JSON-RPC over stdin and stdout, so run it with an interactive
+stdin and no TTY:
+
+```bash
+docker run --rm -i furl-mcp
+```
+
+For Claude Code, register that command directly:
+
+```bash
+claude mcp add furl -- docker run --rm -i furl-mcp
+```
+
+The CCR store lives at `/home/furl/.furl` inside the container. Mount a volume
+there to keep retrievable originals across restarts:
+
+```bash
+docker run --rm -i -v furl-store:/home/furl/.furl furl-mcp
+```
+
 ## Retrieve — full or sliced
 
 **Retrieval is pull-based, not push-based.** A `<<ccr:HASH>>` marker replaces the
