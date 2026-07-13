@@ -167,10 +167,16 @@ def _run_hook(
     cwd_local_settings: dict | None = None,
     home_settings: dict | None = None,
     project_dir_settings: dict | None = None,
+    config_dir_settings: dict | None = None,
+    managed_file_settings: dict | None = None,
+    managed_dir_settings: dict | None = None,
+    managed_path_override: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run pretool_pipe.py hermetically: HOME, the payload cwd, and (when given)
-    CLAUDE_PROJECT_DIR are fresh directories carrying exactly the settings each
-    scenario specifies."""
+    CLAUDE_PROJECT_DIR / CLAUDE_CONFIG_DIR / CLAUDE_CODE_MANAGED_SETTINGS_PATH are
+    fresh directories carrying exactly the settings each scenario specifies. The
+    subprocess env is built from scratch (no os.environ), so the developer's real
+    config-path env vars can never leak in."""
     proj = tmp / "proj"
     home = tmp / "home"
     proj.mkdir(exist_ok=True)
@@ -189,6 +195,22 @@ def _run_hook(
         project_root = tmp / "project-root"
         _write_settings(project_root / ".claude" / "settings.json", project_dir_settings)
         env["CLAUDE_PROJECT_DIR"] = str(project_root)
+    if config_dir_settings is not None:
+        # $CLAUDE_CONFIG_DIR is the config directory itself (settings.json lives
+        # directly in it, not under a nested .claude/).
+        config_dir = tmp / "config-dir"
+        _write_settings(config_dir / "settings.json", config_dir_settings)
+        env["CLAUDE_CONFIG_DIR"] = str(config_dir)
+    if managed_file_settings is not None:
+        managed_file = tmp / "managed" / "policy.json"
+        _write_settings(managed_file, managed_file_settings)
+        env["CLAUDE_CODE_MANAGED_SETTINGS_PATH"] = str(managed_file)
+    if managed_dir_settings is not None:
+        managed_dir = tmp / "managed-dir"
+        _write_settings(managed_dir / "managed-settings.json", managed_dir_settings)
+        env["CLAUDE_CODE_MANAGED_SETTINGS_PATH"] = str(managed_dir)
+    if managed_path_override is not None:
+        env["CLAUDE_CODE_MANAGED_SETTINGS_PATH"] = managed_path_override
     payload = {"tool_name": "Bash", "tool_input": {"command": command}, "cwd": str(proj)}
     return subprocess.run(
         [sys.executable, str(_PRETOOL)],
@@ -310,40 +332,97 @@ def test_guard_is_hermetic_zero_rules_rewrites() -> None:
         assert "updatedInput" in proc.stdout
 
 
+def _no_config_env(monkeypatch) -> None:
+    """Hermetic in-process scope: clear the config-path env vars so unit tests of
+    the default behavior can't be swayed by the developer's shell."""
+    for var in ("CLAUDE_CONFIG_DIR", "CLAUDE_CODE_MANAGED_SETTINGS_PATH", "CLAUDE_PROJECT_DIR"):
+        monkeypatch.delenv(var, raising=False)
+
+
 # --- G2: enterprise managed-settings scope ----------------------------------------
 # Paths verified at code.claude.com/docs/en/settings. The real system path is not
-# writable in CI, so behavior is proven by (1) the platform-correct path, (2)
-# inclusion in _settings_paths, (3) an in-process flow test with a monkeypatched
-# managed path, and (4) drop-in-dir doubt.
+# writable in CI, so default behavior is proven by (1) the platform-correct path,
+# (2) inclusion in _settings_paths, (3) an in-process flow test with a
+# monkeypatched managed path, and (4) drop-in-dir doubt. The env-relocation cases
+# (G6) are proven end-to-end via the real hook subprocess below.
 
 
-def test_managed_settings_path_is_platform_correct() -> None:
+def test_managed_settings_path_is_platform_correct(monkeypatch) -> None:
+    _no_config_env(monkeypatch)  # unset override → verified per-OS default
     expected = {
         "darwin": "/Library/Application Support/ClaudeCode/managed-settings.json",
         "linux": "/etc/claude-code/managed-settings.json",
         "win32": r"C:\Program Files\ClaudeCode\managed-settings.json",
     }
-    paths = _pretool_mod._managed_settings_paths()
+    paths, doubt = _pretool_mod._managed_settings_paths()
+    assert doubt is False
     if sys.platform in expected:
         assert str(paths[0]) == expected[sys.platform]
     else:
         assert paths == []
 
 
-def test_settings_paths_includes_managed_scope(tmp_path) -> None:
-    paths = _pretool_mod._settings_paths(str(tmp_path))
-    for managed in _pretool_mod._managed_settings_paths():
-        assert managed in paths, f"managed scope missing from settings paths: {managed}"
+def test_settings_paths_includes_managed_scope(tmp_path, monkeypatch) -> None:
+    _no_config_env(monkeypatch)
+    paths, _doubt = _pretool_mod._settings_paths(str(tmp_path))
+    managed, _md = _pretool_mod._managed_settings_paths()
+    for m in managed:
+        assert m in paths, f"managed scope missing from settings paths: {m}"
+
+
+def test_settings_paths_user_scope_is_home_and_config_dir_union(tmp_path, monkeypatch) -> None:
+    """G6: user scope is the UNION of ~/.claude AND $CLAUDE_CONFIG_DIR, so a rule
+    relocated by CLAUDE_CONFIG_DIR can never be missed (CC uses
+    ${CLAUDE_CONFIG_DIR:-$HOME/.claude}; reading both strictly dominates it)."""
+    _no_config_env(monkeypatch)
+    custom = tmp_path / "custom-config"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(custom))
+    paths, _doubt = _pretool_mod._settings_paths(str(tmp_path))
+    assert custom / "settings.json" in paths, "CLAUDE_CONFIG_DIR user scope missing"
+    assert Path.home() / ".claude" / "settings.json" in paths, "~/.claude user scope dropped"
+
+
+def test_managed_override_file_is_read(tmp_path, monkeypatch) -> None:
+    _no_config_env(monkeypatch)
+    policy = tmp_path / "policy.json"
+    _write_settings(policy, _deny("Bash(rm:*)"))
+    monkeypatch.setenv("CLAUDE_CODE_MANAGED_SETTINGS_PATH", str(policy))
+    paths, doubt = _pretool_mod._managed_settings_paths()
+    assert (paths, doubt) == ([policy], False)
+
+
+def test_managed_override_dir_reads_json_and_fragments(tmp_path, monkeypatch) -> None:
+    _no_config_env(monkeypatch)
+    mdir = tmp_path / "managed"
+    _write_settings(mdir / "managed-settings.json", _deny("Bash(rm:*)"))
+    (mdir / "managed-settings.d").mkdir()
+    (mdir / "managed-settings.d" / "10-extra.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("CLAUDE_CODE_MANAGED_SETTINGS_PATH", str(mdir))
+    paths, doubt = _pretool_mod._managed_settings_paths()
+    assert doubt is False
+    assert mdir / "managed-settings.json" in paths
+    assert mdir / "managed-settings.d" / "10-extra.json" in paths
+
+
+def test_managed_override_unresolvable_is_doubt(tmp_path, monkeypatch) -> None:
+    """Set-but-unresolvable managed override (neither file nor dir) → doubt, so a
+    set-but-broken managed policy is never silently ignored."""
+    _no_config_env(monkeypatch)
+    monkeypatch.setenv("CLAUDE_CODE_MANAGED_SETTINGS_PATH", str(tmp_path / "does-not-exist"))
+    paths, doubt = _pretool_mod._managed_settings_paths()
+    assert (paths, doubt) == ([], True)
 
 
 def test_managed_rule_flows_into_the_decision(tmp_path, monkeypatch) -> None:
     """A rule that exists ONLY in the managed scope is loaded and makes
     ``_has_any_bash_rule`` True — end to end without writing a protected path."""
+    _no_config_env(monkeypatch)
     managed = tmp_path / "managed-settings.json"
     _write_settings(managed, _deny("Bash(rm:*)"))
-    monkeypatch.setattr(_pretool_mod, "_managed_settings_paths", lambda: [managed])
-    bodies, doubt = _pretool_mod._load_bash_rule_bodies(_pretool_mod._settings_paths(str(tmp_path)))
-    assert doubt is False
+    monkeypatch.setattr(_pretool_mod, "_managed_settings_paths", lambda: ([managed], False))
+    paths, path_doubt = _pretool_mod._settings_paths(str(tmp_path))
+    bodies, load_doubt = _pretool_mod._load_bash_rule_bodies(paths)
+    assert (path_doubt, load_doubt) == (False, False)
     assert _pretool_mod._has_any_bash_rule(bodies) is True
 
 
@@ -355,3 +434,39 @@ def test_managed_dropin_dir_unreadable_is_doubt(tmp_path) -> None:
     dropin.mkdir(parents=True)
     _bodies, doubt = _pretool_mod._load_bash_rule_bodies((dropin,))
     assert doubt is True
+
+
+# --- G6: env-var relocations honored end-to-end (the real hook subprocess) --------
+
+
+def test_claude_config_dir_relocated_user_deny_passes_through(tmp_path) -> None:
+    """G6 pin: a deny that lives ONLY in $CLAUDE_CONFIG_DIR/settings.json must gate
+    the pipe. Pre-fix the hook read hardcoded ~/.claude and missed it → rewrote."""
+    proc = _run_hook("printf HELLO", tmp_path, config_dir_settings=_deny("Bash(printf:*)"))
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == "", "relocated ($CLAUDE_CONFIG_DIR) user-scope deny must gate"
+
+
+def test_managed_settings_path_env_override_deny_passes_through(tmp_path) -> None:
+    """G6 pin: a deny that lives ONLY at $CLAUDE_CODE_MANAGED_SETTINGS_PATH (a
+    file) must gate. Pre-fix the hook read the per-OS default and missed it."""
+    proc = _run_hook("printf HELLO", tmp_path, managed_file_settings=_deny("Bash(printf:*)"))
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == "", "relocated managed-settings deny must gate"
+
+
+def test_managed_settings_path_env_override_dir_deny_passes_through(tmp_path) -> None:
+    """The override may point at a DIRECTORY (managed-settings.json + fragments)."""
+    proc = _run_hook("printf HELLO", tmp_path, managed_dir_settings=_deny("Bash(printf:*)"))
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == ""
+
+
+def test_managed_settings_path_env_override_unresolvable_passes_through(tmp_path) -> None:
+    """A set-but-unresolvable managed override → doubt → passthrough, even with no
+    other rules and an innocuous command (never silently ignore a set override)."""
+    proc = _run_hook(
+        "cat bigfile", tmp_path, managed_path_override=str(tmp_path / "nope" / "missing")
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == "", "set-but-unresolvable managed override must force passthrough"

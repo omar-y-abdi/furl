@@ -107,18 +107,22 @@ the falsy path spends no `uv` resolve.
   drops it).
 - **Permission-rule visibility:** the guard is intentionally coarse and total — it
   rewrites Bash **only when there are zero readable Bash permission rules**. It reads
-  **enterprise managed settings** (the per-OS `managed-settings.json` and its
-  `managed-settings.d` fragments), project `.claude/settings.json` /
-  `.claude/settings.local.json`, and the user-scope `~/.claude/` equivalents. If **any**
-  `Bash` rule (deny/ask/allow — an allowlist counts, since it makes unlisted commands
-  restricted) exists in those, **all** Bash passes through untouched, so
-  your native rules apply exactly — a coarse-but-provable boundary that no command shape
-  (wrapper-hidden `env`/`sudo`/`flock`, compound, absolute path, …) can slip past,
-  because when a rule exists nothing is rewritten (this also avoids the auto-mode
-  obfuscation classifier entirely). It **cannot see** CLI `--permission-mode` /
-  `--disallowedTools` flags or session-level (runtime-approved) rules — **if you restrict
-  Bash only through those, set `FURL_PRETOOL_PIPE=0`**. (`~/.claude.json` is not read: it
-  carries no deny/ask rules, only `allowedTools`.)
+  every scope Claude Code actually uses, including relocations: **enterprise managed
+  settings** (the per-OS `managed-settings.json` + its `managed-settings.d` fragments, or
+  the `CLAUDE_CODE_MANAGED_SETTINGS_PATH` override), **project** settings
+  (`.claude/settings.json` / `.claude/settings.local.json` under both `CLAUDE_PROJECT_DIR`
+  and the working dir), and **user** settings (under both `~/.claude` **and**
+  `CLAUDE_CONFIG_DIR`). If **any** `Bash` rule (deny/ask/allow — an allowlist counts, since
+  it makes unlisted commands restricted) exists in those, **all** Bash passes through
+  untouched, so your native rules apply exactly — a coarse-but-provable boundary that no
+  command shape (wrapper-hidden `env`/`sudo`/`flock`, compound, absolute path, …) can slip
+  past, because when a rule exists nothing is rewritten (this also avoids the auto-mode
+  obfuscation classifier entirely). The genuine residual blindness — set
+  `FURL_PRETOOL_PIPE=0` if you restrict Bash **only** through these — is CLI
+  `--permission-mode` / `--disallowedTools` flags, SDK `managedSettings` options, and
+  API-fetched remote org policy (`CLAUDE_CODE_REMOTE_SETTINGS_PATH` / `remoteSettings`, a
+  session-scope fetch rather than a file). (`~/.claude.json` is not read: it carries no
+  deny/ask rules, only `allowedTools`.)
 - **Cold-start cost:** with the pipe and the PostToolUse hook both enabled, one Bash
   call can spend up to 3 `uv` resolves before caches warm.
 - **Cosmetic:** bash error messages gain a `line N:` prefix from the multi-line wrapper.

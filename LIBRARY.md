@@ -338,14 +338,18 @@ original command runs unwrapped, uncompressed — never a broken command). **Per
 rules are respected (provably, total):** the pipe rewrites Bash **only when there are
 zero readable Bash permission rules**. If any `Bash` rule of any kind —
 `permissions.deny`, `permissions.ask`, or `permissions.allow` (an allow-list is itself a
-restrictive posture) — exists in enterprise managed settings (the per-OS
-`managed-settings.json` + its `managed-settings.d` fragments), project
-`.claude/settings.json` / `settings.local.json`, or the user-scope `~/.claude/` files,
-**all** Bash passes through untouched so your rules apply exactly as native — no command
-shape (wrapper-hidden `env`/`sudo`/`flock`, compound, absolute path) can bypass it,
-because when a rule exists nothing is rewritten. Unreadable/malformed settings also force
-passthrough. It cannot see CLI `--permission-mode`/`--disallowedTools` flags or
-session-level rules; if you restrict Bash only through those, set `FURL_PRETOOL_PIPE=0`
+restrictive posture) — exists in any scope Claude Code actually uses, including
+relocations — enterprise managed settings (the per-OS `managed-settings.json` + its
+`managed-settings.d` fragments, or the `CLAUDE_CODE_MANAGED_SETTINGS_PATH` override),
+project settings (`.claude/settings{,.local}.json` under both `CLAUDE_PROJECT_DIR` and the
+working dir), or user settings (under both `~/.claude` and `CLAUDE_CONFIG_DIR`) — **all**
+Bash passes through untouched so your rules apply exactly as native. No command shape
+(wrapper-hidden `env`/`sudo`/`flock`, compound, absolute path) can bypass it, because when
+a rule exists nothing is rewritten. Unreadable/malformed settings, or a config-path
+override env var set but unresolvable, also force passthrough. The genuine residual
+blindness is CLI `--permission-mode`/`--disallowedTools` flags, SDK `managedSettings`
+options, and API-fetched remote org policy (`CLAUDE_CODE_REMOTE_SETTINGS_PATH` /
+`remoteSettings`); if you restrict Bash only through those, set `FURL_PRETOOL_PIPE=0`
 (details in the plugin README's Known limitations).
 
 ## CLI

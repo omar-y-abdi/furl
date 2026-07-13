@@ -56,7 +56,8 @@ def _rewrite(command: str, cwd: str) -> str:
     """Return the rewritten command pretool_pipe.py emits for *command* (flag on)."""
     payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": command}, "cwd": cwd})
     env = {**os.environ, "FURL_PRETOOL_PIPE": "1", "HOME": _EMPTY_HOME}
-    env.pop("CLAUDE_PROJECT_DIR", None)  # hermetic: no ambient project scope
+    for _v in ("CLAUDE_PROJECT_DIR", "CLAUDE_CONFIG_DIR", "CLAUDE_CODE_MANAGED_SETTINGS_PATH"):
+        env.pop(_v, None)  # hermetic: no ambient project/user/managed scope
     proc = subprocess.run(
         [sys.executable, str(_PRETOOL)],
         input=payload,
@@ -93,7 +94,8 @@ def _with_local_compressor(rewritten: str) -> str:
 def _pretool(payload: dict, flag: str | None) -> subprocess.CompletedProcess[str]:
     env = {**os.environ, "HOME": _EMPTY_HOME}
     env.pop("FURL_PRETOOL_PIPE", None)
-    env.pop("CLAUDE_PROJECT_DIR", None)  # hermetic: no ambient project scope
+    for _v in ("CLAUDE_PROJECT_DIR", "CLAUDE_CONFIG_DIR", "CLAUDE_CODE_MANAGED_SETTINGS_PATH"):
+        env.pop(_v, None)  # hermetic: no ambient project/user/managed scope
     if flag is not None:
         env["FURL_PRETOOL_PIPE"] = flag
     return subprocess.run(

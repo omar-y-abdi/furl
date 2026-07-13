@@ -40,13 +40,17 @@ merges); fail-open (worst case the command runs unwrapped, uncompressed); adds
 ~0.3–0.5 s per rewritten call (two `uv` resolves; a fresh environment pays a
 one-time resolve/build on the first call). It rewrites Bash **only when there
 are zero readable Bash permission rules**: if any `Bash` deny/ask/allow rule
-exists (enterprise managed + project/local/user settings), it leaves all Bash
-untouched so your rules apply exactly as native — a total, provable boundary no
-command shape can bypass. Unreadable settings also force passthrough. It cannot
-see CLI `--permission-mode`/`--disallowedTools` flags or session-level rules; if
-you restrict Bash only through those, set `FURL_PRETOOL_PIPE=0`. Known
-limitations (redaction gaps on fail-open paths, heredoc edge, permission-rule
-visibility bounds): see the plugin README.
+exists in any scope Claude Code uses — enterprise managed (incl. the
+`CLAUDE_CODE_MANAGED_SETTINGS_PATH` override), project (both `CLAUDE_PROJECT_DIR`
+and the working dir), and user (both `~/.claude` and `CLAUDE_CONFIG_DIR`)
+settings — it leaves all Bash untouched so your rules apply exactly as native, a
+total boundary no command shape can bypass. Unreadable settings (or a set-but-
+unresolvable config-path override) also force passthrough. Residual blindness:
+CLI `--permission-mode`/`--disallowedTools` flags, SDK `managedSettings`, and
+API-fetched remote org policy (`CLAUDE_CODE_REMOTE_SETTINGS_PATH`); if you
+restrict Bash only through those, set `FURL_PRETOOL_PIPE=0`. Known limitations
+(redaction gaps on fail-open paths, heredoc edge, permission-rule visibility
+bounds): see the plugin README.
 
 ## The MCP tools
 

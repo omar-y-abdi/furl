@@ -25,27 +25,30 @@ downgrade a hard deny to "ask" (normal mode) or trip the obfuscation classifier
 (auto mode). The invariant is made TOTAL by a single predicate instead of
 fragile per-verb matching: the hook rewrites a Bash command ONLY IF there are
 ZERO readable Bash permission rules. If ANY Bash rule of ANY kind exists — deny,
-ask, OR allow (see below), blanket or scoped — across enterprise managed
-settings (the highest-precedence scope: the per-OS ``managed-settings.json`` +
-its ``managed-settings.d`` fragments), project scope (``.claude/settings.json`` +
-``.claude/settings.local.json`` under BOTH ``$CLAUDE_PROJECT_DIR`` and the
-payload cwd), or user scope (``~/.claude/settings.json`` +
-``~/.claude/settings.local.json``), it PASSES THROUGH ALL Bash: no rewrite, no
-per-verb analysis. This makes "never mask a deny/ask rule" TOTAL — no command
-shape (a command-modifier wrapper CC sees through like ``env``/``sudo``/``flock``
-/``strace``, a compound, or anything CC's closed-source resolver interprets)
-can be masked, because when a rule exists NOTHING is rewritten. ANY doubt
-(unreadable or malformed settings) also PASSES THROUGH. Fail toward
-no-compression, never toward masking a permission rule; no-savings is
-acceptable, defeating a rule is not. WHY ``allow`` COUNTS: an allow-list config
-makes UNLISTED commands restricted (ask/deny by default), so the mere presence
-of allow rules is itself a maskable restrictive posture — including it keeps the
-invariant total and is maximally conservative, while still meeting the
-zero-config criterion (a fresh install has NO permissions config → rewrite →
-savings). HONEST BLINDNESS: the hook still cannot see CLI flags
-(``--permission-mode``, ``--disallowedTools``) or session-state (runtime-approved)
-rules; users relying on CLI/session-level Bash restrictions should set
-``FURL_PRETOOL_PIPE=0`` (documented in the plugin README).
+ask, OR allow (see below), blanket or scoped — across the scopes CC actually
+uses: enterprise managed settings (the per-OS ``managed-settings.json`` + its
+``managed-settings.d`` fragments, OR the ``$CLAUDE_CODE_MANAGED_SETTINGS_PATH``
+override), project scope (``.claude/settings{,.local}.json`` under BOTH
+``$CLAUDE_PROJECT_DIR`` and the payload cwd), or user scope
+(``settings{,.local}.json`` under BOTH ``~/.claude`` AND ``$CLAUDE_CONFIG_DIR``),
+it PASSES THROUGH ALL Bash: no rewrite, no per-verb analysis. This makes "never
+mask a deny/ask rule" TOTAL — no command shape (a command-modifier wrapper CC
+sees through like ``env``/``sudo``/``flock``/``strace``, a compound, or anything
+CC's closed-source resolver interprets) can be masked, because when a rule exists
+NOTHING is rewritten. ANY doubt (unreadable or malformed settings, or a
+config-path override env var that is set but cannot be confidently resolved) also
+PASSES THROUGH. Fail toward no-compression, never toward masking a permission
+rule; no-savings is acceptable, defeating a rule is not. WHY ``allow`` COUNTS: an
+allow-list config makes UNLISTED commands restricted (ask/deny by default), so
+the mere presence of allow rules is itself a maskable restrictive posture —
+including it keeps the invariant total and is maximally conservative, while still
+meeting the zero-config criterion (a fresh install has NO permissions config →
+rewrite → savings). HONEST BLINDNESS (the genuine residual): the hook still
+cannot see CLI flags (``--permission-mode``, ``--disallowedTools``), SDK
+``managedSettings`` options, or API-fetched remote org policy
+(``$CLAUDE_CODE_REMOTE_SETTINGS_PATH`` / ``remoteSettings`` — a session-scope
+fetch, not a normal file). Users relying on those for Bash restrictions should
+set ``FURL_PRETOOL_PIPE=0`` (documented in the plugin README).
 
 Contract (PreToolUse):
   stdin  : JSON {tool_name, tool_input:{command, ...}, cwd, ...}
@@ -124,11 +127,12 @@ def _passthrough() -> None:
 # analysis — existence of ANY rule is all we check, because when a rule exists
 # NOTHING is rewritten, so no command shape can mask it. See the module docstring.
 
-# Enterprise managed-settings.json locations, per OS. Paths VERIFIED against
-# code.claude.com/docs/en/settings (reviewer-guard G2) — never guessed. An
-# unrecognized platform maps to nothing (we do not invent a path). WSL shares
-# the Linux path. Managed settings are the HIGHEST-precedence scope and cannot
-# be overridden, so a Bash deny that lives only here must still gate the pipe.
+# Enterprise managed-settings.json DEFAULT locations, per OS. Paths VERIFIED
+# against code.claude.com/docs/en/settings (reviewer-guard G2) — never guessed.
+# An unrecognized platform maps to nothing (we do not invent a path). WSL shares
+# the Linux path. The location can be relocated via $CLAUDE_CODE_MANAGED_SETTINGS_PATH
+# (honored in ``_managed_settings_paths``), so a Bash rule that lives only in
+# managed settings — wherever they are — must still gate the pipe.
 _MANAGED_BASE_BY_PLATFORM = {
     "darwin": Path("/Library/Application Support/ClaudeCode/managed-settings.json"),
     "linux": Path("/etc/claude-code/managed-settings.json"),
@@ -136,17 +140,14 @@ _MANAGED_BASE_BY_PLATFORM = {
 }
 
 
-def _managed_settings_paths() -> list[Path]:
-    """Enterprise managed-settings sources for this platform: the per-OS
-    ``managed-settings.json`` plus any ``managed-settings.d/*.json`` drop-in
-    fragments alongside it. On an unrecognized platform, return nothing rather
-    than GUESS a path. A drop-in directory that cannot be enumerated is returned
-    AS the directory path — reading a directory raises ``OSError`` in the loader,
-    which is surfaced as doubt → passthrough (never a silently missed policy)."""
-    base = _MANAGED_BASE_BY_PLATFORM.get(sys.platform)
-    if base is None:
-        return []
-    dropin = base.parent / "managed-settings.d"
+def _managed_dir_paths(directory: Path, filename: str = "managed-settings.json") -> list[Path]:
+    """``<directory>/<filename>`` plus any ``<directory>/managed-settings.d/*.json``
+    drop-in fragments (Claude Code merges those alphabetically). A drop-in
+    directory that cannot be enumerated is returned AS its path, which reads as
+    ``OSError`` in the loader → doubt → passthrough (never a silently missed
+    policy)."""
+    base = directory / filename
+    dropin = directory / "managed-settings.d"
     try:
         fragments = sorted(dropin.glob("*.json")) if dropin.is_dir() else []
     except OSError:
@@ -154,31 +155,72 @@ def _managed_settings_paths() -> list[Path]:
     return [base, *fragments]
 
 
-def _settings_paths(cwd: str) -> tuple[Path, ...]:
-    """The permission-rule sources this hook CAN see, in Claude Code order:
-    enterprise managed settings, then project + project-local settings, then user
-    scope. Project scope is read from BOTH ``CLAUDE_PROJECT_DIR`` (the session's
-    project root, provided to every hook — where Claude Code actually loads
-    project settings from) AND the payload cwd — they usually coincide, but when
-    they differ (cwd in a subdirectory) the union is the conservative choice:
-    more readable rules can only mean more passthrough, never a masked rule.
-    Enterprise managed settings (the highest-precedence scope) ARE read
-    (``_managed_settings_paths``). Still invisible here are CLI
-    ``--permission-mode`` / ``--disallowedTools`` flags and session-level
-    (runtime-approved) rules — the documented residual (set ``FURL_PRETOOL_PIPE=0``
-    to disable the pipe if you restrict Bash only through those). Note
-    ``~/.claude.json`` is intentionally NOT read: it carries no deny/ask rules
-    (only ``allowedTools``), so a missed entry there is a savings nit, not a
-    bypass."""
+def _managed_settings_paths() -> tuple[list[Path], bool]:
+    """``(paths, doubt)`` for enterprise managed settings.
+
+    Honors ``$CLAUDE_CODE_MANAGED_SETTINGS_PATH`` when set. Its file-vs-directory
+    semantics are not pinned in public docs, so rather than GUESS one we INSPECT
+    the path at runtime — a FILE is read directly; a DIRECTORY is read as
+    ``managed-settings.json`` + its ``managed-settings.d`` fragments. If the
+    override is set but resolves to NEITHER a readable file nor a directory
+    (missing/broken/permission-errored), that is DOUBT → passthrough: a
+    set-but-unresolvable managed policy must never be silently ignored and let a
+    rewrite through. When the override is unset, fall back to the verified per-OS
+    default location (nothing on an unrecognized platform)."""
+    override = os.environ.get("CLAUDE_CODE_MANAGED_SETTINGS_PATH", "").strip()
+    if override:
+        target = Path(override)
+        try:
+            if target.is_file():
+                return [target], False
+            if target.is_dir():
+                return _managed_dir_paths(target), False
+        except OSError:
+            return [], True
+        return [], True  # set but neither a readable file nor a directory → doubt
+    base = _MANAGED_BASE_BY_PLATFORM.get(sys.platform)
+    if base is None:
+        return [], False
+    return _managed_dir_paths(base.parent, base.name), False
+
+
+def _settings_paths(cwd: str) -> tuple[tuple[Path, ...], bool]:
+    """``(paths, doubt)`` — every permission-rule source this hook can see, across
+    the scopes Claude Code ACTUALLY uses (relocations included).
+
+    * enterprise managed settings (``_managed_settings_paths`` — per-OS default or
+      the ``$CLAUDE_CODE_MANAGED_SETTINGS_PATH`` override; the only ``doubt`` source);
+    * project scope from BOTH ``$CLAUDE_PROJECT_DIR`` (the session's project root,
+      where CC loads project settings) AND the payload cwd — usually the same, but
+      when they differ the union can only add rules, never mask one;
+    * user scope from BOTH ``~/.claude`` AND (when set) ``$CLAUDE_CONFIG_DIR``. CC
+      uses ``${CLAUDE_CONFIG_DIR:-$HOME/.claude}`` (the env var REPLACES the home
+      dir); reading BOTH strictly dominates that, so a relocated user rule can
+      never be missed. Over-reading is always safe (more rules → more passthrough).
+
+    Genuinely invisible here (the documented residual — set ``FURL_PRETOOL_PIPE=0``
+    if you restrict Bash only through these): CLI ``--permission-mode`` /
+    ``--disallowedTools`` flags, SDK ``managedSettings`` options, and API-fetched
+    remote org policy (``$CLAUDE_CODE_REMOTE_SETTINGS_PATH`` / ``remoteSettings``,
+    a session-scope fetch, not a normal file). ``~/.claude.json`` is intentionally
+    NOT read: it carries no deny/ask rules (only ``allowedTools``), so a missed
+    entry there is a savings nit, not a bypass."""
     project_dirs: list[Path] = []
     project_root = os.environ.get("CLAUDE_PROJECT_DIR", "").strip()
     if project_root:
         project_dirs.append(Path(project_root))
     if Path(cwd) not in project_dirs:
         project_dirs.append(Path(cwd))
-    scopes = [base / ".claude" for base in (*project_dirs, Path.home())]
+    project_scopes = [d / ".claude" for d in project_dirs]
+    # User scope: the UNION of ~/.claude and $CLAUDE_CONFIG_DIR (deduped).
+    user_scopes: list[Path] = [Path.home() / ".claude"]
+    config_dir = os.environ.get("CLAUDE_CONFIG_DIR", "").strip()
+    if config_dir and Path(config_dir) not in user_scopes:
+        user_scopes.append(Path(config_dir))
+    scopes = [*project_scopes, *user_scopes]
     scoped = [scope / name for scope in scopes for name in ("settings.json", "settings.local.json")]
-    return (*_managed_settings_paths(), *scoped)
+    managed_paths, managed_doubt = _managed_settings_paths()
+    return (*managed_paths, *scoped), managed_doubt
 
 
 def _bash_bodies_from_entries(entries: object) -> tuple[list[str | None], bool]:
@@ -383,8 +425,9 @@ def main() -> None:
     # so no command shape can mask a rule.
     raw_cwd = payload.get("cwd")
     guard_cwd = raw_cwd if isinstance(raw_cwd, str) and raw_cwd.strip() else os.getcwd()
-    bodies, doubt = _load_bash_rule_bodies(_settings_paths(guard_cwd))
-    if doubt or _has_any_bash_rule(bodies):
+    paths, path_doubt = _settings_paths(guard_cwd)
+    bodies, load_doubt = _load_bash_rule_bodies(paths)
+    if path_doubt or load_doubt or _has_any_bash_rule(bodies):
         _passthrough()
 
     compressor = str(Path(__file__).resolve().parent / "pipe_compress.py")
