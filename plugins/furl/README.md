@@ -58,13 +58,14 @@ trade-offs, up front):
   `# furl-pipe (FURL_PRETOOL_PIPE=0 to disable)` comment so it is never a silent
   substitution.
 - **Permission rules are respected:** the pipe **never rewrites a command that matches
-  a `permissions.deny` or `permissions.ask` rule it can read** (project
-  `.claude/settings.json` / `.claude/settings.local.json` and the user-scope
-  `~/.claude/` equivalents) — those commands pass through untouched so the rule fires
-  on the original. Compound commands, unreadable settings, and anything else doubtful
-  also pass through (conservative passthrough; visibility bounds in Known limitations).
-  `Bash(...)` **allowlist** entries may still not match the rewritten command, so
-  allow-prompts can differ.
+  a `permissions.deny` or `permissions.ask` rule it can read** — enterprise managed
+  settings, project `.claude/settings.json` / `.claude/settings.local.json`, and the
+  user-scope `~/.claude/` equivalents — so those commands pass through untouched and the
+  rule fires on the original. Compound commands, command-modifier prefixes
+  (`env`/`sudo`/`time`/…, which Claude Code resolves to an inner verb), unreadable
+  settings, and anything else doubtful also pass through (conservative passthrough;
+  visibility bounds in Known limitations). `Bash(...)` **allowlist** entries may still
+  not match the rewritten command, so allow-prompts can differ.
 - **Latency:** ~0.3–0.5 s added per rewritten Bash call (two `uv` resolves: the shell
   gate plus the in-command compressor). The first call in a fresh environment pays a
   one-time resolve/build — seconds to tens of seconds.
@@ -104,16 +105,20 @@ the falsy path spends no `uv` resolve.
   versions here (GNU bash 5 `-c` keeps the dangling backslash literal; macOS bash 3.2
   drops it).
 - **Permission-rule visibility:** the pipe never rewrites a command that matches a
-  deny/ask rule it can read (project `.claude/settings.json` /
-  `.claude/settings.local.json` and the user-scope `~/.claude/` equivalents), so those
-  rules keep working — a denied command passes through and the deterministic deny fires
-  on the original (this also avoids the auto-mode obfuscation classifier for denied
-  commands, since they are no longer rewritten). But the hook **cannot see** CLI
-  `--permission-mode` / `--disallowedTools` flags, enterprise managed policy, or
-  session state — **if you rely on those for Bash restrictions, set
-  `FURL_PRETOOL_PIPE=0`**. A bare `Bash` deny/ask rule disables rewriting entirely.
-  `Bash(...)` **allowlist** entries may still not match the rewritten command, so
-  allow-prompts can differ with the pipe on.
+  deny/ask rule it can read — **enterprise managed settings** (the per-OS
+  `managed-settings.json` and its `managed-settings.d` fragments), project
+  `.claude/settings.json` / `.claude/settings.local.json`, and the user-scope
+  `~/.claude/` equivalents — so those rules keep working: a denied command passes
+  through and the deterministic deny fires on the original (this also avoids the
+  auto-mode obfuscation classifier for denied commands, since they are no longer
+  rewritten). It also passes through command-modifier prefixes (`env`, `sudo`, `nice`,
+  `time`, `timeout`, `stdbuf`, …) that Claude Code resolves to an inner verb, so a rule
+  on the inner command is never masked. But the hook **cannot see** CLI
+  `--permission-mode` / `--disallowedTools` flags or session-level (runtime-approved)
+  rules — **if you rely on those for Bash restrictions, set `FURL_PRETOOL_PIPE=0`**. A
+  bare `Bash` deny/ask rule disables rewriting entirely. `Bash(...)` **allowlist**
+  entries may still not match the rewritten command, so allow-prompts can differ with
+  the pipe on.
 - **Cold-start cost:** with the pipe and the PostToolUse hook both enabled, one Bash
   call can spend up to 3 `uv` resolves before caches warm.
 - **Cosmetic:** bash error messages gain a `line N:` prefix from the multi-line wrapper.

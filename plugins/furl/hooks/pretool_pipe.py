@@ -23,19 +23,22 @@ the REWRITTEN command, and the furl-pipe wrapper no longer matches
 ``Bash(verb:*)`` patterns — so rewriting a denied command would silently
 downgrade a hard deny to "ask" (normal mode) or trip the obfuscation classifier
 (auto mode). Before rewriting, the hook reads every ``permissions.deny`` /
-``permissions.ask`` Bash rule it CAN see — project scope (``.claude/settings.json``
-+ ``.claude/settings.local.json`` under BOTH ``$CLAUDE_PROJECT_DIR`` and the
-payload cwd) and user scope (``~/.claude/settings.json`` +
+``permissions.ask`` Bash rule it CAN see — enterprise managed settings (the
+highest-precedence scope: the per-OS ``managed-settings.json`` + its
+``managed-settings.d`` fragments), project scope (``.claude/settings.json`` +
+``.claude/settings.local.json`` under BOTH ``$CLAUDE_PROJECT_DIR`` and the
+payload cwd), and user scope (``~/.claude/settings.json`` +
 ``~/.claude/settings.local.json``) — and when in ANY doubt (unreadable or
-malformed settings, unparseable command, compound command, glob rules it cannot
-interpret, same-verb near-matches) it PASSES THROUGH: no rewrite, the original
-runs, the deterministic rule fires. Fail toward no-compression, never toward
-masking a permission rule; no-savings is acceptable, defeating a deny is not.
-HONEST BLINDNESS: the hook cannot see CLI flags (``--permission-mode``,
-``--disallowedTools``), enterprise managed policy, or session-state approvals.
-A bare ``Bash`` deny/ask rule bounds that blindness (it passes everything
-through); users relying on CLI/policy-level Bash restrictions should set
-``FURL_PRETOOL_PIPE=0`` (documented in the plugin README).
+malformed settings, unparseable command, compound command, a command-modifier
+wrapper verb whose inner verb CC matches on — ``env``/``sudo``/``time``/… (G1),
+glob rules it cannot interpret, same-verb near-matches) it PASSES THROUGH: no
+rewrite, the original runs, the deterministic rule fires. Fail toward
+no-compression, never toward masking a permission rule; no-savings is
+acceptable, defeating a deny is not. HONEST BLINDNESS: the hook still cannot see
+CLI flags (``--permission-mode``, ``--disallowedTools``) or session-state
+(runtime-approved) rules. A bare ``Bash`` deny/ask rule bounds that blindness (it
+passes everything through); users relying on CLI/session-level Bash restrictions
+should set ``FURL_PRETOOL_PIPE=0`` (documented in the plugin README).
 
 Contract (PreToolUse):
   stdin  : JSON {tool_name, tool_input:{command, ...}, cwd, ...}
@@ -118,17 +121,84 @@ _COMPOUND_MARKERS = ("\n", ";", "&", "|", "`", "$(", "<(", ">(")
 # reason about is a rule that COULD match → passthrough.
 _GLOB_CHARS = ("*", "?", "[")
 
+# Linear command-modifier verbs Claude Code's permission matcher SEES THROUGH to
+# the INNER verb (reviewer-guard G1 BLOCKER, empirically confirmed vs CC 2.1.207).
+# For ``env printf X`` CC applies a ``Bash(printf:*)`` rule to ``printf`` — but a
+# naive ``shlex.split(cmd)[0]`` yields ``env`` and matches no printf rule, so the
+# guard would rewrite a command CC denies (a real default-on bypass). When any
+# deny/ask rule exists and the first token is one of these, the guard cannot
+# cheaply resolve the inner verb CC will match on, so it PASSES THROUGH. This is
+# a DENYLIST mirroring CC-internal command-modifier handling — EXACTLY the
+# confirmed linear-modifier set, nothing more (over-passthrough silently kills
+# savings), nothing less (under-match reopens the bypass). CC does NOT see
+# through absolute/relative-path verbs, leading redirects, subshells, or brace
+# groups, so those stay rewritable (rewriting them masks no rule). The set may
+# need updates across CC versions — hence a denylist with passthrough-default.
+_WRAPPER_VERBS = frozenset(
+    {
+        "env",
+        "command",
+        "exec",
+        "builtin",
+        "sudo",
+        "doas",
+        "nice",
+        "time",
+        "timeout",
+        "stdbuf",
+        "nohup",
+        "xargs",
+        "setsid",
+        "ionice",
+        "chrt",
+        "taskset",
+        "proxychains",
+        "proxychains4",
+    }
+)
+
+# Enterprise managed-settings.json locations, per OS. Paths VERIFIED against
+# code.claude.com/docs/en/settings (reviewer-guard G2) — never guessed. An
+# unrecognized platform maps to nothing (we do not invent a path). WSL shares
+# the Linux path. Managed settings are the HIGHEST-precedence scope and cannot
+# be overridden, so a Bash deny that lives only here must still gate the pipe.
+_MANAGED_BASE_BY_PLATFORM = {
+    "darwin": Path("/Library/Application Support/ClaudeCode/managed-settings.json"),
+    "linux": Path("/etc/claude-code/managed-settings.json"),
+    "win32": Path(r"C:\Program Files\ClaudeCode\managed-settings.json"),
+}
+
+
+def _managed_settings_paths() -> list[Path]:
+    """Enterprise managed-settings sources for this platform: the per-OS
+    ``managed-settings.json`` plus any ``managed-settings.d/*.json`` drop-in
+    fragments alongside it. On an unrecognized platform, return nothing rather
+    than GUESS a path. A drop-in directory that cannot be enumerated is returned
+    AS the directory path — reading a directory raises ``OSError`` in the loader,
+    which is surfaced as doubt → passthrough (never a silently missed policy)."""
+    base = _MANAGED_BASE_BY_PLATFORM.get(sys.platform)
+    if base is None:
+        return []
+    dropin = base.parent / "managed-settings.d"
+    try:
+        fragments = sorted(dropin.glob("*.json")) if dropin.is_dir() else []
+    except OSError:
+        return [base, dropin]
+    return [base, *fragments]
+
 
 def _settings_paths(cwd: str) -> tuple[Path, ...]:
     """The permission-rule sources this hook CAN see, in Claude Code order:
-    project settings + project-local settings, then user scope. Project scope is
-    read from BOTH ``CLAUDE_PROJECT_DIR`` (the session's project root, provided
-    to every hook — where Claude Code actually loads project settings from) AND
-    the payload cwd — they usually coincide, but when they differ (cwd in a
-    subdirectory) the union is the conservative choice: more readable rules can
-    only mean more passthrough, never a masked rule. CLI flags, enterprise
-    managed policy, and session state remain invisible here — that blindness is
-    documented and bounded by the bare-``Bash``-rule passthrough."""
+    enterprise managed settings, then project + project-local settings, then user
+    scope. Project scope is read from BOTH ``CLAUDE_PROJECT_DIR`` (the session's
+    project root, provided to every hook — where Claude Code actually loads
+    project settings from) AND the payload cwd — they usually coincide, but when
+    they differ (cwd in a subdirectory) the union is the conservative choice:
+    more readable rules can only mean more passthrough, never a masked rule.
+    Enterprise managed settings (the highest-precedence scope) ARE read
+    (``_managed_settings_paths``). Still invisible here — and bounded by the
+    bare-``Bash``-rule passthrough — are CLI ``--permission-mode`` /
+    ``--disallowedTools`` flags and session-level (runtime-approved) rules."""
     project_dirs: list[Path] = []
     project_root = os.environ.get("CLAUDE_PROJECT_DIR", "").strip()
     if project_root:
@@ -136,9 +206,8 @@ def _settings_paths(cwd: str) -> tuple[Path, ...]:
     if Path(cwd) not in project_dirs:
         project_dirs.append(Path(cwd))
     scopes = [base / ".claude" for base in (*project_dirs, Path.home())]
-    return tuple(
-        scope / name for scope in scopes for name in ("settings.json", "settings.local.json")
-    )
+    scoped = [scope / name for scope in scopes for name in ("settings.json", "settings.local.json")]
+    return (*_managed_settings_paths(), *scoped)
 
 
 def _bash_bodies_from_entries(entries: object) -> tuple[list[str | None], bool]:
@@ -237,8 +306,9 @@ def _deny_guard_passthrough(command: str, bodies: list[str | None]) -> bool:
     Zero rules (the common fresh-install case) → False: nothing can be masked,
     every command rewrites, zero-config savings preserved. With rules present,
     passthrough on: any compound construct (never parsed segment-by-segment),
-    an unparseable command, an env-assignment-obscured verb, or any rule that
-    could match. Rewrite only when the command is a SIMPLE command whose verb
+    an unparseable command, an env-assignment-obscured verb, a command-modifier
+    wrapper verb whose inner verb CC matches on (G1), or any rule that could
+    match. Rewrite only when the command is a SIMPLE command whose verb
     confidently matches no deny/ask rule."""
     if not bodies:
         return False
@@ -254,6 +324,10 @@ def _deny_guard_passthrough(command: str, bodies: list[str | None]) -> bool:
     verb = tokens[0]
     if not verb or "=" in verb:
         # No discernible verb (e.g. `''`) or an env-assignment prefix hiding it.
+        return True
+    if verb in _WRAPPER_VERBS:
+        # A linear command-modifier prefix (env/sudo/time/…): CC applies the rule
+        # to the INNER verb the guard does not resolve → refuse to rewrite (G1).
         return True
     return any(_rule_matches_command(stripped, verb, body) for body in bodies)
 

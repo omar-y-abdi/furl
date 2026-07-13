@@ -39,10 +39,11 @@ interleaving is not preserved (all stderr precedes the compressed stdout; `2>&1`
 merges); fail-open (worst case the command runs unwrapped, uncompressed); adds
 ~0.3–0.5 s per rewritten call (two `uv` resolves; a fresh environment pays a
 one-time resolve/build on the first call). It never rewrites a command matching
-a `permissions.deny`/`ask` rule it can read from project/local/user settings
-(conservative passthrough on any doubt, compound commands included) — but it
-cannot see CLI `--permission-mode` flags, enterprise managed policy, or session
-state; if you rely on those for Bash restrictions, set `FURL_PRETOOL_PIPE=0`.
+a `permissions.deny`/`ask` rule it can read from enterprise managed settings and
+project/local/user settings (conservative passthrough on any doubt — compound
+commands and command-modifier prefixes like `env`/`sudo`/`time` included) — but
+it cannot see CLI `--permission-mode`/`--disallowedTools` flags or session-level
+rules; if you rely on those for Bash restrictions, set `FURL_PRETOOL_PIPE=0`.
 Known limitations (redaction gaps on fail-open paths, `Bash(...)` allowlist
 mismatch, heredoc edge, permission-rule visibility bounds): see the plugin
 README.

@@ -28,6 +28,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+import pytest
+
 _HOOKS = Path(__file__).resolve().parents[1] / "plugins" / "furl" / "hooks"
 _PRETOOL = _HOOKS / "pretool_pipe.py"
 
@@ -356,3 +358,167 @@ def test_guard_is_hermetic_in_this_suite() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         proc = _run_hook("cat bigfile", Path(tmp))
         assert "updatedInput" in proc.stdout
+
+
+# --- G1: command-modifier / wrapper-verb under-match (reviewer-guard BLOCKER) -----
+# Claude Code's permission matcher SEES THROUGH linear command-modifier prefixes
+# (env, sudo, nice, time, timeout N, …) to the INNER verb and applies the rule
+# there. The guard extracts verb=shlex.split(cmd)[0]; for ``env printf X`` that
+# is ``env`` (matches no printf rule) → it REWROTE → CC would DENY the original →
+# a real default-on bypass. Fix: a denylist of exactly the linear-modifier verbs,
+# passthrough whenever a rule exists. These are the reviewer's EMPIRICALLY
+# CONFIRMED bypass pairs (all under deny ``Bash(printf:*)``) — each rewrote
+# pre-fix and must now PASS THROUGH (hook emits nothing).
+_WRAPPER_BYPASS_COMMANDS = (
+    "env printf HELLO",
+    "env FOO=bar printf HELLO",
+    "command printf HELLO",
+    "exec printf HELLO",
+    "builtin printf HELLO",
+    "nice printf HELLO",
+    "time printf HELLO",
+    "timeout 5 printf HELLO",
+    "stdbuf -o0 printf HELLO",
+    "sudo -n printf HELLO",
+    "doas printf HELLO",
+    "nohup printf HELLO",
+    "setsid printf HELLO",
+    "ionice printf HELLO",
+    "chrt 1 printf HELLO",
+    "taskset 1 printf HELLO",
+    "xargs printf HELLO",
+    "proxychains printf HELLO",
+    "proxychains4 printf HELLO",
+)
+
+
+@pytest.mark.parametrize("command", _WRAPPER_BYPASS_COMMANDS)
+def test_wrapper_prefix_denied_inner_verb_passes_through(command, tmp_path) -> None:
+    """RED pre-fix: the guard rewrote every one of these (verb was the wrapper,
+    not ``printf``), silently downgrading a hard deny. Each must now emit
+    NOTHING so CC's deterministic printf deny fires on the original."""
+    proc = _run_hook(command, tmp_path, cwd_settings=_deny("Bash(printf:*)"))
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == "", f"wrapper-prefixed denied command must pass through: {command!r}"
+
+
+@pytest.mark.parametrize("command", ["env printf HELLO", "time git push origin main"])
+def test_wrapper_prefix_with_no_rules_still_rewrites(command, tmp_path) -> None:
+    """Tight scope: the wrapper denylist only fires when a deny/ask rule exists.
+    With NO Bash deny/ask rules the wrapper-prefixed command still rewrites —
+    zero-config savings are not sacrificed for the fix."""
+    settings = {"permissions": {"allow": ["Bash(env:*)"], "deny": [], "ask": []}}
+    proc = _run_hook(command, tmp_path, cwd_settings=settings)
+    assert proc.returncode == 0, proc.stderr
+    assert "updatedInput" in proc.stdout, (
+        f"no rules → wrapper command must still rewrite: {command!r}"
+    )
+
+
+def test_absolute_path_verb_still_rewrites_under_matching_rule(tmp_path) -> None:
+    """Tight scope (reviewer precision): CC does NOT see through an absolute-path
+    verb, so ``/usr/bin/printf`` is genuinely NOT denied by ``Bash(printf:*)`` —
+    rewriting it masks nothing and must stay allowed (savings preserved)."""
+    proc = _run_hook("/usr/bin/printf HELLO", tmp_path, cwd_settings=_deny("Bash(printf:*)"))
+    assert proc.returncode == 0, proc.stderr
+    assert "updatedInput" in proc.stdout, "absolute-path verb is not CC-denied → must still rewrite"
+
+
+def test_wrapper_verbs_are_exactly_the_linear_modifier_set() -> None:
+    """Pin the denylist to EXACTLY the empirically-confirmed linear-modifier set
+    — nothing more (over-passthrough silently kills savings), nothing less
+    (under-match reopens the bypass). Mirrors CC-internal command-modifier
+    handling; may need updates across CC versions (denylist, passthrough-default)."""
+    assert _pretool_mod._WRAPPER_VERBS == frozenset(
+        {
+            "env",
+            "command",
+            "exec",
+            "builtin",
+            "sudo",
+            "doas",
+            "nice",
+            "time",
+            "timeout",
+            "stdbuf",
+            "nohup",
+            "xargs",
+            "setsid",
+            "ionice",
+            "chrt",
+            "taskset",
+            "proxychains",
+            "proxychains4",
+        }
+    )
+
+
+def test_decision_wrapper_verb_with_rules_passes_through() -> None:
+    guard = _pretool_mod._deny_guard_passthrough
+    assert guard("env printf x", ["printf:*"]) is True
+    assert guard("sudo -n rm -rf /tmp/x", ["rm:*"]) is True
+
+
+def test_decision_wrapper_verb_no_rules_rewrites() -> None:
+    guard = _pretool_mod._deny_guard_passthrough
+    assert guard("env printf x", []) is False
+
+
+# --- G2: enterprise managed-settings scope (reviewer-guard MAJOR) -----------------
+# The guard read only project + user settings; a Bash deny that lives ONLY in the
+# enterprise managed-settings policy → guard saw zero rules → rewrote → silent
+# downgrade. Fix: also read the per-OS managed-settings.json (+ managed-settings.d
+# fragments). Paths verified at code.claude.com/docs/en/settings.
+
+
+def test_managed_settings_path_is_platform_correct() -> None:
+    """The enterprise managed path must be the VERIFIED per-OS location (never a
+    guessed one); on an unrecognized platform we return nothing rather than
+    invent a path."""
+    expected = {
+        "darwin": "/Library/Application Support/ClaudeCode/managed-settings.json",
+        "linux": "/etc/claude-code/managed-settings.json",
+        "win32": r"C:\Program Files\ClaudeCode\managed-settings.json",
+    }
+    paths = _pretool_mod._managed_settings_paths()
+    if sys.platform in expected:
+        assert str(paths[0]) == expected[sys.platform]
+    else:
+        assert paths == []
+
+
+def test_settings_paths_includes_managed_scope(tmp_path) -> None:
+    """RED pre-fix: ``_settings_paths`` did not include the enterprise managed
+    file, so a managed-only deny was invisible. Every managed path must now be
+    part of the sources the loader reads."""
+    paths = _pretool_mod._settings_paths(str(tmp_path))
+    for managed in _pretool_mod._managed_settings_paths():
+        assert managed in paths, f"managed scope missing from settings paths: {managed}"
+
+
+def test_managed_deny_rule_flows_into_the_decision(tmp_path, monkeypatch) -> None:
+    """Integration: a deny that exists ONLY in the managed scope is loaded and
+    (via the union) gates a command whose verb it governs. Proves the wiring end
+    to end without writing to a protected system path."""
+    managed = tmp_path / "managed-settings.json"
+    _write_settings(managed, _deny("Bash(rm:*)"))
+    monkeypatch.setattr(_pretool_mod, "_managed_settings_paths", lambda: [managed])
+    bodies, doubt = _pretool_mod._load_bash_rule_bodies(_pretool_mod._settings_paths(str(tmp_path)))
+    assert doubt is False
+    assert "rm:*" in bodies
+    assert _pretool_mod._deny_guard_passthrough("rm -rf /tmp/x", bodies) is True
+
+
+def test_managed_dropin_dir_unreadable_is_doubt(tmp_path, monkeypatch) -> None:
+    """A managed-settings.d drop-in directory that cannot be enumerated surfaces
+    as doubt (the dir path itself is unreadable-as-a-file in the loader) →
+    passthrough. Fail toward no-compression, never toward a missed policy."""
+    base = tmp_path / "ClaudeCode" / "managed-settings.json"
+    dropin = tmp_path / "ClaudeCode" / "managed-settings.d"
+    dropin.mkdir(parents=True)
+    monkeypatch.setitem(_pretool_mod._MANAGED_BASE_BY_PLATFORM, sys.platform, base)
+    # A real directory in the path list reads as OSError (IsADirectoryError) in
+    # the loader → doubt. (We include the dir when we cannot list it; here we
+    # simulate the unreadable case by asserting the loader's doubt on a dir path.)
+    _bodies, doubt = _pretool_mod._load_bash_rule_bodies((dropin,))
+    assert doubt is True

@@ -336,12 +336,14 @@ seconds to tens of seconds); and it is **fail-open** (a compressor that cannot s
 falls back to the raw captured output, and a tempfile that cannot be created means the
 original command runs unwrapped, uncompressed — never a broken command). **Permission
 rules are respected:** the pipe never rewrites a command that matches a
-`permissions.deny`/`ask` rule it can read (project `.claude/settings.json` /
-`settings.local.json` and the user-scope `~/.claude/` files) — matching, compound, and
-doubtful commands pass through untouched so the rule fires on the original. It cannot
-see CLI `--permission-mode` flags, enterprise managed policy, or session state; if you
-rely on those for Bash restrictions, set `FURL_PRETOOL_PIPE=0` (details in the plugin
-README's Known limitations).
+`permissions.deny`/`ask` rule it can read — enterprise managed settings (the per-OS
+`managed-settings.json` + its `managed-settings.d` fragments), project
+`.claude/settings.json` / `settings.local.json`, and the user-scope `~/.claude/` files
+— so matching, compound, command-modifier-prefixed (`env`/`sudo`/`time`/…), and
+otherwise-doubtful commands pass through untouched and the rule fires on the original.
+It cannot see CLI `--permission-mode`/`--disallowedTools` flags or session-level rules;
+if you rely on those for Bash restrictions, set `FURL_PRETOOL_PIPE=0` (details in the
+plugin README's Known limitations).
 
 ## CLI
 
