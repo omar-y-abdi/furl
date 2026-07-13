@@ -2,8 +2,10 @@
 
 Context compression for AI agents, bundled into Claude Code as a single plugin. The
 on-demand MCP toolkit your agent calls directly works on every Claude Code version
-today. Automatic, hands-off compression is still landing, and the Current harness
-status section below states exactly where it stands. This plugin ships three things:
+today. Automatic, hands-off compression is pending an upstream Claude Code fix, issue
+[#68951](https://github.com/anthropics/claude-code/issues/68951), and the Current
+harness status section below states exactly where it stands. This plugin ships three
+things:
 
 - **MCP server** (`furl`) → the `furl_compress`, `furl_retrieve`, `furl_stats`, `furl_purge`, `furl_search`, `furl_list` tools. A seventh tool, `furl_read`, is off by default (enable with `FURL_MCP_READ=1`).
 - **PostToolUse hook** → automatically compresses large tool outputs before they

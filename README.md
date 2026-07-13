@@ -28,7 +28,7 @@
 
 Furl is context compression for AI agents. It shrinks the large things your Claude Code agent reads, like tool outputs, logs, web fetches, and RAG chunks, so they cost far fewer tokens while the answers stay the same. Every dropped byte stays retrievable on demand.
 
-**What works today** is the on-demand toolkit. Your agent calls the MCP tools directly, `furl_compress`, `furl_retrieve`, `furl_search`, `furl_list`, `furl_stats`, and `furl_purge`, and gets real, verified compression on genuinely large payloads. Savings are typically 0-54% on high-entropy content and far higher on repetitive data, and every original comes back byte-exact through `furl_retrieve` whenever the agent needs it.
+**What works today** is the on-demand toolkit. Your agent calls the MCP tools directly, `furl_compress`, `furl_retrieve`, `furl_search`, `furl_list`, `furl_stats`, and `furl_purge`, and gets real, verified compression on genuinely large payloads. Savings are typically 0-54% on high-entropy content, up to a best-case 95% ceiling on repetitive logs and fixtures, and every original comes back byte-exact through `furl_retrieve` whenever the agent needs it.
 
 **Retrieval is pull-based, not push-based.** Nothing dropped comes back on its own. The compressed view your agent reads does not contain the dropped rows, so to inspect a specific dropped item it must call `furl_retrieve` for that item by pattern, field, or line range. The data is never lost and every retrieval is byte-exact. What this costs you is anomaly visibility: a one-off outlier buried in otherwise-repetitive data will not appear in the compressed summary unless someone already knows to query for it. Trust the summary for the shape of the data, not for surfacing an anomaly you were not already looking for.
 
@@ -104,7 +104,7 @@ result = compress(messages, model="claude-sonnet-4")
 
 Install, usage, pipeline internals, prompt-caching contract, and the full `FURL_*` config reference live in [LIBRARY.md](LIBRARY.md).
 
-**Stability:** `compress()` is the stable public API, and its signature is the surface to build against. Internal modules under `furl_ctx` may change between releases, so pin a version for reproducible builds. Releases have been frequent during early development, so pin a minor version if you need a fixed surface to depend on.
+**Stability:** The public API is what `furl_ctx` exports at the top level, including `compress()`, `retrieve()`, `purge()`, and `resolve_markers()`. Those signatures are the surface to build against. Submodule internals under `furl_ctx.*` may change between releases, so import from the top-level package rather than reaching into submodules. Releases have been frequent during early development, so pin a minor version if you need a fixed surface to depend on.
 
 ## Community
 

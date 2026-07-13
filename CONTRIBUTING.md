@@ -103,7 +103,7 @@ until they agree:
   `furl <version> · engine furl-ctx <version>` string in the SessionStart hook of
   `plugins/furl/hooks/hooks.json`.
 
-**Public API surface:** The `compress()` function is the stable public API. Its signature is the part downstream integrations should depend on. Internal `furl_ctx` modules may change between releases. Pin a minor version for reproducible builds.
+**Public API surface:** The stable public API is what `furl_ctx` exports at the top level, including `compress()`, `retrieve()`, `purge()`, and `resolve_markers()`. Those signatures are what downstream integrations should depend on. Submodule internals under `furl_ctx.*` may change between releases, so import from the top-level package rather than from submodules. Pin a minor version for reproducible builds.
 
 ## Development setup
 
