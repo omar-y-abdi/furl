@@ -32,6 +32,8 @@ import json
 import os
 import re
 import subprocess
+import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -62,15 +64,15 @@ _EXPECTED_COMMAND = (
     'python3 "${CLAUDE_PLUGIN_ROOT}/hooks/compress_tool_output.py" || true\''
 )
 
-# The opt-in PreToolUse pipe hook (default OFF). The command is SHELL-GATED on
-# FURL_PRETOOL_PIPE so the default-off path never spends a ``uv`` resolve — only a
-# truthy flag launches the rewrite script. The flag value is NORMALIZED
-# (lowercased + whitespace-stripped via ``tr``, review F3) so the shell gate
-# accepts the same value set as the python ``_flag_enabled`` gate — ``TRUE``,
-# ``On``, ``" 1"`` all enable. Bash-only. Any edit here must be deliberate.
+# The PreToolUse pipe hook — ON BY DEFAULT (S1 smart default, user-approved).
+# The shell gate is an OPT-OUT: an explicitly falsy FURL_PRETOOL_PIPE
+# (0/false/off/no/disabled, normalized via ``tr`` lowercase + strip, review F3)
+# skips the body cheaply (no ``uv`` resolve); unset, empty, and ANY other value
+# — including unknown junk like "garbage" — launch the rewrite ("on unless
+# explicitly disabled"). Bash-only. Any edit here must be deliberate.
 _EXPECTED_PRETOOL_COMMAND = (
     'sh -lc \'case "$(printf %s "$FURL_PRETOOL_PIPE" | '
-    'tr "[:upper:]" "[:lower:]" | tr -d "[:space:]")" in 1|true|yes|on|enabled) '
+    'tr "[:upper:]" "[:lower:]" | tr -d "[:space:]")" in 0|false|off|no|disabled) ;; *) '
     "uv run --no-project --with "
     f'"furl-ctx[mcp]=={_LIB_VERSION}" '
     'python3 "${CLAUDE_PLUGIN_ROOT}/hooks/pretool_pipe.py" ;; esac; true\''
@@ -158,7 +160,7 @@ def test_env_defaults_owned_by_hook_script_setdefault() -> None:
     assert 'os.environ.setdefault("FURL_CCR_TTL_SECONDS", "86400")' in src
 
 
-# --- PreToolUse opt-in pipe hook (default OFF) ------------------------------------
+# --- PreToolUse pipe hook (on by default; FURL_PRETOOL_PIPE=0 disables) -----------
 
 
 def test_pretool_group_shape() -> None:
@@ -181,8 +183,8 @@ def test_pretool_command_is_env_gated_and_pinned() -> None:
     assert hook["timeout"] == 30
     command = hook["command"]
     assert command == _EXPECTED_PRETOOL_COMMAND
-    # Shell-gated on the opt-in flag so the default-off path costs no `uv` resolve;
-    # the gate normalizes the value (F3) so it matches python's _flag_enabled set.
+    # Opt-OUT shell gate (S1): explicit falsy skips cheaply; the value is
+    # normalized (F3) so the gate matches python's _pipe_disabled set exactly.
     assert '"$FURL_PRETOOL_PIPE"' in command
     assert 'tr "[:upper:]" "[:lower:]"' in command
     # Invokes the bundled rewrite script via the plugin-root placeholder.
@@ -192,21 +194,16 @@ def test_pretool_command_is_env_gated_and_pinned() -> None:
     assert "FURL_CCR" not in command
 
 
-def test_pretool_default_off_is_cheap_no_uv_no_output() -> None:
-    # With the flag unset, the shell gate skips the body entirely: no output, exit
-    # 0, and crucially NO `uv` process is spawned (the default-off zero-cost path).
+def test_pretool_explicit_disable_is_cheap_no_uv_no_output() -> None:
+    # With an explicitly falsy flag the shell gate skips the body entirely: no
+    # output, exit 0, and crucially NO `uv` process is spawned — disabling the
+    # pipe costs nothing. (The DEFAULT path now launches the rewrite hook; that
+    # side is exercised via the uv-free gate probe in the parity test below.)
     command = _load()["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
-    proc = _run(command)  # FURL_PRETOOL_PIPE not set
-    assert proc.returncode == 0, proc.stderr
-    assert proc.stdout == ""
-
-
-def test_pretool_falsey_flag_stays_off() -> None:
-    command = _load()["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
-    for value in ("0", "false", "off", ""):
+    for value in ("0", "false", "off", "no", "disabled", "OFF"):
         proc = _run(command, {"FURL_PRETOOL_PIPE": value})
-        assert proc.returncode == 0
-        assert proc.stdout == "", f"flag {value!r} must NOT enable the pipe"
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout == "", f"flag {value!r} must skip the pipe cheaply"
 
 
 # The uv-launch body inside the shipped PreToolUse command. Swapped for a marker
@@ -225,38 +222,89 @@ def _pretool_gate_probe() -> str:
     return probe
 
 
-def test_pretool_gate_accepts_python_equivalent_variants() -> None:
-    """Review F3 pin: the SHELL gate must accept the SAME value set as the python
-    ``_flag_enabled`` gate — case-insensitive, whitespace-stripped. Pre-fix the
-    shell `case` was case-sensitive/no-strip, so ``FURL_PRETOOL_PIPE=TRUE`` (or
-    ``On``, ``" 1"``) kept the pipe off while python would have enabled it."""
-    probe = _pretool_gate_probe()
-    for value in (
-        "1",
-        "true",
-        "yes",
-        "on",
-        "enabled",
-        "TRUE",
-        "On",
-        "YES",
-        "Enabled",
-        " 1",
-        "true ",
-    ):
-        proc = _run(probe, {"FURL_PRETOOL_PIPE": value})
-        assert proc.returncode == 0, proc.stderr
-        assert "GATE-OPEN" in proc.stdout, f"shell gate must open for {value!r} (python does)"
+# The gate-parity contract (S1 + review-84 F1): the hooks.json SHELL gate and
+# the python ``_pipe_disabled`` gate must agree on EVERY value. ON unless
+# explicitly disabled: unset, empty, truthy spellings, and unknown junk all
+# leave the pipe ON; only the normalized falsy set turns it off. Both gates
+# remove ALL whitespace (the shell's ``tr -d "[:space:]"``, python's ASCII
+# whitespace-removal table) before comparing — INTERNAL whitespace included —
+# so "semantically identical" holds for every value, not just whitespace-free
+# ones.
+_GATE_PARITY_CASES: tuple[tuple[str | None, bool], ...] = (
+    (None, True),  # unset → ON (the S1 smart default; pre-flip this was OFF)
+    ("", True),  # empty → ON
+    ("0", False),
+    ("false", False),
+    ("OFF", False),  # case-insensitive falsy
+    (" no ", False),  # whitespace-stripped falsy
+    ("disabled", False),  # now an EXPLICIT falsy (pre-flip it was merely unrecognized)
+    ("1", True),
+    ("TRUE", True),
+    ("garbage", True),  # unknown non-falsy → ON ("on unless explicitly disabled")
+    ("o f f", False),  # INTERNAL whitespace (F1): both gates remove it → falsy
+    ("\tFALSE\n", False),  # mixed whitespace + case
+    ("d i s a b l e d", False),
+    ("g a r b a g e", True),  # collapsed junk is still junk → ON
+)
+
+_PRETOOL_SCRIPT = _PLUGIN_HOOKS_DIR / "pretool_pipe.py"
+
+# Hermetic HOME + cwd for the python-gate subprocess: the deny/ask guard
+# (reviewer-84 F3) reads permission rules from the payload cwd and HOME, and
+# this parity test targets the FLAG gate only — a developer's real ~/.claude
+# deny rules must not turn its rewrites into passthroughs.
+_EMPTY_SETTINGS_DIR = tempfile.mkdtemp(prefix="furl-manifest-tests-home-")
 
 
-def test_pretool_gate_rejects_falsey_variants() -> None:
-    """The falsey half of gate parity: values python rejects stay off in the shell
-    gate too — including uppercase falsey spellings."""
-    probe = _pretool_gate_probe()
-    for value in ("", " ", "0", "false", "FALSE", "off", "OFF", "no", "No", "disabled"):
-        proc = _run(probe, {"FURL_PRETOOL_PIPE": value})
-        assert proc.returncode == 0, proc.stderr
-        assert "GATE-OPEN" not in proc.stdout, f"shell gate must stay closed for {value!r}"
+def _env_with_flag(value: str | None) -> dict[str, str]:
+    env = dict(os.environ)
+    env["HOME"] = _EMPTY_SETTINGS_DIR
+    for _v in ("CLAUDE_PROJECT_DIR", "CLAUDE_CONFIG_DIR", "CLAUDE_CODE_MANAGED_SETTINGS_PATH"):
+        env.pop(_v, None)  # hermetic: no ambient project/user/managed scope
+    env.pop("FURL_PRETOOL_PIPE", None)  # true UNSET for the None case
+    if value is not None:
+        env["FURL_PRETOOL_PIPE"] = value
+    return env
+
+
+def _shell_gate_enabled(value: str | None) -> bool:
+    proc = subprocess.run(
+        ["/bin/sh", "-c", _pretool_gate_probe()],
+        capture_output=True,
+        text=True,
+        env=_env_with_flag(value),
+    )
+    assert proc.returncode == 0, proc.stderr
+    return "GATE-OPEN" in proc.stdout
+
+
+def _python_gate_enabled(value: str | None) -> bool:
+    payload = json.dumps(
+        {
+            "tool_name": "Bash",
+            "tool_input": {"command": "echo hi"},
+            "cwd": _EMPTY_SETTINGS_DIR,
+        }
+    )
+    proc = subprocess.run(
+        [sys.executable, str(_PRETOOL_SCRIPT)],
+        input=payload,
+        capture_output=True,
+        text=True,
+        env=_env_with_flag(value),
+    )
+    assert proc.returncode == 0, proc.stderr
+    return "updatedInput" in proc.stdout
+
+
+def test_pretool_gate_parity_shell_and_python() -> None:
+    """S1 pin: BOTH gates implement the same opt-out semantics over the full
+    enumeration — unset, empty, falsy spellings (case/whitespace variants),
+    truthy spellings, and unknown junk. Pre-flip, unset/empty/'garbage' were OFF
+    in both gates and 'disabled' was ON, so this fails on pre-flip code."""
+    for value, expected_on in _GATE_PARITY_CASES:
+        assert _shell_gate_enabled(value) is expected_on, f"shell gate disagrees on {value!r}"
+        assert _python_gate_enabled(value) is expected_on, f"python gate disagrees on {value!r}"
 
 
 # --- SessionStart status signal ---------------------------------------------------

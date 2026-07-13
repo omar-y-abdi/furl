@@ -23,7 +23,8 @@ the token savings from the default path until upstream fixes the drop.
 **What still works today:** the MCP tools (`furl_compress`, `furl_retrieve`,
 `furl_search`, `furl_list`, `furl_stats`, `furl_purge`) — manual compression and
 retrieval are unaffected; durable storage + `<<ccr:HASH>>` retrieval; the SessionStart
-status line; the observability counters below; and the opt-in `FURL_PRETOOL_PIPE` path.
+status line; the observability counters below; and the `FURL_PRETOOL_PIPE` pipe (on by
+default), which delivers real savings today.
 
 The hook **keeps emitting** `updatedToolOutput`, so the default path revives
 automatically — with no plugin release — the moment upstream fixes #68951.
@@ -43,31 +44,52 @@ raw tool output, the harness is dropping the replacements — see
 project also prints a one-line stderr heads-up. (These counters are live as of this
 plugin release — the pinned engine, `furl-ctx` 1.2.0+, ships the store counter API that
 populates them.)
-Once the opt-in pipe has run, `pipe_invocations_seen` / `pipe_compressions_applied` /
+Once the pipe has run, `pipe_invocations_seen` / `pipe_compressions_applied` /
 `pipe_noop_reasons` appear in the same `store.hook_activity` block.
 
-### `FURL_PRETOOL_PIPE` — real savings on today's harness (opt-in, default OFF)
+### `FURL_PRETOOL_PIPE` — real savings on today's harness (on by default)
 
-Set `FURL_PRETOOL_PIPE=1` to enable a **PreToolUse** hook that rewrites a `Bash`
-command so its stdout is piped through the Furl compressor **before** it becomes the
-tool result — so the model-visible output **is** the compressed form (the original is
-stored under a `<<ccr:HASH>>` marker, retrievable via `furl_retrieve`, exactly like the
-PostToolUse path). It does **not** rely on `updatedToolOutput`, so it works now.
-
-Trade-offs:
+The PreToolUse pipe is **enabled by default** — real token savings on today's harness.
+Disable it with `FURL_PRETOOL_PIPE=0`. **What you're getting by default** (the
+trade-offs, up front):
 
 - **Bash-only** — it rewrites a command's stdout; other tools are untouched.
 - **The command mutation is visible in the transcript** — the rewrite carries a
-  `# furl-pipe (FURL_PRETOOL_PIPE=1)` comment so it is never a silent substitution.
-- **Exit code preserved exactly**; small outputs pass through raw; **fail-open** twice
-  over — a compressor that cannot start falls back to the raw captured output, and if
-  the stdout tempfile cannot even be created the original command runs **unwrapped**
-  (uncompressed); never a broken command.
+  `# furl-pipe (FURL_PRETOOL_PIPE=0 to disable)` comment so it is never a silent
+  substitution.
+- **Permission rules are respected (provably):** the pipe rewrites Bash **only when you
+  have no Bash permission rules at all**. If **any** `Bash` rule of any kind —
+  `permissions.deny`, `permissions.ask`, **or** `permissions.allow` — exists in
+  enterprise managed settings, project `.claude/settings.json` /
+  `.claude/settings.local.json`, or the user-scope `~/.claude/` equivalents, the pipe
+  **leaves every Bash command untouched**, so your rules apply exactly as native — no
+  command shape can bypass them. (`allow` counts because an allow-list makes unlisted
+  commands restricted.) Unreadable or malformed settings also force passthrough. The
+  trade-off is honest: once you add any Bash permission rule, the pipe stops compressing
+  Bash for that session.
+- **Latency:** ~0.3–0.5 s added per rewritten Bash call (two `uv` resolves: the shell
+  gate plus the in-command compressor). The first call in a fresh environment pays a
+  one-time resolve/build — seconds to tens of seconds.
 - **stderr is not captured and flows live** — but because stdout is buffered for
   compression, stderr/stdout **interleaving is not preserved**: in a merged view all
   stderr appears before the (possibly compressed) stdout. `cmd 2>&1` merges both into
   the compressed stream.
-- Default **OFF** is a byte-identical no-op (the default-off path spends no `uv` resolve).
+- **Exit code preserved exactly**; small outputs pass through raw; **fail-open** twice
+  over — a compressor that cannot start falls back to the raw captured output, and if
+  the stdout tempfile cannot even be created the original command runs **unwrapped**
+  (uncompressed); never a broken command.
+
+How it works: a **PreToolUse** hook rewrites a `Bash` command so its stdout is piped
+through the Furl compressor **before** it becomes the tool result — so the model-visible
+output **is** the compressed form (the original is stored under a `<<ccr:HASH>>` marker,
+retrievable via `furl_retrieve`, exactly like the PostToolUse path). It does **not**
+rely on `updatedToolOutput`, so it works now. Before rewriting, the hook reads the
+deny/ask permission rules it can see and passes any matching, compound, or doubtful
+command through untouched — it fails toward no-compression, never toward masking a
+permission rule. Opt-out semantics: only an explicitly falsy value —
+`0`/`false`/`off`/`no`/`disabled`, case-insensitive (whitespace ignored) — disables it;
+unset, empty, or any other value (including typos) leaves it ON. Disabling is cheap:
+the falsy path spends no `uv` resolve.
 
 #### Known limitations
 
@@ -83,8 +105,24 @@ Trade-offs:
   backslash is not preserved in stdout — and bare-bash behavior itself differs between
   versions here (GNU bash 5 `-c` keeps the dangling backslash literal; macOS bash 3.2
   drops it).
-- **Permission allowlists:** the rewritten command no longer matches a user's
-  `Bash(...)` allowlist entries, so permission prompts can differ with the pipe on.
+- **Permission-rule visibility:** the guard is intentionally coarse and total — it
+  rewrites Bash **only when there are zero readable Bash permission rules**. It reads
+  every scope Claude Code actually uses, including relocations: **enterprise managed
+  settings** (the per-OS `managed-settings.json` + its `managed-settings.d` fragments, or
+  the `CLAUDE_CODE_MANAGED_SETTINGS_PATH` override), **project** settings
+  (`.claude/settings.json` / `.claude/settings.local.json` under both `CLAUDE_PROJECT_DIR`
+  and the working dir), and **user** settings (under both `~/.claude` **and**
+  `CLAUDE_CONFIG_DIR`). If **any** `Bash` rule (deny/ask/allow — an allowlist counts, since
+  it makes unlisted commands restricted) exists in those, **all** Bash passes through
+  untouched, so your native rules apply exactly — a coarse-but-provable boundary that no
+  command shape (wrapper-hidden `env`/`sudo`/`flock`, compound, absolute path, …) can slip
+  past, because when a rule exists nothing is rewritten (this also avoids the auto-mode
+  obfuscation classifier entirely). The genuine residual blindness — set
+  `FURL_PRETOOL_PIPE=0` if you restrict Bash **only** through these — is CLI
+  `--permission-mode` / `--disallowedTools` flags, SDK `managedSettings` options, and
+  API-fetched remote org policy (`CLAUDE_CODE_REMOTE_SETTINGS_PATH` / `remoteSettings`, a
+  session-scope fetch rather than a file). (`~/.claude.json` is not read: it carries no
+  deny/ask rules, only `allowedTools`.)
 - **Cold-start cost:** with the pipe and the PostToolUse hook both enabled, one Bash
   call can spend up to 3 `uv` resolves before caches warm.
 - **Cosmetic:** bash error messages gain a `line N:` prefix from the multi-line wrapper.
@@ -107,6 +145,9 @@ to that one project while the MCP tools stay available. Equivalent broader alter
 
 ## Install (2 commands)
 
+**Prerequisite:** [`uv`](https://docs.astral.sh/uv/) on your PATH — the same bootstrap
+the official [serena](https://github.com/oraios/serena) plugin uses.
+
 Inside Claude Code:
 
 ```
@@ -116,12 +157,9 @@ Inside Claude Code:
 
 That is the whole install. It registers this repo as a marketplace named `furl`
 and installs the plugin — MCP server, compression hook, and skill. **No `pip
-install`, no venv:** Furl fetches itself on first use via
-[`uv`](https://docs.astral.sh/uv/) from prebuilt wheels on PyPI (Linux
-x86_64/aarch64, macOS arm64/Intel — no Windows wheels yet, so Windows needs a
-Rust toolchain to build from source). The one requirement is
-`uv` on your PATH — the same bootstrap the official
-[serena](https://github.com/oraios/serena) plugin uses.
+install`, no venv:** Furl fetches itself on first use via `uv` from prebuilt
+wheels on PyPI (Linux x86_64/aarch64, macOS arm64/Intel — no Windows wheels yet,
+so Windows needs a Rust toolchain to build from source).
 
 Restart the session (or re-enable the plugin) so the MCP server and hook load.
 First use triggers a one-time wheel download (a few seconds).
@@ -200,7 +238,7 @@ output that actually enters context.
 | `FURL_HOOK_EXCLUDE_TOOLS` | (none) | Comma-separated tools never to compress — exact or `mcp__db__*` globs. |
 | `FURL_HOOK_MODE` | `normal` | `aggressive` compresses more (code + smaller outputs). |
 | `FURL_HOOK_VERBOSE` | off | `1` prints a one-line per-compression savings summary to stderr. |
-| `FURL_PRETOOL_PIPE` | off | `1`/`true`/`on` enables the opt-in PreToolUse pipe (Bash-only, real savings on today's harness — see "Current harness status"). Default off is a byte-identical no-op. The gate runs via `sh -lc` (a login shell), so an export in your login profile or in the environment Claude Code launches from takes effect. |
+| `FURL_PRETOOL_PIPE` | **on** | The PreToolUse pipe (Bash-only, real savings on today's harness — see "Current harness status") runs **by default**. Only an explicitly falsy value — `0`/`false`/`off`/`no`/`disabled`, case-insensitive, whitespace ignored — disables it; unset/empty/any other value leaves it on. It rewrites Bash only when there are zero readable Bash permission rules; if any deny/ask/allow `Bash` rule exists (enterprise/project/local/user settings), it leaves Bash untouched (see Known limitations). The gate runs via `sh -lc` (a login shell), so an export in your login profile or in the environment Claude Code launches from takes effect. |
 | `FURL_STATUS_LINE` | on | `0` silences the one-line SessionStart status signal. Export it in the environment Claude Code launches from — the status hook runs `sh -c`, which does not source login profiles. |
 
 The full `FURL_*` reference is in [`LIBRARY.md`](../../LIBRARY.md) → "Configuration".
@@ -233,7 +271,7 @@ plugins/furl/
 ├── hooks/
 │   ├── hooks.json           # PostToolUse + PreToolUse + SessionStart registration
 │   ├── compress_tool_output.py   # the fail-open PostToolUse compression hook
-│   ├── pretool_pipe.py      # opt-in PreToolUse pipe rewrite (FURL_PRETOOL_PIPE)
+│   ├── pretool_pipe.py      # PreToolUse pipe rewrite (on by default; FURL_PRETOOL_PIPE=0 off)
 │   ├── pipe_compress.py     # the stdout compressor the pipe rewrite runs
 │   └── _furl_ccr_counters.py     # shared cross-process observability counters
 ├── skills/

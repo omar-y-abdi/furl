@@ -4,7 +4,7 @@ The hook (a subprocess) tallies into the shared per-project sqlite store; furl_s
 must read those counters back so a user can tell "the hook ran but my context still
 shows raw output" (#68951) from "the hook never fired". These tests pin that the
 counters appear under the cross-process ``store`` block, that no-op reasons are
-grouped, that the opt-in pipe counters appear only once the pipe has run, and that
+grouped, that the pipe counters appear only once the pipe has actually run, and that
 the two scopes carry a clarifying label.
 """
 
@@ -66,7 +66,7 @@ async def test_pipe_counters_hidden_until_pipe_runs() -> None:
 
     stats = _envelope(await FurlMCPServer()._handle_stats())
     activity = stats["store"]["hook_activity"]
-    assert "pipe_invocations_seen" not in activity  # opt-in path idle → not shown
+    assert "pipe_invocations_seen" not in activity  # pipe never ran here → not shown
 
     store.increment_counter("pipe_invocations_seen", 4)
     store.increment_counter("pipe_compressions_applied", 1)

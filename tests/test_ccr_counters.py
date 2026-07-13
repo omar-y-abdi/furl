@@ -1,6 +1,6 @@
 """Cross-process observability counters on the CCR store.
 
-The PostToolUse hook and the opt-in PreToolUse pipe are short-lived subprocesses;
+The PostToolUse hook and the (on-by-default) PreToolUse pipe are short-lived subprocesses;
 the ``furl`` MCP server is long-lived. For ``furl_stats`` to surface hook activity
 it can't see directly (Finding B / #68951 diagnostic), the counters must persist
 in the SAME durable per-project sqlite file both sides open. These tests pin:

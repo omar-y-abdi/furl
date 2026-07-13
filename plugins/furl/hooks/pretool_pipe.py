@@ -1,16 +1,54 @@
 #!/usr/bin/env python3
-"""Furl PreToolUse hook (OPT-IN, default OFF): a real-savings compression path
-that does NOT depend on PostToolUse ``updatedToolOutput`` (silently dropped by
-Claude Code >=2.1.163 — anthropics/claude-code#68951).
+"""Furl PreToolUse hook (ON BY DEFAULT — disable with FURL_PRETOOL_PIPE=0): the
+real-savings compression path that does NOT depend on PostToolUse
+``updatedToolOutput`` (silently dropped by Claude Code >=2.1.163 —
+anthropics/claude-code#68951).
 
-When ``FURL_PRETOOL_PIPE`` is enabled, this rewrites a ``Bash`` command so its
-STDOUT is piped through the Furl compressor (``pipe_compress.py``) BEFORE it
-becomes the tool result — so the model-visible output IS the compressed form,
-with the original stored under a ``<<ccr:HASH>>`` marker (retrievable via
-``furl_retrieve``), exactly like the PostToolUse path.
+Unless disabled, this rewrites a ``Bash`` command so its STDOUT is piped through
+the Furl compressor (``pipe_compress.py``) BEFORE it becomes the tool result —
+so the model-visible output IS the compressed form, with the original stored
+under a ``<<ccr:HASH>>`` marker (retrievable via ``furl_retrieve``), exactly
+like the PostToolUse path.
 
-DEFAULT OFF: with ``FURL_PRETOOL_PIPE`` unset/falsey this hook emits nothing and
-exits 0 — a byte-identical no-op, zero behavior change. Only ``Bash`` is touched.
+SMART DEFAULT (v10, user-approved): the pipe runs UNLESS ``FURL_PRETOOL_PIPE``
+is EXPLICITLY falsy — ``0``/``false``/``off``/``no``/``disabled``
+(case-insensitive, ALL whitespace removed). Unset, empty, and any other value —
+including unknown junk — leave it ON ("on unless explicitly disabled", so a typo
+never silently disables savings). Only ``Bash`` is touched.
+
+CORE PROPERTY — PERMISSION-RULE SAFETY (provably-safe redesign, non-negotiable,
+total): this hook MUST NEVER rewrite a command that Claude Code would subject to
+a permissions **deny** or **ask** rule. Claude Code evaluates those rules against
+the REWRITTEN command, and the furl-pipe wrapper no longer matches
+``Bash(verb:*)`` patterns — so rewriting a governed command would silently
+downgrade a hard deny to "ask" (normal mode) or trip the obfuscation classifier
+(auto mode). The invariant is made TOTAL by a single predicate instead of
+fragile per-verb matching: the hook rewrites a Bash command ONLY IF there are
+ZERO readable Bash permission rules. If ANY Bash rule of ANY kind exists — deny,
+ask, OR allow (see below), blanket or scoped — across the scopes CC actually
+uses: enterprise managed settings (the per-OS ``managed-settings.json`` + its
+``managed-settings.d`` fragments, OR the ``$CLAUDE_CODE_MANAGED_SETTINGS_PATH``
+override), project scope (``.claude/settings{,.local}.json`` under BOTH
+``$CLAUDE_PROJECT_DIR`` and the payload cwd), or user scope
+(``settings{,.local}.json`` under BOTH ``~/.claude`` AND ``$CLAUDE_CONFIG_DIR``),
+it PASSES THROUGH ALL Bash: no rewrite, no per-verb analysis. This makes "never
+mask a deny/ask rule" TOTAL — no command shape (a command-modifier wrapper CC
+sees through like ``env``/``sudo``/``flock``/``strace``, a compound, or anything
+CC's closed-source resolver interprets) can be masked, because when a rule exists
+NOTHING is rewritten. ANY doubt (unreadable or malformed settings, or a
+config-path override env var that is set but cannot be confidently resolved) also
+PASSES THROUGH. Fail toward no-compression, never toward masking a permission
+rule; no-savings is acceptable, defeating a rule is not. WHY ``allow`` COUNTS: an
+allow-list config makes UNLISTED commands restricted (ask/deny by default), so
+the mere presence of allow rules is itself a maskable restrictive posture —
+including it keeps the invariant total and is maximally conservative, while still
+meeting the zero-config criterion (a fresh install has NO permissions config →
+rewrite → savings). HONEST BLINDNESS (the genuine residual): the hook still
+cannot see CLI flags (``--permission-mode``, ``--disallowedTools``), SDK
+``managedSettings`` options, or API-fetched remote org policy
+(``$CLAUDE_CODE_REMOTE_SETTINGS_PATH`` / ``remoteSettings`` — a session-scope
+fetch, not a normal file). Users relying on those for Bash restrictions should
+set ``FURL_PRETOOL_PIPE=0`` (documented in the plugin README).
 
 Contract (PreToolUse):
   stdin  : JSON {tool_name, tool_input:{command, ...}, cwd, ...}
@@ -43,25 +81,236 @@ from pathlib import Path
 _FURL_CTX_PIN = "furl-ctx[mcp]==1.2.0"
 
 # Transparency marker: prepended to the rewritten command (visible in the
-# transcript) AND used as the loop guard so an already-wrapped command is never
-# double-wrapped.
-_PIPE_MARKER = "# furl-pipe (FURL_PRETOOL_PIPE=1)"
+# transcript). Names the OPT-OUT since the pipe is on by default.
+_PIPE_MARKER = "# furl-pipe (FURL_PRETOOL_PIPE=0 to disable)"
+
+# Loop guard: the STABLE PREFIX of every marker version this plugin has ever
+# emitted (old opt-in markers said "(FURL_PRETOOL_PIPE=1)"), so a command
+# wrapped by ANY plugin version is never double-wrapped after an upgrade.
+_PIPE_GUARD = "# furl-pipe"
 
 _ENABLE_ENV = "FURL_PRETOOL_PIPE"
 
+# The explicit opt-out set (S1 smart default). Shared semantics with the
+# hooks.json shell gate — a parity test enumerates both.
+_DISABLE_VALUES = frozenset({"0", "false", "off", "no", "disabled"})
 
-def _flag_enabled(raw: str | None) -> bool:
-    """Interpret the opt-in flag. Unset/empty/falsey -> OFF (default). Only an
-    explicit truthy value turns the pipe on, so the byte-identical no-op is the
-    default and enabling it is a deliberate choice."""
+# ASCII whitespace removal — the exact character class the shell gate's
+# ``tr -d "[:space:]"`` deletes (POSIX locale), so both gates normalize
+# identically even for values with INTERNAL whitespace (review-84 F1).
+_WS_REMOVE = str.maketrans("", "", " \t\n\r\f\v")
+
+
+def _pipe_disabled(raw: str | None) -> bool:
+    """SMART DEFAULT (v10, user-approved): the pipe runs UNLESS explicitly
+    disabled. True only for an explicit falsy value — 0/false/off/no/disabled,
+    case-insensitive with ALL ASCII whitespace removed (so `` o f f `` is OFF,
+    matching the shell gate's ``tr -d "[:space:]"`` exactly). Unset (None),
+    empty, and any unrecognized value return False (pipe ON): "on unless
+    explicitly disabled", so a typo like ``FURL_PRETOOL_PIPE=fasle`` never
+    silently disables savings. SEMANTICALLY IDENTICAL to the hooks.json shell
+    gate for every value (test_pretool_gate_parity_shell_and_python enumerates
+    both, internal-whitespace cases included)."""
     if raw is None:
         return False
-    return raw.strip().lower() in {"1", "true", "yes", "on", "enabled"}
+    return raw.translate(_WS_REMOVE).lower() in _DISABLE_VALUES
 
 
 def _passthrough() -> None:
     """Emit nothing and succeed: the original command runs unchanged."""
     sys.exit(0)
+
+
+# --- permission-rule guard (provably-safe redesign) -------------------------------
+# The TOTAL invariant: rewrite a Bash command ONLY when ZERO readable Bash
+# permission rules exist. No per-verb matching, no wrapper denylist, no compound
+# analysis — existence of ANY rule is all we check, because when a rule exists
+# NOTHING is rewritten, so no command shape can mask it. See the module docstring.
+
+# Enterprise managed-settings.json DEFAULT locations, per OS. Paths VERIFIED
+# against code.claude.com/docs/en/settings (reviewer-guard G2) — never guessed.
+# An unrecognized platform maps to nothing (we do not invent a path). WSL shares
+# the Linux path. The location can be relocated via $CLAUDE_CODE_MANAGED_SETTINGS_PATH
+# (honored in ``_managed_settings_paths``), so a Bash rule that lives only in
+# managed settings — wherever they are — must still gate the pipe.
+_MANAGED_BASE_BY_PLATFORM = {
+    "darwin": Path("/Library/Application Support/ClaudeCode/managed-settings.json"),
+    "linux": Path("/etc/claude-code/managed-settings.json"),
+    "win32": Path(r"C:\Program Files\ClaudeCode\managed-settings.json"),
+}
+
+
+def _managed_dir_paths(directory: Path, filename: str = "managed-settings.json") -> list[Path]:
+    """``<directory>/<filename>`` plus any ``<directory>/managed-settings.d/*.json``
+    drop-in fragments (Claude Code merges those alphabetically). A drop-in
+    directory that cannot be enumerated is returned AS its path, which reads as
+    ``OSError`` in the loader → doubt → passthrough (never a silently missed
+    policy)."""
+    base = directory / filename
+    dropin = directory / "managed-settings.d"
+    try:
+        fragments = sorted(dropin.glob("*.json")) if dropin.is_dir() else []
+    except OSError:
+        return [base, dropin]
+    return [base, *fragments]
+
+
+def _managed_settings_paths() -> tuple[list[Path], bool]:
+    """``(paths, doubt)`` for enterprise managed settings.
+
+    Honors ``$CLAUDE_CODE_MANAGED_SETTINGS_PATH`` when set. Its file-vs-directory
+    semantics are not pinned in public docs, so rather than GUESS one we INSPECT
+    the path at runtime — a FILE is read directly; a DIRECTORY is read as
+    ``managed-settings.json`` + its ``managed-settings.d`` fragments. If the
+    override is set but resolves to NEITHER a readable file nor a directory
+    (missing/broken/permission-errored), that is DOUBT → passthrough: a
+    set-but-unresolvable managed policy must never be silently ignored and let a
+    rewrite through. When the override is unset, fall back to the verified per-OS
+    default location (nothing on an unrecognized platform)."""
+    override = os.environ.get("CLAUDE_CODE_MANAGED_SETTINGS_PATH", "").strip()
+    if override:
+        target = Path(override)
+        try:
+            if target.is_file():
+                return [target], False
+            if target.is_dir():
+                return _managed_dir_paths(target), False
+        except OSError:
+            return [], True
+        return [], True  # set but neither a readable file nor a directory → doubt
+    base = _MANAGED_BASE_BY_PLATFORM.get(sys.platform)
+    if base is None:
+        return [], False
+    return _managed_dir_paths(base.parent, base.name), False
+
+
+def _settings_paths(cwd: str) -> tuple[tuple[Path, ...], bool]:
+    """``(paths, doubt)`` — every permission-rule source this hook can see, across
+    the scopes Claude Code ACTUALLY uses (relocations included).
+
+    * enterprise managed settings (``_managed_settings_paths`` — per-OS default or
+      the ``$CLAUDE_CODE_MANAGED_SETTINGS_PATH`` override; the only ``doubt`` source);
+    * project scope from BOTH ``$CLAUDE_PROJECT_DIR`` (the session's project root,
+      where CC loads project settings) AND the payload cwd — usually the same, but
+      when they differ the union can only add rules, never mask one;
+    * user scope from BOTH ``~/.claude`` AND (when set) ``$CLAUDE_CONFIG_DIR``. CC
+      uses ``${CLAUDE_CONFIG_DIR:-$HOME/.claude}`` (the env var REPLACES the home
+      dir); reading BOTH strictly dominates that, so a relocated user rule can
+      never be missed. Over-reading is always safe (more rules → more passthrough).
+
+    Genuinely invisible here (the documented residual — set ``FURL_PRETOOL_PIPE=0``
+    if you restrict Bash only through these): CLI ``--permission-mode`` /
+    ``--disallowedTools`` flags, SDK ``managedSettings`` options, and API-fetched
+    remote org policy (``$CLAUDE_CODE_REMOTE_SETTINGS_PATH`` / ``remoteSettings``,
+    a session-scope fetch, not a normal file). ``~/.claude.json`` is intentionally
+    NOT read: it carries no deny/ask rules (only ``allowedTools``), so a missed
+    entry there is a savings nit, not a bypass."""
+    project_dirs: list[Path] = []
+    project_root = os.environ.get("CLAUDE_PROJECT_DIR", "").strip()
+    if project_root:
+        project_dirs.append(Path(project_root))
+    if Path(cwd) not in project_dirs:
+        project_dirs.append(Path(cwd))
+    project_scopes = [d / ".claude" for d in project_dirs]
+    # User scope: the UNION of ~/.claude and $CLAUDE_CONFIG_DIR (deduped).
+    user_scopes: list[Path] = [Path.home() / ".claude"]
+    config_dir = os.environ.get("CLAUDE_CONFIG_DIR", "").strip()
+    if config_dir and Path(config_dir) not in user_scopes:
+        user_scopes.append(Path(config_dir))
+    scopes = [*project_scopes, *user_scopes]
+    scoped = [scope / name for scope in scopes for name in ("settings.json", "settings.local.json")]
+    managed_paths, managed_doubt = _managed_settings_paths()
+    return (*managed_paths, *scoped), managed_doubt
+
+
+def _bash_bodies_from_entries(entries: object) -> tuple[list[str | None], bool]:
+    """Collect the Bash-governing rule bodies from one deny/ask/allow array.
+
+    Returns ``(bodies, doubt)``: any Bash entry contributes a body (``None`` for
+    a BLANKET bare ``Bash`` or an unparseable ``Bash(...``; the string body
+    otherwise). Only EXISTENCE matters downstream, so the body content is now
+    incidental — but it stays a faithful record of what was found. Rules for
+    other tools (including ``BashOutput``, which merely shares the prefix) are
+    irrelevant to a Bash rewrite and are skipped. Any shape we cannot read raises
+    *doubt* instead of being guessed at."""
+    bodies: list[str | None] = []
+    if not isinstance(entries, list):
+        return bodies, True
+    doubt = False
+    for entry in entries:
+        if not isinstance(entry, str):
+            doubt = True
+            continue
+        rule = entry.strip()
+        # A recognizable Bash rule is EXACTLY ``Bash`` or starts with ``Bash(``.
+        # The open paren disambiguates ``Bash(...)`` from the sibling tool
+        # ``BashOutput`` (which does not govern command execution). Whitespace is
+        # stripped first, so `` Bash(rm:*) `` and ``Bash( rm:*)`` both count. An
+        # UNTERMINATED but recognizable rule (``Bash(rm:*`` — no close paren)
+        # still counts as PRESENT (a ``None`` body) and is never silently
+        # dropped: presence is what gates the rewrite, so a rule we can see but
+        # not fully parse must still force passthrough.
+        if rule == "Bash":
+            bodies.append(None)
+        elif rule.startswith("Bash("):
+            bodies.append(rule[5:-1] if rule.endswith(")") else None)
+    return bodies, doubt
+
+
+def _load_bash_rule_bodies(paths: tuple[Path, ...]) -> tuple[list[str | None], bool]:
+    """Union of every ``deny``/``ask``/``allow`` Bash rule body across *paths*.
+
+    Precedence is irrelevant to a conservative union: a rule in ANY scope could
+    gate the command, so all of them count. ``allow`` is included because an
+    allow-list config makes UNLISTED commands restricted, so its presence is
+    itself a maskable posture (see the module docstring). ``doubt`` is True when
+    a source EXISTS but cannot be read or parsed (unreadable file, invalid JSON,
+    wrong shapes) — the caller must pass through, because unknowable rules could
+    contain a deny. A missing file is not doubt; it simply has no rules."""
+    bodies: list[str | None] = []
+    doubt = False
+    for path in paths:
+        try:
+            text = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            continue
+        except OSError:
+            doubt = True
+            continue
+        try:
+            data = json.loads(text)
+        except ValueError:
+            doubt = True
+            continue
+        if not isinstance(data, dict):
+            doubt = True
+            continue
+        permissions = data.get("permissions")
+        if permissions is None:
+            continue
+        if not isinstance(permissions, dict):
+            doubt = True
+            continue
+        for key in ("deny", "ask", "allow"):
+            if key not in permissions:
+                continue
+            found, entry_doubt = _bash_bodies_from_entries(permissions[key])
+            bodies.extend(found)
+            doubt = doubt or entry_doubt
+    return bodies, doubt
+
+
+def _has_any_bash_rule(bodies: list[str | None]) -> bool:
+    """The TOTAL invariant's predicate: True iff ANY readable Bash permission
+    rule exists (deny/ask/allow, blanket or scoped). A rewrite happens ONLY when
+    this is False (and there is no doubt) — no per-verb matching, because when a
+    rule exists NOTHING is rewritten, so no command shape can mask it.
+
+    Uses ``bool(bodies)`` (list non-empty), NOT ``any(bodies)``: a blanket or
+    unterminated rule contributes a ``None`` body, and ``any([None])`` is False
+    while ``bool([None])`` is True — a recognizable rule must count as present
+    even when its body could not be parsed."""
+    return bool(bodies)
 
 
 def _rewrite_command(original: str, project_dir: str, compressor: str) -> str:
@@ -134,9 +383,9 @@ def _project_dir(payload: dict) -> str:
 
 
 def main() -> None:
-    # Opt-in gate FIRST: default OFF is a byte-identical no-op, and when off we
-    # never even parse stdin — zero behavior change and zero added latency.
-    if not _flag_enabled(os.environ.get(_ENABLE_ENV)):
+    # Opt-OUT gate FIRST (S1 smart default): an explicitly disabled pipe is a
+    # byte-identical no-op — we never even parse stdin, zero added latency.
+    if _pipe_disabled(os.environ.get(_ENABLE_ENV)):
         _passthrough()
 
     try:
@@ -164,8 +413,21 @@ def main() -> None:
     if not isinstance(command, str) or not command.strip():
         _passthrough()
 
-    # Loop guard: never double-wrap a command we already rewrote.
-    if _PIPE_MARKER in command:
+    # Loop guard: never double-wrap a command we (any plugin version) rewrote —
+    # matches the stable "# furl-pipe" prefix, not one marker spelling.
+    if _PIPE_GUARD in command:
+        _passthrough()
+
+    # SECURITY GUARD (provably-safe, total): rewrite ONLY when ZERO readable Bash
+    # permission rules exist. If ANY Bash rule (deny/ask/allow) is present — or
+    # settings are unreadable/malformed (doubt) — pass through so the original
+    # command runs and CC's rules apply exactly as native. No per-verb analysis,
+    # so no command shape can mask a rule.
+    raw_cwd = payload.get("cwd")
+    guard_cwd = raw_cwd if isinstance(raw_cwd, str) and raw_cwd.strip() else os.getcwd()
+    paths, path_doubt = _settings_paths(guard_cwd)
+    bodies, load_doubt = _load_bash_rule_bodies(paths)
+    if path_doubt or load_doubt or _has_any_bash_rule(bodies):
         _passthrough()
 
     compressor = str(Path(__file__).resolve().parent / "pipe_compress.py")

@@ -109,6 +109,9 @@ def test_first_run_note_fires_exactly_once(tmp_path) -> None:
     first = _run_hook(payload, ws, proj)
     second = _run_hook(payload, ws, proj)
     assert "anthropics/claude-code#68951" in first.stderr, "first durable run must warn once"
+    # S1: the note now also tells the user the PreToolUse pipe is active by
+    # default and how to opt out — the actionable half of the heads-up.
+    assert "FURL_PRETOOL_PIPE=0" in first.stderr, "note must name the pipe opt-out"
     assert "#68951" not in second.stderr, "the note must not repeat"
     assert _counters(ws, proj)["hook_invocations_seen"] == 2
 

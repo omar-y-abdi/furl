@@ -1,7 +1,7 @@
 ---
 name: furl
 description: How the Furl context-compression plugin works — the furl_compress / furl_retrieve / furl_stats / furl_purge / furl_search / furl_list MCP tools, the PostToolUse hook that shrinks large tool outputs, the <<ccr:HASH>> retrieval flow, and the FURL_* environment knobs to tune or disable it. Use when the user asks what Furl is doing, why a tool output looks compressed or contains <<ccr:...>> markers, how to retrieve original content, how to tune compression thresholds, or how to turn the hook off.
-version: 1.2.0
+version: 1.3.0
 ---
 
 # Furl — context compression for Claude Code
@@ -28,15 +28,29 @@ emitting the replacement, so the default path revives itself when upstream fixes
 your context still shows raw tool output, the harness is dropping the replacements — see
 [#68951](https://github.com/anthropics/claude-code/issues/68951).**
 
-**Real savings now (opt-in):** set `FURL_PRETOOL_PIPE=1` for a **PreToolUse** pipe that
-compresses a `Bash` command's stdout at the source (so the tool result *is* the
-compressed form, original retrievable via `furl_retrieve`) — it doesn't use
-`updatedToolOutput`, so it works today. Bash-only; the rewrite is transcript-visible
-(a `# furl-pipe` comment); exit code preserved exactly; stderr is not captured and flows
-live, but stderr/stdout interleaving is not preserved (all stderr precedes the
-compressed stdout; `2>&1` merges); fail-open (worst case the command runs unwrapped,
-uncompressed). Default off. Known limitations (redaction gaps on fail-open paths,
-`Bash(...)` allowlist mismatch, heredoc edge): see the plugin README.
+**Real savings now (enabled by default):** a **PreToolUse** pipe compresses a `Bash`
+command's stdout at the source (so the tool result *is* the compressed form, original
+retrievable via `furl_retrieve`) — it doesn't use `updatedToolOutput`, so it works
+today. Disable it with `FURL_PRETOOL_PIPE=0` (`false`/`off`/`no`/`disabled` also work,
+case-insensitively); unset, empty, or any other value leaves it on. Trade-offs:
+Bash-only; the rewrite is transcript-visible (a `# furl-pipe` comment); exit code
+preserved exactly; stderr is not captured and flows live, but stderr/stdout
+interleaving is not preserved (all stderr precedes the compressed stdout; `2>&1`
+merges); fail-open (worst case the command runs unwrapped, uncompressed); adds
+~0.3–0.5 s per rewritten call (two `uv` resolves; a fresh environment pays a
+one-time resolve/build on the first call). It rewrites Bash **only when there
+are zero readable Bash permission rules**: if any `Bash` deny/ask/allow rule
+exists in any scope Claude Code uses — enterprise managed (incl. the
+`CLAUDE_CODE_MANAGED_SETTINGS_PATH` override), project (both `CLAUDE_PROJECT_DIR`
+and the working dir), and user (both `~/.claude` and `CLAUDE_CONFIG_DIR`)
+settings — it leaves all Bash untouched so your rules apply exactly as native, a
+total boundary no command shape can bypass. Unreadable settings (or a set-but-
+unresolvable config-path override) also force passthrough. Residual blindness:
+CLI `--permission-mode`/`--disallowedTools` flags, SDK `managedSettings`, and
+API-fetched remote org policy (`CLAUDE_CODE_REMOTE_SETTINGS_PATH`); if you
+restrict Bash only through those, set `FURL_PRETOOL_PIPE=0`. Known limitations
+(redaction gaps on fail-open paths, heredoc edge, permission-rule visibility
+bounds): see the plugin README.
 
 ## The MCP tools
 
@@ -142,7 +156,7 @@ Set these in the plugin's `hooks/hooks.json` / `.mcp.json` env, or your shell:
 | `FURL_HOOK_EXCLUDE_TOOLS` | (none) | Comma-separated tool names never to compress — exact (`Bash`) or fnmatch globs (`mcp__db__*`). Furl's own tools are always excluded. |
 | `FURL_HOOK_MODE` | `normal` | `aggressive` also compresses code in the blob and squeezes smaller outputs; `normal` keeps the default behavior. |
 | `FURL_HOOK_VERBOSE` | off | `1`/`true` prints a one-line savings summary per compression to stderr (`furl: Bash 12.4 KB -> 0.3 KB  -97%`). |
-| `FURL_PRETOOL_PIPE` | off | `1`/`true`/`on` enables the opt-in PreToolUse pipe (Bash-only, real savings on today's harness — see "Current harness status"). Default off is a byte-identical no-op. |
+| `FURL_PRETOOL_PIPE` | on | The PreToolUse pipe (Bash-only, real savings on today's harness — see "Current harness status") runs by default. Set `0`/`false`/`off`/`no`/`disabled` (case-insensitive) to disable; unset, empty, or any other value leaves it on. Disabled is a byte-identical no-op. |
 | `FURL_STATUS_LINE` | on | Set `0` to silence the one-line `furl … · engine furl-ctx …` SessionStart status signal. Must be exported in the environment Claude Code launches from — the status hook runs `sh -c`, which does not source login profiles. |
 | `FURL_CCR_BACKEND` | `sqlite` (set by the plugin) | CCR store backend. Must match between the hook and the `furl` server for retrieval to work. |
 | `FURL_CCR_TTL_SECONDS` | `86400` = 24h (set by the plugin) | How long offloaded originals stay retrievable before they expire. Lower to reclaim disk sooner; raise for a longer retrieval window. |
