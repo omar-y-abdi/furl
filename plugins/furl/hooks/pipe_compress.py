@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Furl pipe compressor — the STDOUT filter the opt-in FURL_PRETOOL_PIPE rewrite
-pipes a Bash command's output through.
+"""Furl pipe compressor — the STDOUT filter the on-by-default FURL_PRETOOL_PIPE
+rewrite (disable with FURL_PRETOOL_PIPE=0) pipes a Bash command's output through.
 
 Unlike the PostToolUse hook (whose ``updatedToolOutput`` Claude Code >=2.1.163
 silently DROPS — anthropics/claude-code#68951), this rewrites what the model

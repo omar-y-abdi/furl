@@ -293,7 +293,7 @@ The only entries that live solely in one process are those a veto already flagge
 as non-durable (volatile fallback) — and the caller was told exactly that at veto
 time and still holds those originals.
 
-## Claude Code harness status (≥ 2.1.163) — the PostToolUse drop and the pipe opt-in
+## Claude Code harness status (≥ 2.1.163) — the PostToolUse drop and the default-on pipe
 
 The Claude Code plugin's PostToolUse compression hook replaces a large tool output by
 emitting `hookSpecificOutput.updatedToolOutput`. On Claude Code **≥ 2.1.163 that
@@ -315,23 +315,24 @@ still shows raw tool output, the harness is dropping the replacements — see
 stored via `CompressionStore.increment_counter` / `get_counters` and read back cross-process
 through the durable SQLite backend.
 
-**`FURL_PRETOOL_PIPE` — real savings on today's harness (opt-in, default OFF).** When set
-truthy, a **PreToolUse** hook rewrites a `Bash` command so its stdout is piped through the
-Furl compressor **before** it becomes the tool result — so the model-visible output *is*
-the compressed form, with the original stored under a `<<ccr:HASH>>` marker in the same
-per-project store (same TTL as the PostToolUse path; `FURL_REDACT_PATTERNS` redaction
-applies on the normal path but **not** to binary/undecodable output or when the engine
-cannot load — see the plugin README's "Known limitations"). It does not use
-`updatedToolOutput`, so it is unaffected by #68951. Trade-offs: **Bash-only**; the command
-mutation is **visible in the transcript** (a `# furl-pipe (FURL_PRETOOL_PIPE=1)` comment,
-never a silent substitution); the original command's **exit code is preserved exactly**;
-its **stderr is not captured and flows live** — but stdout is buffered for compression, so
-stderr/stdout **interleaving is not preserved** (in a merged view all stderr precedes the
-possibly-compressed stdout; `cmd 2>&1` merges both into the compressed stream); small
-outputs pass through raw; and it is **fail-open** (a compressor that cannot start falls
-back to the raw captured output, and a tempfile that cannot be created means the original
-command runs unwrapped, uncompressed — never a broken command). Default off is a
-byte-identical no-op.
+**`FURL_PRETOOL_PIPE` — real savings on today's harness (on by default).** Unless
+explicitly disabled, a **PreToolUse** hook rewrites a `Bash` command so its stdout is piped
+through the Furl compressor **before** it becomes the tool result — so the model-visible
+output *is* the compressed form, with the original stored under a `<<ccr:HASH>>` marker in
+the same per-project store (same TTL as the PostToolUse path; `FURL_REDACT_PATTERNS`
+redaction applies on the normal path but **not** to binary/undecodable output or when the
+engine cannot load — see the plugin README's "Known limitations"). It does not use
+`updatedToolOutput`, so it is unaffected by #68951. Disable it with `FURL_PRETOOL_PIPE=0`
+(`false`/`off`/`no`/`disabled` also work, case-insensitively); unset, empty, or any other
+value leaves it on, and disabling is a byte-identical no-op. Trade-offs: **Bash-only**; the
+command mutation is **visible in the transcript** (a `# furl-pipe (FURL_PRETOOL_PIPE=0 to
+disable)` comment, never a silent substitution); the original command's **exit code is
+preserved exactly**; its **stderr is not captured and flows live** — but stdout is buffered
+for compression, so stderr/stdout **interleaving is not preserved** (in a merged view all
+stderr precedes the possibly-compressed stdout; `cmd 2>&1` merges both into the compressed
+stream); small outputs pass through raw; and it is **fail-open** (a compressor that cannot
+start falls back to the raw captured output, and a tempfile that cannot be created means
+the original command runs unwrapped, uncompressed — never a broken command).
 
 ## CLI
 

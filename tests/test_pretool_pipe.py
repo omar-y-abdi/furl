@@ -1,12 +1,14 @@
-"""Opt-in PreToolUse pipe: the rewrite hook (pretool_pipe.py) + the compressor
-(pipe_compress.py).
+"""PreToolUse pipe (on by default): the rewrite hook (pretool_pipe.py) + the
+compressor (pipe_compress.py).
 
 This is the real-savings path that does NOT depend on PostToolUse
 ``updatedToolOutput`` (dropped by Claude Code >=2.1.163, #68951): it rewrites a
 Bash command so its stdout is compressed at the SOURCE. The load-bearing
 invariants pinned here:
 
-* DEFAULT OFF is a byte-identical no-op (the flag must be a deliberate opt-in).
+* ON BY DEFAULT (S1) — unset/empty/unknown values run the pipe; only an explicit
+  falsy FURL_PRETOOL_PIPE (0/false/off/no/disabled, case-insensitive) disables
+  it, and disabled is a byte-identical no-op.
 * the rewrite preserves the ORIGINAL command's EXIT CODE exactly (proved with a
   stub compressor so the property is isolated to the shell wrapper); stderr is
   never captured and flows live — but stdout is buffered, so stderr/stdout
@@ -92,23 +94,41 @@ def _pretool(payload: dict, flag: str | None) -> subprocess.CompletedProcess[str
     )
 
 
-def test_default_off_is_byte_identical_noop() -> None:
+def test_pipe_on_by_default_unset_env_rewrites() -> None:
+    """S1 pin (SMART DEFAULT, user-approved): with FURL_PRETOOL_PIPE UNSET the
+    pipe must REWRITE — on unless explicitly disabled. Pre-flip, unset meant the
+    opt-in OFF default (empty stdout), so this fails on pre-flip code."""
     proc = _pretool({"tool_name": "Bash", "tool_input": {"command": "echo hi"}}, flag=None)
     assert proc.returncode == 0
-    assert proc.stdout == ""  # nothing emitted → original command runs unchanged
+    assert "updatedInput" in proc.stdout, "unset env must leave the pipe ON"
 
 
-def test_falsey_flags_stay_off() -> None:
-    for value in ("0", "false", "off", "no", ""):
+def test_pipe_on_for_empty_and_unknown_values() -> None:
+    """S1 pin: empty and UNKNOWN non-falsy values leave the pipe ON ("on unless
+    explicitly disabled") — a typo like 'fasle' must not silently disable
+    savings. Pre-flip these were all OFF."""
+    for value in ("", "garbage", "fasle", "2"):
         proc = _pretool({"tool_name": "Bash", "tool_input": {"command": "echo hi"}}, flag=value)
-        assert proc.returncode == 0 and proc.stdout == "", f"flag {value!r} must stay off"
+        assert proc.returncode == 0
+        assert "updatedInput" in proc.stdout, f"{value!r} must leave the pipe ON"
+
+
+def test_pipe_explicit_falsy_disables() -> None:
+    """The documented falsy set — 0/false/off/no/disabled, case-insensitive,
+    whitespace-stripped — is the ONLY way to turn the pipe off. (A guard, not a
+    flip pin: these values were also off pre-flip, then as unrecognized values;
+    now they are the explicit opt-out set.)"""
+    for value in ("0", "false", "OFF", " no ", "disabled"):
+        proc = _pretool({"tool_name": "Bash", "tool_input": {"command": "echo hi"}}, flag=value)
+        assert proc.returncode == 0 and proc.stdout == "", f"flag {value!r} must disable"
 
 
 def test_enabled_rewrites_bash_with_transparent_marker() -> None:
     proc = _pretool({"tool_name": "Bash", "tool_input": {"command": "echo hi"}}, flag="1")
     assert proc.returncode == 0
     new_cmd = json.loads(proc.stdout)["hookSpecificOutput"]["updatedInput"]["command"]
-    assert new_cmd.startswith("# furl-pipe (FURL_PRETOOL_PIPE=1)")  # transcript-visible
+    # Transcript-visible marker names the OPT-OUT (the pipe is on by default).
+    assert new_cmd.startswith("# furl-pipe (FURL_PRETOOL_PIPE=0 to disable)")
     assert "pipe_compress.py" in new_cmd
     assert "furl-ctx[mcp]==" in new_cmd  # pinned engine
     assert "exit $__furl_ec" in new_cmd  # exit-code preservation
@@ -120,6 +140,15 @@ def test_enabled_but_non_bash_passthrough() -> None:
 
 
 def test_already_wrapped_not_double_wrapped() -> None:
+    wrapped = "# furl-pipe (FURL_PRETOOL_PIPE=0 to disable)\necho already"
+    proc = _pretool({"tool_name": "Bash", "tool_input": {"command": wrapped}}, flag="1")
+    assert proc.returncode == 0 and proc.stdout == ""
+
+
+def test_old_marker_commands_still_loop_guarded() -> None:
+    """Compat: the loop guard matches the stable '# furl-pipe' PREFIX, so a
+    command wrapped by an OLDER plugin version (marker '(FURL_PRETOOL_PIPE=1)')
+    re-run after upgrade is still never double-wrapped."""
     wrapped = "# furl-pipe (FURL_PRETOOL_PIPE=1)\necho already"
     proc = _pretool({"tool_name": "Bash", "tool_input": {"command": wrapped}}, flag="1")
     assert proc.returncode == 0 and proc.stdout == ""

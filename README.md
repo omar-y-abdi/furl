@@ -38,19 +38,21 @@ Furl was extracted from the author's *Headroom* context-engineering experimentat
 
 ## Install
 
-Two commands inside Claude Code:
+**Prerequisite:** [`uv`](https://docs.astral.sh/uv/) on your PATH (same as the official [serena](https://github.com/oraios/serena) plugin).
+
+Then two commands inside Claude Code:
 
 ```
 /plugin marketplace add omar-y-abdi/furl-ctx
 /plugin install furl@furl
 ```
 
-That's it — this installs the compression hook, the MCP tools, and the skill. No `pip install`, no setup: Furl fetches itself on first use. Requires [`uv`](https://docs.astral.sh/uv/) on your PATH (same as the official [serena](https://github.com/oraios/serena) plugin).
+That's it — this installs the compression hook, the MCP tools, and the skill. No `pip install`, no setup: Furl fetches itself on first use.
 
 **What you get**
 
 - **Auto-compression hook** — shrinks large `Bash` / `WebFetch` / `WebSearch` / `Task` (sub-agent) outputs before they enter context. Fail-open: never breaks a tool call. **It does *not* touch your `Read` / `Grep` / `Glob` file reads — by design**, so a later `Edit` still sees exact file bytes; those reads (often a coding agent's largest context cost) pass through uncompressed ([why](#proof)). One honest limit: when an output is so large that Claude Code itself persists it to a file and hands the model only a file reference, there is no inline output for the hook to compress.
-- **Known issue:** Claude Code ≥2.1.163 currently ignores hooks' replacement output ([anthropics/claude-code#68951](https://github.com/anthropics/claude-code/issues/68951)), so the automatic PostToolUse compression above stores and accounts savings, but the model may still receive the original text until that bug is fixed. Manual tools (`furl_compress` / `furl_retrieve` / `furl_search`) are unaffected. See [LIBRARY.md](LIBRARY.md) for current harness status and the `FURL_PRETOOL_PIPE` opt-in.
+- **Known issue:** Claude Code ≥2.1.163 currently ignores hooks' replacement output ([anthropics/claude-code#68951](https://github.com/anthropics/claude-code/issues/68951)), so the automatic PostToolUse compression above stores and accounts savings, but the model may still receive the original text until that bug is fixed. Manual tools (`furl_compress` / `furl_retrieve` / `furl_search`) are unaffected, and real savings still land today via the **on-by-default PreToolUse pipe** (Bash-only; disable with `FURL_PRETOOL_PIPE=0`). See [LIBRARY.md](LIBRARY.md) for current harness status and pipe details.
 - **Signal-aware offload + sliceable retrieval** — a payload too big to compress inline (e.g. a 33 MB trace) comes back as a structured summary (schema, per-field value histograms, example rows) instead of a truncated head/tail, and the agent pulls a narrow slice on demand — `retrieve(hash, select_field="name", select_equals="DroppedFrame")` or a numeric range — without materializing the whole thing.
 - **MCP tools** — `furl_compress`, `furl_retrieve`, `furl_stats`, `furl_purge` (erase stored originals), `furl_search` (find by content substring), `furl_list` (list stored entries). A seventh tool, `furl_read`, exists but is off by default — enable with `FURL_MCP_READ=1` (see [LIBRARY.md](LIBRARY.md)).
 - **Skill** — explains the `<<ccr:HASH>>` retrieval flow and how to tune or disable it.

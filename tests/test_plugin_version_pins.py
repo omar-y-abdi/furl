@@ -113,7 +113,7 @@ def test_mcp_pin_matches_pyproject_version() -> None:
 
 
 def test_pretool_pin_matches_pyproject_version() -> None:
-    # The opt-in PreToolUse pipe hook resolves the same pinned engine.
+    # The on-by-default PreToolUse pipe hook resolves the same pinned engine.
     assert _extract(_PIN_RE, _pretool_command(), "furl-ctx[mcp] pin") == _pyproject_version()
 
 

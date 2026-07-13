@@ -231,7 +231,7 @@ def _mode_kwargs() -> dict[str, object]:
     """FURL_HOOK_MODE -> compress() overrides. ``aggressive`` also compresses code
     in the blob and squeezes smaller outputs; ``normal`` (default) keeps the
     shipped behavior. (``lossless_only`` is not yet wired — it needs an engine-side
-    pipeline lever; see harness-plan.md.)"""
+    pipeline lever.)"""
     if os.environ.get(_MODE_ENV, "").strip().lower() == "aggressive":
         return {"protect_recent": 0, "min_tokens_to_compress": 50}
     return {}
@@ -345,8 +345,9 @@ def _emit(output_text: str, *, compressed: bool) -> NoReturn:
     NOTE (anthropics/claude-code#68951): Claude Code >=2.1.163 currently DROPS
     this ``updatedToolOutput`` — the model still sees the original. The emission
     is kept so the feature revives automatically when upstream fixes the drop;
-    until then real savings need the opt-in PreToolUse pipe (FURL_PRETOOL_PIPE),
-    and the counters here surface whether the drop is happening."""
+    until then real savings come from the on-by-default PreToolUse pipe
+    (FURL_PRETOOL_PIPE=0 disables it), and the counters here surface whether the
+    drop is happening."""
     output = {
         "hookSpecificOutput": {
             "hookEventName": "PostToolUse",

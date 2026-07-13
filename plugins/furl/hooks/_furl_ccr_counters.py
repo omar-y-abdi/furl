@@ -1,6 +1,6 @@
 """Shared CCR observability counters for Furl's hooks.
 
-Both the PostToolUse compression hook and the opt-in PreToolUse pipe compressor
+Both the PostToolUse compression hook and the on-by-default PreToolUse pipe compressor
 tally their activity into the SAME durable per-project CCR store the MCP server
 reads, so ``furl_stats`` surfaces cross-process hook activity even though each
 hook is a short-lived subprocess. Counters are cumulative and monotonic (they
@@ -37,7 +37,8 @@ PIPE_NOOP_PREFIX = "pipe_noop:"
 # it fires once, not on every tool call — see ``emit_first_run_note_if_first``.
 FIRST_RUN_NOTE = (
     "furl: note — Claude Code >=2.1.163 may ignore replacement output "
-    "(anthropics/claude-code#68951); savings apply when fixed; see furl_stats counters"
+    "(anthropics/claude-code#68951); the PreToolUse pipe is active by default for "
+    "real savings (FURL_PRETOOL_PIPE=0 to disable); see furl_stats counters"
 )
 
 

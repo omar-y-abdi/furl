@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
-"""Furl PreToolUse hook (OPT-IN, default OFF): a real-savings compression path
-that does NOT depend on PostToolUse ``updatedToolOutput`` (silently dropped by
-Claude Code >=2.1.163 — anthropics/claude-code#68951).
+"""Furl PreToolUse hook (ON BY DEFAULT — disable with FURL_PRETOOL_PIPE=0): the
+real-savings compression path that does NOT depend on PostToolUse
+``updatedToolOutput`` (silently dropped by Claude Code >=2.1.163 —
+anthropics/claude-code#68951).
 
-When ``FURL_PRETOOL_PIPE`` is enabled, this rewrites a ``Bash`` command so its
-STDOUT is piped through the Furl compressor (``pipe_compress.py``) BEFORE it
-becomes the tool result — so the model-visible output IS the compressed form,
-with the original stored under a ``<<ccr:HASH>>`` marker (retrievable via
-``furl_retrieve``), exactly like the PostToolUse path.
+Unless disabled, this rewrites a ``Bash`` command so its STDOUT is piped through
+the Furl compressor (``pipe_compress.py``) BEFORE it becomes the tool result —
+so the model-visible output IS the compressed form, with the original stored
+under a ``<<ccr:HASH>>`` marker (retrievable via ``furl_retrieve``), exactly
+like the PostToolUse path.
 
-DEFAULT OFF: with ``FURL_PRETOOL_PIPE`` unset/falsey this hook emits nothing and
-exits 0 — a byte-identical no-op, zero behavior change. Only ``Bash`` is touched.
+SMART DEFAULT (v10, user-approved): the pipe runs UNLESS ``FURL_PRETOOL_PIPE``
+is EXPLICITLY falsy — ``0``/``false``/``off``/``no``/``disabled``
+(case-insensitive, whitespace-stripped). Unset, empty, and any other value —
+including unknown junk — leave it ON ("on unless explicitly disabled", so a typo
+never silently disables savings). Only ``Bash`` is touched.
 
 Contract (PreToolUse):
   stdin  : JSON {tool_name, tool_input:{command, ...}, cwd, ...}
@@ -43,20 +47,32 @@ from pathlib import Path
 _FURL_CTX_PIN = "furl-ctx[mcp]==1.2.0"
 
 # Transparency marker: prepended to the rewritten command (visible in the
-# transcript) AND used as the loop guard so an already-wrapped command is never
-# double-wrapped.
-_PIPE_MARKER = "# furl-pipe (FURL_PRETOOL_PIPE=1)"
+# transcript). Names the OPT-OUT since the pipe is on by default.
+_PIPE_MARKER = "# furl-pipe (FURL_PRETOOL_PIPE=0 to disable)"
+
+# Loop guard: the STABLE PREFIX of every marker version this plugin has ever
+# emitted (old opt-in markers said "(FURL_PRETOOL_PIPE=1)"), so a command
+# wrapped by ANY plugin version is never double-wrapped after an upgrade.
+_PIPE_GUARD = "# furl-pipe"
 
 _ENABLE_ENV = "FURL_PRETOOL_PIPE"
 
+# The explicit opt-out set (S1 smart default). Shared semantics with the
+# hooks.json shell gate — a parity test enumerates both.
+_DISABLE_VALUES = frozenset({"0", "false", "off", "no", "disabled"})
 
-def _flag_enabled(raw: str | None) -> bool:
-    """Interpret the opt-in flag. Unset/empty/falsey -> OFF (default). Only an
-    explicit truthy value turns the pipe on, so the byte-identical no-op is the
-    default and enabling it is a deliberate choice."""
+
+def _pipe_disabled(raw: str | None) -> bool:
+    """SMART DEFAULT (v10, user-approved): the pipe runs UNLESS explicitly
+    disabled. True only for an explicit falsy value — 0/false/off/no/disabled,
+    case-insensitive, whitespace-stripped. Unset (None), empty, and any
+    unrecognized value return False (pipe ON): "on unless explicitly disabled",
+    so a typo like ``FURL_PRETOOL_PIPE=fasle`` never silently disables savings.
+    Must stay SEMANTICALLY IDENTICAL to the hooks.json shell gate
+    (test_pretool_gate_parity_shell_and_python enumerates both)."""
     if raw is None:
         return False
-    return raw.strip().lower() in {"1", "true", "yes", "on", "enabled"}
+    return raw.strip().lower() in _DISABLE_VALUES
 
 
 def _passthrough() -> None:
@@ -134,9 +150,9 @@ def _project_dir(payload: dict) -> str:
 
 
 def main() -> None:
-    # Opt-in gate FIRST: default OFF is a byte-identical no-op, and when off we
-    # never even parse stdin — zero behavior change and zero added latency.
-    if not _flag_enabled(os.environ.get(_ENABLE_ENV)):
+    # Opt-OUT gate FIRST (S1 smart default): an explicitly disabled pipe is a
+    # byte-identical no-op — we never even parse stdin, zero added latency.
+    if _pipe_disabled(os.environ.get(_ENABLE_ENV)):
         _passthrough()
 
     try:
@@ -164,8 +180,9 @@ def main() -> None:
     if not isinstance(command, str) or not command.strip():
         _passthrough()
 
-    # Loop guard: never double-wrap a command we already rewrote.
-    if _PIPE_MARKER in command:
+    # Loop guard: never double-wrap a command we (any plugin version) rewrote —
+    # matches the stable "# furl-pipe" prefix, not one marker spelling.
+    if _PIPE_GUARD in command:
         _passthrough()
 
     compressor = str(Path(__file__).resolve().parent / "pipe_compress.py")
