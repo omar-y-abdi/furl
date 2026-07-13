@@ -16,29 +16,36 @@ is EXPLICITLY falsy — ``0``/``false``/``off``/``no``/``disabled``
 including unknown junk — leave it ON ("on unless explicitly disabled", so a typo
 never silently disables savings). Only ``Bash`` is touched.
 
-CORE PROPERTY — PERMISSION-RULE SAFETY (reviewer-84 F3, non-negotiable): this
-hook MUST NEVER rewrite a command that Claude Code would subject to a
-permissions **deny** or **ask** rule. Claude Code evaluates those rules against
+CORE PROPERTY — PERMISSION-RULE SAFETY (provably-safe redesign, non-negotiable,
+total): this hook MUST NEVER rewrite a command that Claude Code would subject to
+a permissions **deny** or **ask** rule. Claude Code evaluates those rules against
 the REWRITTEN command, and the furl-pipe wrapper no longer matches
-``Bash(verb:*)`` patterns — so rewriting a denied command would silently
+``Bash(verb:*)`` patterns — so rewriting a governed command would silently
 downgrade a hard deny to "ask" (normal mode) or trip the obfuscation classifier
-(auto mode). Before rewriting, the hook reads every ``permissions.deny`` /
-``permissions.ask`` Bash rule it CAN see — enterprise managed settings (the
-highest-precedence scope: the per-OS ``managed-settings.json`` + its
-``managed-settings.d`` fragments), project scope (``.claude/settings.json`` +
+(auto mode). The invariant is made TOTAL by a single predicate instead of
+fragile per-verb matching: the hook rewrites a Bash command ONLY IF there are
+ZERO readable Bash permission rules. If ANY Bash rule of ANY kind exists — deny,
+ask, OR allow (see below), blanket or scoped — across enterprise managed
+settings (the highest-precedence scope: the per-OS ``managed-settings.json`` +
+its ``managed-settings.d`` fragments), project scope (``.claude/settings.json`` +
 ``.claude/settings.local.json`` under BOTH ``$CLAUDE_PROJECT_DIR`` and the
-payload cwd), and user scope (``~/.claude/settings.json`` +
-``~/.claude/settings.local.json``) — and when in ANY doubt (unreadable or
-malformed settings, unparseable command, compound command, a command-modifier
-wrapper verb whose inner verb CC matches on — ``env``/``sudo``/``time``/… (G1),
-glob rules it cannot interpret, same-verb near-matches) it PASSES THROUGH: no
-rewrite, the original runs, the deterministic rule fires. Fail toward
+payload cwd), or user scope (``~/.claude/settings.json`` +
+``~/.claude/settings.local.json``), it PASSES THROUGH ALL Bash: no rewrite, no
+per-verb analysis. This makes "never mask a deny/ask rule" TOTAL — no command
+shape (a command-modifier wrapper CC sees through like ``env``/``sudo``/``flock``
+/``strace``, a compound, or anything CC's closed-source resolver interprets)
+can be masked, because when a rule exists NOTHING is rewritten. ANY doubt
+(unreadable or malformed settings) also PASSES THROUGH. Fail toward
 no-compression, never toward masking a permission rule; no-savings is
-acceptable, defeating a deny is not. HONEST BLINDNESS: the hook still cannot see
-CLI flags (``--permission-mode``, ``--disallowedTools``) or session-state
-(runtime-approved) rules. A bare ``Bash`` deny/ask rule bounds that blindness (it
-passes everything through); users relying on CLI/session-level Bash restrictions
-should set ``FURL_PRETOOL_PIPE=0`` (documented in the plugin README).
+acceptable, defeating a rule is not. WHY ``allow`` COUNTS: an allow-list config
+makes UNLISTED commands restricted (ask/deny by default), so the mere presence
+of allow rules is itself a maskable restrictive posture — including it keeps the
+invariant total and is maximally conservative, while still meeting the
+zero-config criterion (a fresh install has NO permissions config → rewrite →
+savings). HONEST BLINDNESS: the hook still cannot see CLI flags
+(``--permission-mode``, ``--disallowedTools``) or session-state (runtime-approved)
+rules; users relying on CLI/session-level Bash restrictions should set
+``FURL_PRETOOL_PIPE=0`` (documented in the plugin README).
 
 Contract (PreToolUse):
   stdin  : JSON {tool_name, tool_input:{command, ...}, cwd, ...}
@@ -111,51 +118,11 @@ def _passthrough() -> None:
     sys.exit(0)
 
 
-# --- deny/ask-aware guard (reviewer-84 F3) ----------------------------------------
-# Shell constructs that can introduce ANOTHER command. If any appears and any
-# deny/ask Bash rule exists, the command is never parsed segment-by-segment —
-# it passes through wholesale. ``&`` covers ``&&``, ``|`` covers ``||``.
-_COMPOUND_MARKERS = ("\n", ";", "&", "|", "`", "$(", "<(", ">(")
-
-# Glob metacharacters we refuse to interpret in a rule verb: a rule we cannot
-# reason about is a rule that COULD match → passthrough.
-_GLOB_CHARS = ("*", "?", "[")
-
-# Linear command-modifier verbs Claude Code's permission matcher SEES THROUGH to
-# the INNER verb (reviewer-guard G1 BLOCKER, empirically confirmed vs CC 2.1.207).
-# For ``env printf X`` CC applies a ``Bash(printf:*)`` rule to ``printf`` — but a
-# naive ``shlex.split(cmd)[0]`` yields ``env`` and matches no printf rule, so the
-# guard would rewrite a command CC denies (a real default-on bypass). When any
-# deny/ask rule exists and the first token is one of these, the guard cannot
-# cheaply resolve the inner verb CC will match on, so it PASSES THROUGH. This is
-# a DENYLIST mirroring CC-internal command-modifier handling — EXACTLY the
-# confirmed linear-modifier set, nothing more (over-passthrough silently kills
-# savings), nothing less (under-match reopens the bypass). CC does NOT see
-# through absolute/relative-path verbs, leading redirects, subshells, or brace
-# groups, so those stay rewritable (rewriting them masks no rule). The set may
-# need updates across CC versions — hence a denylist with passthrough-default.
-_WRAPPER_VERBS = frozenset(
-    {
-        "env",
-        "command",
-        "exec",
-        "builtin",
-        "sudo",
-        "doas",
-        "nice",
-        "time",
-        "timeout",
-        "stdbuf",
-        "nohup",
-        "xargs",
-        "setsid",
-        "ionice",
-        "chrt",
-        "taskset",
-        "proxychains",
-        "proxychains4",
-    }
-)
+# --- permission-rule guard (provably-safe redesign) -------------------------------
+# The TOTAL invariant: rewrite a Bash command ONLY when ZERO readable Bash
+# permission rules exist. No per-verb matching, no wrapper denylist, no compound
+# analysis — existence of ANY rule is all we check, because when a rule exists
+# NOTHING is rewritten, so no command shape can mask it. See the module docstring.
 
 # Enterprise managed-settings.json locations, per OS. Paths VERIFIED against
 # code.claude.com/docs/en/settings (reviewer-guard G2) — never guessed. An
@@ -196,9 +163,13 @@ def _settings_paths(cwd: str) -> tuple[Path, ...]:
     they differ (cwd in a subdirectory) the union is the conservative choice:
     more readable rules can only mean more passthrough, never a masked rule.
     Enterprise managed settings (the highest-precedence scope) ARE read
-    (``_managed_settings_paths``). Still invisible here — and bounded by the
-    bare-``Bash``-rule passthrough — are CLI ``--permission-mode`` /
-    ``--disallowedTools`` flags and session-level (runtime-approved) rules."""
+    (``_managed_settings_paths``). Still invisible here are CLI
+    ``--permission-mode`` / ``--disallowedTools`` flags and session-level
+    (runtime-approved) rules — the documented residual (set ``FURL_PRETOOL_PIPE=0``
+    to disable the pipe if you restrict Bash only through those). Note
+    ``~/.claude.json`` is intentionally NOT read: it carries no deny/ask rules
+    (only ``allowedTools``), so a missed entry there is a savings nit, not a
+    bypass."""
     project_dirs: list[Path] = []
     project_root = os.environ.get("CLAUDE_PROJECT_DIR", "").strip()
     if project_root:
@@ -211,13 +182,15 @@ def _settings_paths(cwd: str) -> tuple[Path, ...]:
 
 
 def _bash_bodies_from_entries(entries: object) -> tuple[list[str | None], bool]:
-    """Collect the Bash-governing rule bodies from one deny/ask array.
+    """Collect the Bash-governing rule bodies from one deny/ask/allow array.
 
-    Returns ``(bodies, doubt)``: ``None`` in *bodies* is a BLANKET rule (a bare
-    ``Bash`` or a ``Bash(...`` we cannot parse — either could govern anything).
-    Rules for other tools (including ``BashOutput``, which merely shares the
-    prefix) are irrelevant to a Bash rewrite and are skipped. Any shape we
-    cannot read raises *doubt* instead of being guessed at."""
+    Returns ``(bodies, doubt)``: any Bash entry contributes a body (``None`` for
+    a BLANKET bare ``Bash`` or an unparseable ``Bash(...``; the string body
+    otherwise). Only EXISTENCE matters downstream, so the body content is now
+    incidental — but it stays a faithful record of what was found. Rules for
+    other tools (including ``BashOutput``, which merely shares the prefix) are
+    irrelevant to a Bash rewrite and are skipped. Any shape we cannot read raises
+    *doubt* instead of being guessed at."""
     bodies: list[str | None] = []
     if not isinstance(entries, list):
         return bodies, True
@@ -227,6 +200,14 @@ def _bash_bodies_from_entries(entries: object) -> tuple[list[str | None], bool]:
             doubt = True
             continue
         rule = entry.strip()
+        # A recognizable Bash rule is EXACTLY ``Bash`` or starts with ``Bash(``.
+        # The open paren disambiguates ``Bash(...)`` from the sibling tool
+        # ``BashOutput`` (which does not govern command execution). Whitespace is
+        # stripped first, so `` Bash(rm:*) `` and ``Bash( rm:*)`` both count. An
+        # UNTERMINATED but recognizable rule (``Bash(rm:*`` — no close paren)
+        # still counts as PRESENT (a ``None`` body) and is never silently
+        # dropped: presence is what gates the rewrite, so a rule we can see but
+        # not fully parse must still force passthrough.
         if rule == "Bash":
             bodies.append(None)
         elif rule.startswith("Bash("):
@@ -235,12 +216,14 @@ def _bash_bodies_from_entries(entries: object) -> tuple[list[str | None], bool]:
 
 
 def _load_bash_rule_bodies(paths: tuple[Path, ...]) -> tuple[list[str | None], bool]:
-    """Union of every deny/ask Bash rule body across *paths*.
+    """Union of every ``deny``/``ask``/``allow`` Bash rule body across *paths*.
 
     Precedence is irrelevant to a conservative union: a rule in ANY scope could
-    gate the command, so all of them count. ``doubt`` is True when a source
-    EXISTS but cannot be read or parsed (unreadable file, invalid JSON, wrong
-    shapes) — the caller must pass through, because unknowable rules could
+    gate the command, so all of them count. ``allow`` is included because an
+    allow-list config makes UNLISTED commands restricted, so its presence is
+    itself a maskable posture (see the module docstring). ``doubt`` is True when
+    a source EXISTS but cannot be read or parsed (unreadable file, invalid JSON,
+    wrong shapes) — the caller must pass through, because unknowable rules could
     contain a deny. A missing file is not doubt; it simply has no rules."""
     bodies: list[str | None] = []
     doubt = False
@@ -266,7 +249,7 @@ def _load_bash_rule_bodies(paths: tuple[Path, ...]) -> tuple[list[str | None], b
         if not isinstance(permissions, dict):
             doubt = True
             continue
-        for key in ("deny", "ask"):
+        for key in ("deny", "ask", "allow"):
             if key not in permissions:
                 continue
             found, entry_doubt = _bash_bodies_from_entries(permissions[key])
@@ -275,61 +258,17 @@ def _load_bash_rule_bodies(paths: tuple[Path, ...]) -> tuple[list[str | None], b
     return bodies, doubt
 
 
-def _rule_matches_command(command: str, verb: str, body: str | None) -> bool:
-    """True whenever the rule COULD govern *command* — deliberately conservative.
+def _has_any_bash_rule(bodies: list[str | None]) -> bool:
+    """The TOTAL invariant's predicate: True iff ANY readable Bash permission
+    rule exists (deny/ask/allow, blanket or scoped). A rewrite happens ONLY when
+    this is False (and there is no doubt) — no per-verb matching, because when a
+    rule exists NOTHING is rewritten, so no command shape can mask it.
 
-    Over-matching only costs compression on one call; under-matching would mask
-    a permission rule. Layers, any hit → match:
-      * blanket (``None`` body, empty/pure-wildcard prefix) → always;
-      * Claude Code's raw prefix semantics: ``Bash(P:*)`` governs commands
-        starting with ``P`` (exact-form bodies are the degenerate no-args case);
-      * verb backstop: a rule whose first word shares the command's verb (or a
-        ``gi*``-style verb-prefix glob of it) could match some spelling of this
-        command → same-verb commands are never rewritten;
-      * a rule verb containing glob characters we cannot interpret → match."""
-    if body is None:
-        return True
-    prefix = (body[:-2] if body.endswith(":*") else body).strip()
-    if not prefix:
-        return True
-    if command.startswith(prefix):
-        return True
-    core = prefix.split()[0].rstrip("*")
-    if not core or any(ch in core for ch in _GLOB_CHARS):
-        return True
-    return verb.startswith(core)
-
-
-def _deny_guard_passthrough(command: str, bodies: list[str | None]) -> bool:
-    """CORE PROPERTY decision: True → do NOT rewrite (see module docstring).
-
-    Zero rules (the common fresh-install case) → False: nothing can be masked,
-    every command rewrites, zero-config savings preserved. With rules present,
-    passthrough on: any compound construct (never parsed segment-by-segment),
-    an unparseable command, an env-assignment-obscured verb, a command-modifier
-    wrapper verb whose inner verb CC matches on (G1), or any rule that could
-    match. Rewrite only when the command is a SIMPLE command whose verb
-    confidently matches no deny/ask rule."""
-    if not bodies:
-        return False
-    stripped = command.strip()
-    if any(marker in stripped for marker in _COMPOUND_MARKERS):
-        return True
-    try:
-        tokens = shlex.split(stripped)
-    except ValueError:
-        return True
-    if not tokens:
-        return True
-    verb = tokens[0]
-    if not verb or "=" in verb:
-        # No discernible verb (e.g. `''`) or an env-assignment prefix hiding it.
-        return True
-    if verb in _WRAPPER_VERBS:
-        # A linear command-modifier prefix (env/sudo/time/…): CC applies the rule
-        # to the INNER verb the guard does not resolve → refuse to rewrite (G1).
-        return True
-    return any(_rule_matches_command(stripped, verb, body) for body in bodies)
+    Uses ``bool(bodies)`` (list non-empty), NOT ``any(bodies)``: a blanket or
+    unterminated rule contributes a ``None`` body, and ``any([None])`` is False
+    while ``bool([None])`` is True — a recognizable rule must count as present
+    even when its body could not be parsed."""
+    return bool(bodies)
 
 
 def _rewrite_command(original: str, project_dir: str, compressor: str) -> str:
@@ -437,13 +376,15 @@ def main() -> None:
     if _PIPE_GUARD in command:
         _passthrough()
 
-    # SECURITY GUARD (reviewer-84 F3): never rewrite a command a deny/ask rule
-    # could govern — doubt of ANY kind (unreadable settings included) passes
-    # through so the deterministic rule fires on the ORIGINAL command.
+    # SECURITY GUARD (provably-safe, total): rewrite ONLY when ZERO readable Bash
+    # permission rules exist. If ANY Bash rule (deny/ask/allow) is present — or
+    # settings are unreadable/malformed (doubt) — pass through so the original
+    # command runs and CC's rules apply exactly as native. No per-verb analysis,
+    # so no command shape can mask a rule.
     raw_cwd = payload.get("cwd")
     guard_cwd = raw_cwd if isinstance(raw_cwd, str) and raw_cwd.strip() else os.getcwd()
     bodies, doubt = _load_bash_rule_bodies(_settings_paths(guard_cwd))
-    if doubt or _deny_guard_passthrough(command, bodies):
+    if doubt or _has_any_bash_rule(bodies):
         _passthrough()
 
     compressor = str(Path(__file__).resolve().parent / "pipe_compress.py")

@@ -335,15 +335,18 @@ stream); small outputs pass through raw; it adds **~0.3–0.5 s per rewritten ca
 seconds to tens of seconds); and it is **fail-open** (a compressor that cannot start
 falls back to the raw captured output, and a tempfile that cannot be created means the
 original command runs unwrapped, uncompressed — never a broken command). **Permission
-rules are respected:** the pipe never rewrites a command that matches a
-`permissions.deny`/`ask` rule it can read — enterprise managed settings (the per-OS
+rules are respected (provably, total):** the pipe rewrites Bash **only when there are
+zero readable Bash permission rules**. If any `Bash` rule of any kind —
+`permissions.deny`, `permissions.ask`, or `permissions.allow` (an allow-list is itself a
+restrictive posture) — exists in enterprise managed settings (the per-OS
 `managed-settings.json` + its `managed-settings.d` fragments), project
-`.claude/settings.json` / `settings.local.json`, and the user-scope `~/.claude/` files
-— so matching, compound, command-modifier-prefixed (`env`/`sudo`/`time`/…), and
-otherwise-doubtful commands pass through untouched and the rule fires on the original.
-It cannot see CLI `--permission-mode`/`--disallowedTools` flags or session-level rules;
-if you rely on those for Bash restrictions, set `FURL_PRETOOL_PIPE=0` (details in the
-plugin README's Known limitations).
+`.claude/settings.json` / `settings.local.json`, or the user-scope `~/.claude/` files,
+**all** Bash passes through untouched so your rules apply exactly as native — no command
+shape (wrapper-hidden `env`/`sudo`/`flock`, compound, absolute path) can bypass it,
+because when a rule exists nothing is rewritten. Unreadable/malformed settings also force
+passthrough. It cannot see CLI `--permission-mode`/`--disallowedTools` flags or
+session-level rules; if you restrict Bash only through those, set `FURL_PRETOOL_PIPE=0`
+(details in the plugin README's Known limitations).
 
 ## CLI
 

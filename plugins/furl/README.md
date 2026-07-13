@@ -57,15 +57,16 @@ trade-offs, up front):
 - **The command mutation is visible in the transcript** — the rewrite carries a
   `# furl-pipe (FURL_PRETOOL_PIPE=0 to disable)` comment so it is never a silent
   substitution.
-- **Permission rules are respected:** the pipe **never rewrites a command that matches
-  a `permissions.deny` or `permissions.ask` rule it can read** — enterprise managed
-  settings, project `.claude/settings.json` / `.claude/settings.local.json`, and the
-  user-scope `~/.claude/` equivalents — so those commands pass through untouched and the
-  rule fires on the original. Compound commands, command-modifier prefixes
-  (`env`/`sudo`/`time`/…, which Claude Code resolves to an inner verb), unreadable
-  settings, and anything else doubtful also pass through (conservative passthrough;
-  visibility bounds in Known limitations). `Bash(...)` **allowlist** entries may still
-  not match the rewritten command, so allow-prompts can differ.
+- **Permission rules are respected (provably):** the pipe rewrites Bash **only when you
+  have no Bash permission rules at all**. If **any** `Bash` rule of any kind —
+  `permissions.deny`, `permissions.ask`, **or** `permissions.allow` — exists in
+  enterprise managed settings, project `.claude/settings.json` /
+  `.claude/settings.local.json`, or the user-scope `~/.claude/` equivalents, the pipe
+  **leaves every Bash command untouched**, so your rules apply exactly as native — no
+  command shape can bypass them. (`allow` counts because an allow-list makes unlisted
+  commands restricted.) Unreadable or malformed settings also force passthrough. The
+  trade-off is honest: once you add any Bash permission rule, the pipe stops compressing
+  Bash for that session.
 - **Latency:** ~0.3–0.5 s added per rewritten Bash call (two `uv` resolves: the shell
   gate plus the in-command compressor). The first call in a fresh environment pays a
   one-time resolve/build — seconds to tens of seconds.
@@ -104,21 +105,20 @@ the falsy path spends no `uv` resolve.
   backslash is not preserved in stdout — and bare-bash behavior itself differs between
   versions here (GNU bash 5 `-c` keeps the dangling backslash literal; macOS bash 3.2
   drops it).
-- **Permission-rule visibility:** the pipe never rewrites a command that matches a
-  deny/ask rule it can read — **enterprise managed settings** (the per-OS
-  `managed-settings.json` and its `managed-settings.d` fragments), project
-  `.claude/settings.json` / `.claude/settings.local.json`, and the user-scope
-  `~/.claude/` equivalents — so those rules keep working: a denied command passes
-  through and the deterministic deny fires on the original (this also avoids the
-  auto-mode obfuscation classifier for denied commands, since they are no longer
-  rewritten). It also passes through command-modifier prefixes (`env`, `sudo`, `nice`,
-  `time`, `timeout`, `stdbuf`, …) that Claude Code resolves to an inner verb, so a rule
-  on the inner command is never masked. But the hook **cannot see** CLI
-  `--permission-mode` / `--disallowedTools` flags or session-level (runtime-approved)
-  rules — **if you rely on those for Bash restrictions, set `FURL_PRETOOL_PIPE=0`**. A
-  bare `Bash` deny/ask rule disables rewriting entirely. `Bash(...)` **allowlist**
-  entries may still not match the rewritten command, so allow-prompts can differ with
-  the pipe on.
+- **Permission-rule visibility:** the guard is intentionally coarse and total — it
+  rewrites Bash **only when there are zero readable Bash permission rules**. It reads
+  **enterprise managed settings** (the per-OS `managed-settings.json` and its
+  `managed-settings.d` fragments), project `.claude/settings.json` /
+  `.claude/settings.local.json`, and the user-scope `~/.claude/` equivalents. If **any**
+  `Bash` rule (deny/ask/allow — an allowlist counts, since it makes unlisted commands
+  restricted) exists in those, **all** Bash passes through untouched, so
+  your native rules apply exactly — a coarse-but-provable boundary that no command shape
+  (wrapper-hidden `env`/`sudo`/`flock`, compound, absolute path, …) can slip past,
+  because when a rule exists nothing is rewritten (this also avoids the auto-mode
+  obfuscation classifier entirely). It **cannot see** CLI `--permission-mode` /
+  `--disallowedTools` flags or session-level (runtime-approved) rules — **if you restrict
+  Bash only through those, set `FURL_PRETOOL_PIPE=0`**. (`~/.claude.json` is not read: it
+  carries no deny/ask rules, only `allowedTools`.)
 - **Cold-start cost:** with the pipe and the PostToolUse hook both enabled, one Bash
   call can spend up to 3 `uv` resolves before caches warm.
 - **Cosmetic:** bash error messages gain a `line N:` prefix from the multi-line wrapper.
@@ -234,7 +234,7 @@ output that actually enters context.
 | `FURL_HOOK_EXCLUDE_TOOLS` | (none) | Comma-separated tools never to compress — exact or `mcp__db__*` globs. |
 | `FURL_HOOK_MODE` | `normal` | `aggressive` compresses more (code + smaller outputs). |
 | `FURL_HOOK_VERBOSE` | off | `1` prints a one-line per-compression savings summary to stderr. |
-| `FURL_PRETOOL_PIPE` | **on** | The PreToolUse pipe (Bash-only, real savings on today's harness — see "Current harness status") runs **by default**. Only an explicitly falsy value — `0`/`false`/`off`/`no`/`disabled`, case-insensitive, whitespace ignored — disables it; unset/empty/any other value leaves it on. It never rewrites a command matching a readable deny/ask permission rule (conservative passthrough — see Known limitations). The gate runs via `sh -lc` (a login shell), so an export in your login profile or in the environment Claude Code launches from takes effect. |
+| `FURL_PRETOOL_PIPE` | **on** | The PreToolUse pipe (Bash-only, real savings on today's harness — see "Current harness status") runs **by default**. Only an explicitly falsy value — `0`/`false`/`off`/`no`/`disabled`, case-insensitive, whitespace ignored — disables it; unset/empty/any other value leaves it on. It rewrites Bash only when there are zero readable Bash permission rules; if any deny/ask/allow `Bash` rule exists (enterprise/project/local/user settings), it leaves Bash untouched (see Known limitations). The gate runs via `sh -lc` (a login shell), so an export in your login profile or in the environment Claude Code launches from takes effect. |
 | `FURL_STATUS_LINE` | on | `0` silences the one-line SessionStart status signal. Export it in the environment Claude Code launches from — the status hook runs `sh -c`, which does not source login profiles. |
 
 The full `FURL_*` reference is in [`LIBRARY.md`](../../LIBRARY.md) → "Configuration".

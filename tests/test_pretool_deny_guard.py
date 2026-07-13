@@ -1,22 +1,25 @@
-"""Deny/ask-aware guard on the PreToolUse pipe (reviewer-84 F3 — SECURITY).
+"""Provably-safe permission guard on the PreToolUse pipe (reviewer-guard).
 
-CORE PROPERTY (non-negotiable): the pipe must NEVER rewrite a command that
-Claude Code would subject to a permissions **deny** or **ask** rule. Claude Code
-evaluates permission rules against the REWRITTEN command, and the furl-pipe
-wrapper no longer matches ``Bash(verb:*)`` patterns — so rewriting a denied
-command silently downgrades a hard deny to "ask" (normal mode) or trips the
-obfuscation classifier (auto mode). When in ANY doubt — unreadable or malformed
-settings, unparseable command, compound command, glob rules we cannot interpret
-— the hook must PASS THROUGH (emit nothing) so the original command runs and
-the deterministic rule fires. Fail toward no-compression, never toward masking
-a permission rule.
+CORE INVARIANT (total, provable): when the pipe is enabled, it rewrites a Bash
+command ONLY IF there are ZERO readable Bash permission rules. If ANY Bash rule
+of ANY kind exists — ``deny``, ``ask``, OR ``allow`` (blanket or scoped) across
+enterprise managed + project + local + user settings — the hook PASSES THROUGH
+ALL Bash: no rewrite, no per-verb analysis. This makes "never mask a deny/ask
+rule" TOTAL: no command shape (a command-modifier wrapper Claude Code sees
+through like ``env``/``sudo``/``flock``/``strace``/``ltrace``, a compound, an
+absolute-path verb, or anything CC's closed-source resolver interprets) can be
+masked, because when a rule exists NOTHING is rewritten. Unreadable/malformed
+settings → doubt → passthrough too. Fail toward no-compression, never toward
+masking a rule.
 
-Unit tests feed the loader/matcher/decision functions synthetic settings and
-commands (no live Claude Code needed). Acceptance tests run the real hook as a
-subprocess against settings files on disk — one per review-84 G3 scenario, each
-with a hermetic HOME so the developer's real ``~/.claude`` can never leak in.
-Pre-guard, the hook rewrote in every deny/ask scenario below (the assert-empty
-pins failed), which is the pre-fix proof for this round.
+This REPLACES the earlier per-verb matcher + wrapper denylist (which reviewer-
+guard proved could never be a complete boundary against CC's closed, version-
+dependent see-through set). The contract is now STRICTLY SAFER — more commands
+pass through, never fewer — so the tests that asserted the old per-verb
+rewrite/passthrough splits are replaced, not weakened.
+
+Unit tests feed the loader/predicate synthetic settings; acceptance tests run
+the real hook as a subprocess against settings on disk with a hermetic HOME.
 """
 
 from __future__ import annotations
@@ -39,41 +42,70 @@ _pretool_mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_pretool_mod)
 
 
-# --- unit: rule loader ------------------------------------------------------------
-
-
 def _write_settings(path: Path, data: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data), encoding="utf-8")
 
 
-def test_loader_collects_bash_deny_and_ask_only(tmp_path) -> None:
-    """Bash-governing entries from BOTH deny and ask are collected; other tools'
-    rules (and BashOutput, which merely shares the prefix) are irrelevant."""
+def _deny(*rules: str) -> dict:
+    return {"permissions": {"deny": list(rules)}}
+
+
+def _ask(*rules: str) -> dict:
+    return {"permissions": {"ask": list(rules)}}
+
+
+def _allow(*rules: str) -> dict:
+    return {"permissions": {"allow": list(rules)}}
+
+
+# --- unit: rule loader (existence + doubt) ----------------------------------------
+
+
+def test_loader_collects_bash_deny_ask_and_allow(tmp_path) -> None:
+    """R2: deny, ask, AND allow Bash entries are all collected — an allow-list
+    config is itself a restrictive posture. Other tools' rules (and BashOutput,
+    which merely shares the prefix) are skipped."""
     path = tmp_path / "settings.json"
     _write_settings(
         path,
         {
             "permissions": {
-                "deny": ["Bash(printf:*)", "WebFetch", "BashOutput(x)", "Read(/etc/*)"],
+                "deny": ["Bash(printf:*)", "WebFetch", "Read(/etc/*)"],
                 "ask": ["Bash(curl:*)"],
-                "allow": ["Bash(rm -rf /:*)"],  # allow entries must NOT gate the pipe
+                "allow": ["Bash(cat:*)", "BashOutput(x)"],
             }
         },
     )
     bodies, doubt = _pretool_mod._load_bash_rule_bodies((path,))
     assert doubt is False
-    assert bodies == ["printf:*", "curl:*"]
+    assert bodies == ["printf:*", "curl:*", "cat:*"]
 
 
-def test_loader_blanket_and_unparseable_bash_entries(tmp_path) -> None:
-    """A bare ``Bash`` rule and a malformed ``Bash(...`` entry are BLANKET
-    (body ``None``): they could govern anything, so everything passes through."""
+def test_loader_recognizes_odd_but_valid_bash_shapes(tmp_path) -> None:
+    """Refinement: every syntactically-odd-but-recognizable Bash rule counts as
+    PRESENT — whitespace-padded, a space after the paren, an UNTERMINATED rule
+    (no close paren), and the bare blanket ``Bash``. None is silently dropped."""
     path = tmp_path / "settings.json"
-    _write_settings(path, {"permissions": {"deny": ["Bash", "Bash(git push"]}})
+    _write_settings(
+        path,
+        {"permissions": {"deny": [" Bash(rm:*) ", "Bash( rm:*)", "Bash(rm:*", "Bash"]}},
+    )
     bodies, doubt = _pretool_mod._load_bash_rule_bodies((path,))
     assert doubt is False
-    assert bodies == [None, None]
+    assert len(bodies) == 4, "every recognizable Bash rule shape must be present"
+    assert _pretool_mod._has_any_bash_rule(bodies) is True
+
+
+def test_loader_bashoutput_is_not_a_bash_rule(tmp_path) -> None:
+    """``BashOutput`` is a distinct tool (reads a background shell's output); it
+    does NOT govern command execution, so it must not be read as a Bash rule.
+    The ``Bash(`` open-paren check disambiguates it from ``Bash(...)``."""
+    path = tmp_path / "settings.json"
+    _write_settings(path, {"permissions": {"deny": ["BashOutput(x)", "BashOutputFoo"]}})
+    bodies, doubt = _pretool_mod._load_bash_rule_bodies((path,))
+    assert (bodies, doubt) == ([], False)
+    assert _pretool_mod._has_any_bash_rule(bodies) is False
 
 
 def test_loader_missing_file_is_not_doubt(tmp_path) -> None:
@@ -83,14 +115,14 @@ def test_loader_missing_file_is_not_doubt(tmp_path) -> None:
 
 def test_loader_doubt_on_malformed_sources(tmp_path) -> None:
     """Anything that PREVENTS knowing the rules is doubt → passthrough: invalid
-    JSON, a non-dict document, a non-dict permissions block, a non-list deny/ask
-    array, or a non-string entry."""
+    JSON, a non-dict document, a non-dict permissions block, a non-list
+    deny/ask/allow array, or a non-string entry."""
     cases = [
         "{not json",
         json.dumps(["not", "a", "dict"]),
         json.dumps({"permissions": "nope"}),
         json.dumps({"permissions": {"deny": "Bash(printf:*)"}}),
-        json.dumps({"permissions": {"ask": [42]}}),
+        json.dumps({"permissions": {"allow": [42]}}),
     ]
     for i, text in enumerate(cases):
         path = tmp_path / f"settings-{i}.json"
@@ -102,109 +134,29 @@ def test_loader_doubt_on_malformed_sources(tmp_path) -> None:
 def test_loader_merges_all_settings_files(tmp_path) -> None:
     a = tmp_path / "a" / "settings.json"
     b = tmp_path / "b" / "settings.local.json"
-    _write_settings(a, {"permissions": {"deny": ["Bash(touch:*)"]}})
-    _write_settings(b, {"permissions": {"ask": ["Bash(curl:*)"]}})
+    _write_settings(a, _deny("Bash(touch:*)"))
+    _write_settings(b, _allow("Bash(curl:*)"))
     bodies, doubt = _pretool_mod._load_bash_rule_bodies((a, b))
     assert doubt is False
     assert sorted(str(x) for x in bodies) == ["curl:*", "touch:*"]
 
 
-# --- unit: matcher ----------------------------------------------------------------
+# --- unit: the existence predicate ------------------------------------------------
 
 
-def _matches(command: str, body: str | None) -> bool:
-    verb = command.split()[0]
-    return bool(_pretool_mod._rule_matches_command(command, verb, body))
+def test_has_any_bash_rule_true_for_scoped_and_blanket() -> None:
+    assert _pretool_mod._has_any_bash_rule(["printf:*"]) is True
+    # CRITICAL: a blanket/unterminated rule is a None body; the predicate uses
+    # bool(bodies), not any(bodies) — any([None]) is False, bool([None]) is True.
+    assert _pretool_mod._has_any_bash_rule([None]) is True
+    assert _pretool_mod._has_any_bash_rule([None, "rm:*"]) is True
 
 
-def test_matcher_prefix_rule_semantics() -> None:
-    assert _matches("printf 'X\\n'", "printf:*") is True
-    assert _matches("printf", "printf:*") is True
-    assert _matches("echo hi", "printf:*") is False
-    # Raw prefix semantics: Bash(git:*) governs gitk-style continuations too.
-    assert _matches("gitk --all", "git:*") is True
-    # A longer rule prefix does not govern a shorter different command.
-    assert _matches("git status", "git-lfs:*") is False
+def test_has_any_bash_rule_false_only_for_empty() -> None:
+    assert _pretool_mod._has_any_bash_rule([]) is False
 
 
-def test_matcher_same_verb_is_conservatively_matched() -> None:
-    """DOCUMENTED over-match: ``Bash(git push:*)`` + ``git status`` passes
-    through. Same-verb commands are never rewritten — over-matching only costs
-    savings; under-matching would mask a rule."""
-    assert _matches("git status", "git push:*") is True
-
-
-def test_matcher_exact_and_bare_verb_rules() -> None:
-    assert _matches("printf 'X'", "printf 'X'") is True  # exact form
-    assert _matches("printf 'Y'", "printf 'X'") is True  # same verb → conservative
-    assert _matches("printf hello", "printf") is True  # bare verb rule
-    assert _matches("echo hi", "printf 'X'") is False
-
-
-def test_matcher_blanket_and_glob_rules_always_match() -> None:
-    assert _matches("anything at all", None) is True  # bare Bash
-    assert _matches("anything at all", "*") is True
-    assert _matches("anything at all", ":*") is True
-    assert _matches("git push", "gi*:*") is True  # glob verb prefix
-    assert _matches("kubectl get", "k*l:*") is True  # uninterpretable glob → match
-
-
-# --- unit: decision ---------------------------------------------------------------
-
-
-def test_decision_zero_rules_always_rewrites() -> None:
-    """The common zero-config case (fresh install, no deny/ask Bash rules):
-    nothing can be masked, so even compound commands rewrite — v11's
-    zero-config savings are preserved."""
-    guard = _pretool_mod._deny_guard_passthrough
-    assert guard("cat bigfile", []) is False
-    assert guard("printf x | tee y && ls; echo done", []) is False
-
-
-def test_decision_compound_with_any_rule_passes_through() -> None:
-    """With ANY deny/ask Bash rule present, a command containing a construct
-    that can introduce another command is never parsed segment-by-segment —
-    it passes through wholesale."""
-    guard = _pretool_mod._deny_guard_passthrough
-    rules = ["unrelated-verb:*"]
-    for command in (
-        "printf x | tee y",
-        "echo a && echo b",
-        "echo a || echo b",
-        "echo a; echo b",
-        "echo $(whoami)",
-        "echo `whoami`",
-        "diff <(ls) <(ls -a)",
-        "tee >(wc -l)",
-        "echo a\necho b",
-        "sleep 1 &",
-    ):
-        assert guard(command, rules) is True, f"compound must pass through: {command!r}"
-
-
-def test_decision_simple_command_matching_rule_passes_through() -> None:
-    guard = _pretool_mod._deny_guard_passthrough
-    assert guard("printf 'X\\n'", ["printf:*"]) is True
-    assert guard("touch f.txt", ["touch:*"]) is True
-    assert guard("curl x", ["curl:*"]) is True
-
-
-def test_decision_simple_command_matching_no_rule_rewrites() -> None:
-    guard = _pretool_mod._deny_guard_passthrough
-    assert guard("cat bigfile", ["printf:*", "touch:*"]) is False
-
-
-def test_decision_obscured_or_unparseable_passes_through() -> None:
-    """Env-assignment prefixes hide the real verb; shlex failures mean we cannot
-    name the verb at all. Both are doubt → passthrough (when any rule exists)."""
-    guard = _pretool_mod._deny_guard_passthrough
-    rules = ["printf:*"]
-    assert guard("FOO=1 printf x", rules) is True
-    assert guard('printf "unclosed', rules) is True
-    assert guard("''", rules) is True  # no discernible verb
-
-
-# --- acceptance: the real hook subprocess against settings on disk (G3) -----------
+# --- acceptance: the real hook subprocess against settings on disk ----------------
 
 
 def _run_hook(
@@ -247,234 +199,125 @@ def _run_hook(
     )
 
 
-def _deny(*rules: str) -> dict:
-    return {"permissions": {"deny": list(rules)}}
+# Every command shape reviewer-guard raised, plus the classes the old per-verb
+# matcher got wrong. Under the total invariant, a SINGLE unrelated deny rule
+# makes ALL of them pass through — including the ones that match no rule
+# (``zzz …``, ``/usr/bin/printf``) and the wrappers CC sees through that were
+# NOT in the old 18-verb denylist (``flock``/``strace``/``ltrace``). The
+# non-matching + un-listed-wrapper shapes REWROTE pre-redesign → RED proof.
+_EVERY_COMMAND_SHAPE = (
+    "printf x",  # simple
+    "printf x | tee y",  # compound
+    "env printf HELLO",  # listed wrapper
+    "flock -n /tmp/l printf X",  # 3rd-class wrapper (not in old denylist)
+    "strace printf X",  # 3rd-class wrapper
+    "ltrace printf X",  # 3rd-class wrapper
+    "/usr/bin/printf X",  # absolute-path verb (old code REWROTE)
+    "zzz totally unrelated",  # matches no rule (old code REWROTE)
+    "FOO=1 printf x",  # env-assignment prefix
+)
 
 
-def _ask(*rules: str) -> dict:
-    return {"permissions": {"ask": list(rules)}}
-
-
-def test_denied_printf_passes_through(tmp_path) -> None:
-    """G3 scenario 1 — THE reviewer-84 F3 reproducer: deny ``Bash(printf:*)``
-    plus ``printf 'X\\n'`` must emit NOTHING so the deterministic deny fires on
-    the original. Pre-guard the hook rewrote here (deny downgraded to ask)."""
-    proc = _run_hook("printf 'X\\n'", tmp_path, cwd_settings=_deny("Bash(printf:*)"))
+@pytest.mark.parametrize("command", _EVERY_COMMAND_SHAPE)
+def test_any_deny_rule_present_passes_through_every_shape(command, tmp_path) -> None:
+    """The total invariant: a single UNRELATED deny (``Bash(rm:*)``) makes every
+    command shape pass through, regardless of its verb — no per-verb matching."""
+    proc = _run_hook(command, tmp_path, cwd_settings=_deny("Bash(rm:*)"))
     assert proc.returncode == 0, proc.stderr
-    assert proc.stdout == "", "a denied command must never be rewritten"
+    assert proc.stdout == "", f"any rule present → passthrough all Bash: {command!r}"
 
 
-def test_denied_touch_passes_through(tmp_path) -> None:
-    """G3 scenario 2."""
-    proc = _run_hook("touch f.txt", tmp_path, cwd_settings=_deny("Bash(touch:*)"))
+def test_ask_rule_present_passes_through(tmp_path) -> None:
+    """An ask rule triggers passthrough exactly like a deny rule."""
+    proc = _run_hook("cat bigfile", tmp_path, cwd_settings=_ask("Bash(curl:*)"))
     assert proc.returncode == 0, proc.stderr
     assert proc.stdout == ""
 
 
-def test_asked_curl_passes_through(tmp_path) -> None:
-    """G3 scenario 3: ask rules gate exactly like deny rules — the ask prompt
-    must still fire on the ORIGINAL command."""
-    proc = _run_hook("curl x", tmp_path, cwd_settings=_ask("Bash(curl:*)"))
+def test_allow_rule_present_passes_through(tmp_path) -> None:
+    """R2: an allow rule triggers passthrough too (allow-list mode makes unlisted
+    commands restricted). Pre-redesign, allow rules did not gate → this rewrote."""
+    proc = _run_hook("cat bigfile", tmp_path, cwd_settings=_allow("Bash(cat:*)"))
     assert proc.returncode == 0, proc.stderr
     assert proc.stdout == ""
 
 
-def test_no_rules_rewrites_allowed_command(tmp_path) -> None:
-    """G3 scenario 4: with NO deny/ask Bash rules the pipe rewrites normally —
-    zero-config savings preserved (allow rules do not gate)."""
-    settings = {"permissions": {"allow": ["Bash(cat:*)"], "deny": [], "ask": []}}
+@pytest.mark.parametrize("odd_rule", [" Bash(rm:*) ", "Bash( rm:*)", "Bash(rm:*", "Bash"])
+def test_odd_but_recognizable_rule_shape_passes_through(odd_rule, tmp_path) -> None:
+    """Refinement: whitespace-padded, space-after-paren, UNTERMINATED, and bare
+    blanket Bash rules each count as PRESENT → passthrough, even for a command
+    the rule would not obviously name."""
+    proc = _run_hook("cat bigfile", tmp_path, cwd_settings=_deny(odd_rule))
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == "", f"recognizable rule {odd_rule!r} must force passthrough"
+
+
+@pytest.mark.parametrize("command", ["cat bigfile", "env printf HELLO", "printf x | tee y"])
+def test_zero_permission_config_rewrites(command, tmp_path) -> None:
+    """The savings case — the WHOLE point: with NO permission config at all, even
+    wrapper/compound commands rewrite. Zero-config sessions keep their savings."""
+    proc = _run_hook(command, tmp_path)  # no settings written anywhere
+    assert proc.returncode == 0, proc.stderr
+    assert "updatedInput" in proc.stdout, f"zero rules → must rewrite: {command!r}"
+
+
+def test_empty_permission_arrays_are_zero_rules_rewrite(tmp_path) -> None:
+    """Empty deny/ask/allow arrays are zero rules (no bodies) → rewrite."""
+    settings = {"permissions": {"deny": [], "ask": [], "allow": []}}
     proc = _run_hook("cat bigfile", tmp_path, cwd_settings=settings)
     assert proc.returncode == 0, proc.stderr
-    assert "updatedInput" in proc.stdout, "zero deny/ask rules must still rewrite"
+    assert "updatedInput" in proc.stdout
 
 
-def test_compound_with_deny_rule_passes_through(tmp_path) -> None:
-    """G3 scenario 5: a compound command is never parsed segment-by-segment —
-    with any deny/ask rule present it passes through wholesale."""
-    proc = _run_hook("printf x | tee y", tmp_path, cwd_settings=_deny("Bash(printf:*)"))
-    assert proc.returncode == 0, proc.stderr
-    assert proc.stdout == ""
-
-
-def test_malformed_settings_passes_through(tmp_path) -> None:
-    """G3 scenario 6: unreadable rules = unknowable rules → fail-safe, even for
-    an innocuous command."""
+def test_malformed_settings_is_doubt_passthrough(tmp_path) -> None:
+    """Unreadable rules = unknowable rules → doubt → passthrough, even for an
+    innocuous command."""
     proc = _run_hook("cat bigfile", tmp_path, cwd_settings="{definitely not json")
     assert proc.returncode == 0, proc.stderr
     assert proc.stdout == ""
 
 
-def test_blanket_bash_deny_passes_through_everything(tmp_path) -> None:
-    """A bare ``Bash`` deny/ask rule bounds the hook's CLI/policy blindness:
-    every Bash command passes through."""
-    proc = _run_hook("cat bigfile", tmp_path, cwd_settings=_deny("Bash"))
+# --- acceptance: scope completeness (a rule in ANY readable scope gates) ----------
+
+
+def test_home_scope_rule_passes_through(tmp_path) -> None:
+    proc = _run_hook("cat big", tmp_path, home_settings=_deny("Bash(printf:*)"))
     assert proc.returncode == 0, proc.stderr
-    assert proc.stdout == ""
+    assert proc.stdout == "", "user-scope (~/.claude) rule must gate"
 
 
-def test_home_settings_rules_apply(tmp_path) -> None:
-    """User-scope ``~/.claude/settings.json`` gates exactly like project scope."""
-    proc = _run_hook("printf hi", tmp_path, home_settings=_deny("Bash(printf:*)"))
+def test_claude_project_dir_scope_rule_passes_through(tmp_path) -> None:
+    """CC loads project settings from the session's project root
+    (CLAUDE_PROJECT_DIR); a rule there must gate even when the payload cwd is a
+    subdirectory with no .claude of its own."""
+    proc = _run_hook("cat big", tmp_path, project_dir_settings=_deny("Bash(printf:*)"))
     assert proc.returncode == 0, proc.stderr
-    assert proc.stdout == ""
+    assert proc.stdout == "", "project-root (CLAUDE_PROJECT_DIR) rule must gate"
 
 
-def test_claude_project_dir_scope_rules_apply(tmp_path) -> None:
-    """Claude Code loads project settings from the session's PROJECT ROOT
-    (``CLAUDE_PROJECT_DIR``, which every hook receives), while the payload cwd
-    can be a subdirectory with no ``.claude`` of its own. A deny rule at the
-    project root must still gate the pipe."""
-    proc = _run_hook("printf hi", tmp_path, project_dir_settings=_deny("Bash(printf:*)"))
+def test_local_settings_scope_rule_passes_through(tmp_path) -> None:
+    proc = _run_hook("cat big", tmp_path, cwd_local_settings=_ask("Bash(curl:*)"))
     assert proc.returncode == 0, proc.stderr
-    assert proc.stdout == "", "project-root (CLAUDE_PROJECT_DIR) deny rules must gate"
+    assert proc.stdout == "", "project-local settings.local.json rule must gate"
 
 
-def test_cwd_local_settings_rules_apply(tmp_path) -> None:
-    """Project-local ``.claude/settings.local.json`` gates too."""
-    proc = _run_hook("curl x", tmp_path, cwd_local_settings=_ask("Bash(curl:*)"))
-    assert proc.returncode == 0, proc.stderr
-    assert proc.stdout == ""
-
-
-def test_unrelated_deny_rule_still_rewrites_simple_command(tmp_path) -> None:
-    """Savings are only skipped where a rule could apply: a simple command whose
-    verb matches no deny/ask rule still rewrites."""
-    proc = _run_hook("cat bigfile", tmp_path, cwd_settings=_deny("Bash(rm:*)"))
-    assert proc.returncode == 0, proc.stderr
-    assert "updatedInput" in proc.stdout
-
-
-def test_env_assignment_prefix_passes_through_when_rules_exist(tmp_path) -> None:
-    """``FOO=1 printf x`` hides the verb behind an assignment — with a printf
-    deny present it must pass through, not be misread as verb ``FOO=1``."""
-    proc = _run_hook("FOO=1 printf x", tmp_path, cwd_settings=_deny("Bash(printf:*)"))
-    assert proc.returncode == 0, proc.stderr
-    assert proc.stdout == ""
-
-
-def test_guard_is_hermetic_in_this_suite() -> None:
-    """Meta-pin: every acceptance test above supplies its own HOME, so a
-    developer's real ~/.claude rules can never decide these outcomes."""
+def test_guard_is_hermetic_zero_rules_rewrites() -> None:
+    """Meta-pin: every acceptance test supplies its own HOME + cwd, so a
+    developer's real ~/.claude rules can never decide these outcomes — a truly
+    empty environment rewrites."""
     with tempfile.TemporaryDirectory() as tmp:
         proc = _run_hook("cat bigfile", Path(tmp))
         assert "updatedInput" in proc.stdout
 
 
-# --- G1: command-modifier / wrapper-verb under-match (reviewer-guard BLOCKER) -----
-# Claude Code's permission matcher SEES THROUGH linear command-modifier prefixes
-# (env, sudo, nice, time, timeout N, …) to the INNER verb and applies the rule
-# there. The guard extracts verb=shlex.split(cmd)[0]; for ``env printf X`` that
-# is ``env`` (matches no printf rule) → it REWROTE → CC would DENY the original →
-# a real default-on bypass. Fix: a denylist of exactly the linear-modifier verbs,
-# passthrough whenever a rule exists. These are the reviewer's EMPIRICALLY
-# CONFIRMED bypass pairs (all under deny ``Bash(printf:*)``) — each rewrote
-# pre-fix and must now PASS THROUGH (hook emits nothing).
-_WRAPPER_BYPASS_COMMANDS = (
-    "env printf HELLO",
-    "env FOO=bar printf HELLO",
-    "command printf HELLO",
-    "exec printf HELLO",
-    "builtin printf HELLO",
-    "nice printf HELLO",
-    "time printf HELLO",
-    "timeout 5 printf HELLO",
-    "stdbuf -o0 printf HELLO",
-    "sudo -n printf HELLO",
-    "doas printf HELLO",
-    "nohup printf HELLO",
-    "setsid printf HELLO",
-    "ionice printf HELLO",
-    "chrt 1 printf HELLO",
-    "taskset 1 printf HELLO",
-    "xargs printf HELLO",
-    "proxychains printf HELLO",
-    "proxychains4 printf HELLO",
-)
-
-
-@pytest.mark.parametrize("command", _WRAPPER_BYPASS_COMMANDS)
-def test_wrapper_prefix_denied_inner_verb_passes_through(command, tmp_path) -> None:
-    """RED pre-fix: the guard rewrote every one of these (verb was the wrapper,
-    not ``printf``), silently downgrading a hard deny. Each must now emit
-    NOTHING so CC's deterministic printf deny fires on the original."""
-    proc = _run_hook(command, tmp_path, cwd_settings=_deny("Bash(printf:*)"))
-    assert proc.returncode == 0, proc.stderr
-    assert proc.stdout == "", f"wrapper-prefixed denied command must pass through: {command!r}"
-
-
-@pytest.mark.parametrize("command", ["env printf HELLO", "time git push origin main"])
-def test_wrapper_prefix_with_no_rules_still_rewrites(command, tmp_path) -> None:
-    """Tight scope: the wrapper denylist only fires when a deny/ask rule exists.
-    With NO Bash deny/ask rules the wrapper-prefixed command still rewrites —
-    zero-config savings are not sacrificed for the fix."""
-    settings = {"permissions": {"allow": ["Bash(env:*)"], "deny": [], "ask": []}}
-    proc = _run_hook(command, tmp_path, cwd_settings=settings)
-    assert proc.returncode == 0, proc.stderr
-    assert "updatedInput" in proc.stdout, (
-        f"no rules → wrapper command must still rewrite: {command!r}"
-    )
-
-
-def test_absolute_path_verb_still_rewrites_under_matching_rule(tmp_path) -> None:
-    """Tight scope (reviewer precision): CC does NOT see through an absolute-path
-    verb, so ``/usr/bin/printf`` is genuinely NOT denied by ``Bash(printf:*)`` —
-    rewriting it masks nothing and must stay allowed (savings preserved)."""
-    proc = _run_hook("/usr/bin/printf HELLO", tmp_path, cwd_settings=_deny("Bash(printf:*)"))
-    assert proc.returncode == 0, proc.stderr
-    assert "updatedInput" in proc.stdout, "absolute-path verb is not CC-denied → must still rewrite"
-
-
-def test_wrapper_verbs_are_exactly_the_linear_modifier_set() -> None:
-    """Pin the denylist to EXACTLY the empirically-confirmed linear-modifier set
-    — nothing more (over-passthrough silently kills savings), nothing less
-    (under-match reopens the bypass). Mirrors CC-internal command-modifier
-    handling; may need updates across CC versions (denylist, passthrough-default)."""
-    assert _pretool_mod._WRAPPER_VERBS == frozenset(
-        {
-            "env",
-            "command",
-            "exec",
-            "builtin",
-            "sudo",
-            "doas",
-            "nice",
-            "time",
-            "timeout",
-            "stdbuf",
-            "nohup",
-            "xargs",
-            "setsid",
-            "ionice",
-            "chrt",
-            "taskset",
-            "proxychains",
-            "proxychains4",
-        }
-    )
-
-
-def test_decision_wrapper_verb_with_rules_passes_through() -> None:
-    guard = _pretool_mod._deny_guard_passthrough
-    assert guard("env printf x", ["printf:*"]) is True
-    assert guard("sudo -n rm -rf /tmp/x", ["rm:*"]) is True
-
-
-def test_decision_wrapper_verb_no_rules_rewrites() -> None:
-    guard = _pretool_mod._deny_guard_passthrough
-    assert guard("env printf x", []) is False
-
-
-# --- G2: enterprise managed-settings scope (reviewer-guard MAJOR) -----------------
-# The guard read only project + user settings; a Bash deny that lives ONLY in the
-# enterprise managed-settings policy → guard saw zero rules → rewrote → silent
-# downgrade. Fix: also read the per-OS managed-settings.json (+ managed-settings.d
-# fragments). Paths verified at code.claude.com/docs/en/settings.
+# --- G2: enterprise managed-settings scope ----------------------------------------
+# Paths verified at code.claude.com/docs/en/settings. The real system path is not
+# writable in CI, so behavior is proven by (1) the platform-correct path, (2)
+# inclusion in _settings_paths, (3) an in-process flow test with a monkeypatched
+# managed path, and (4) drop-in-dir doubt.
 
 
 def test_managed_settings_path_is_platform_correct() -> None:
-    """The enterprise managed path must be the VERIFIED per-OS location (never a
-    guessed one); on an unrecognized platform we return nothing rather than
-    invent a path."""
     expected = {
         "darwin": "/Library/Application Support/ClaudeCode/managed-settings.json",
         "linux": "/etc/claude-code/managed-settings.json",
@@ -488,37 +331,27 @@ def test_managed_settings_path_is_platform_correct() -> None:
 
 
 def test_settings_paths_includes_managed_scope(tmp_path) -> None:
-    """RED pre-fix: ``_settings_paths`` did not include the enterprise managed
-    file, so a managed-only deny was invisible. Every managed path must now be
-    part of the sources the loader reads."""
     paths = _pretool_mod._settings_paths(str(tmp_path))
     for managed in _pretool_mod._managed_settings_paths():
         assert managed in paths, f"managed scope missing from settings paths: {managed}"
 
 
-def test_managed_deny_rule_flows_into_the_decision(tmp_path, monkeypatch) -> None:
-    """Integration: a deny that exists ONLY in the managed scope is loaded and
-    (via the union) gates a command whose verb it governs. Proves the wiring end
-    to end without writing to a protected system path."""
+def test_managed_rule_flows_into_the_decision(tmp_path, monkeypatch) -> None:
+    """A rule that exists ONLY in the managed scope is loaded and makes
+    ``_has_any_bash_rule`` True — end to end without writing a protected path."""
     managed = tmp_path / "managed-settings.json"
     _write_settings(managed, _deny("Bash(rm:*)"))
     monkeypatch.setattr(_pretool_mod, "_managed_settings_paths", lambda: [managed])
     bodies, doubt = _pretool_mod._load_bash_rule_bodies(_pretool_mod._settings_paths(str(tmp_path)))
     assert doubt is False
-    assert "rm:*" in bodies
-    assert _pretool_mod._deny_guard_passthrough("rm -rf /tmp/x", bodies) is True
+    assert _pretool_mod._has_any_bash_rule(bodies) is True
 
 
-def test_managed_dropin_dir_unreadable_is_doubt(tmp_path, monkeypatch) -> None:
-    """A managed-settings.d drop-in directory that cannot be enumerated surfaces
-    as doubt (the dir path itself is unreadable-as-a-file in the loader) →
-    passthrough. Fail toward no-compression, never toward a missed policy."""
-    base = tmp_path / "ClaudeCode" / "managed-settings.json"
+def test_managed_dropin_dir_unreadable_is_doubt(tmp_path) -> None:
+    """A managed-settings.d drop-in directory that cannot be enumerated is
+    returned AS the directory path, which reads as OSError in the loader →
+    doubt → passthrough."""
     dropin = tmp_path / "ClaudeCode" / "managed-settings.d"
     dropin.mkdir(parents=True)
-    monkeypatch.setitem(_pretool_mod._MANAGED_BASE_BY_PLATFORM, sys.platform, base)
-    # A real directory in the path list reads as OSError (IsADirectoryError) in
-    # the loader → doubt. (We include the dir when we cannot list it; here we
-    # simulate the unreadable case by asserting the loader's doubt on a dir path.)
     _bodies, doubt = _pretool_mod._load_bash_rule_bodies((dropin,))
     assert doubt is True

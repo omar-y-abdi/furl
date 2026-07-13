@@ -38,15 +38,15 @@ preserved exactly; stderr is not captured and flows live, but stderr/stdout
 interleaving is not preserved (all stderr precedes the compressed stdout; `2>&1`
 merges); fail-open (worst case the command runs unwrapped, uncompressed); adds
 ~0.3–0.5 s per rewritten call (two `uv` resolves; a fresh environment pays a
-one-time resolve/build on the first call). It never rewrites a command matching
-a `permissions.deny`/`ask` rule it can read from enterprise managed settings and
-project/local/user settings (conservative passthrough on any doubt — compound
-commands and command-modifier prefixes like `env`/`sudo`/`time` included) — but
-it cannot see CLI `--permission-mode`/`--disallowedTools` flags or session-level
-rules; if you rely on those for Bash restrictions, set `FURL_PRETOOL_PIPE=0`.
-Known limitations (redaction gaps on fail-open paths, `Bash(...)` allowlist
-mismatch, heredoc edge, permission-rule visibility bounds): see the plugin
-README.
+one-time resolve/build on the first call). It rewrites Bash **only when there
+are zero readable Bash permission rules**: if any `Bash` deny/ask/allow rule
+exists (enterprise managed + project/local/user settings), it leaves all Bash
+untouched so your rules apply exactly as native — a total, provable boundary no
+command shape can bypass. Unreadable settings also force passthrough. It cannot
+see CLI `--permission-mode`/`--disallowedTools` flags or session-level rules; if
+you restrict Bash only through those, set `FURL_PRETOOL_PIPE=0`. Known
+limitations (redaction gaps on fail-open paths, heredoc edge, permission-rule
+visibility bounds): see the plugin README.
 
 ## The MCP tools
 
