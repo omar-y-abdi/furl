@@ -1018,8 +1018,10 @@ impl LogCompressor {
 
         let mut unique_candidates: Vec<usize> = Vec::new();
         for (i, line) in log_lines.iter().enumerate() {
-            if matches!(line.level, LogLevel::Info | LogLevel::Unknown | LogLevel::Debug | LogLevel::Trace)
-                && !line.is_stack_trace
+            if matches!(
+                line.level,
+                LogLevel::Info | LogLevel::Unknown | LogLevel::Debug | LogLevel::Trace
+            ) && !line.is_stack_trace
                 && !line.is_summary
             {
                 let count = *template_counts.get(&normalized_lines[i]).unwrap_or(&0);
@@ -1836,7 +1838,8 @@ mod tests {
         let c = cmp(); // max_unique_logs defaults to 10, unique_log_threshold defaults to 3
         let mut lines = Vec::new();
         for i in 0..60 {
-            lines.push(format!("INFO: connection pool status active {}", i % 5)); // highly repetitive
+            lines.push(format!("INFO: connection pool status active {}", i % 5));
+            // highly repetitive
         }
         lines[10] = "INFO: unique database checkpoint reached".to_string(); // occurs once
         lines[30] = "INFO: unexpected background task failed due to disk".to_string(); // occurs once
