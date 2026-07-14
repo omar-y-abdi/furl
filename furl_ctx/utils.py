@@ -55,5 +55,3 @@ def concat_text_parts(content: Any) -> str:
 def create_tool_digest_marker(original_hash: str) -> str:
     """Create marker for crushed tool output."""
     return f'<headroom:tool_digest sha256="{original_hash}">'
-
-

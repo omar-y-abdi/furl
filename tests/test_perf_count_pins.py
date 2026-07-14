@@ -213,6 +213,7 @@ class TestPipelineFullConversationCounts:
         counter = SpyCounter()
         deep_copies = {"n": 0}
         import copy
+
         real_deep_copy = copy.deepcopy
 
         def counting_deep_copy(messages, memo=None):
