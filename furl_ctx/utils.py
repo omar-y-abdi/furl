@@ -99,7 +99,7 @@ def deep_copy_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         new_msg = msg.copy()
         for key, val in new_msg.items():
             if isinstance(val, list):
-                 new_msg[key] = [_deep_copy_any(item) for item in val]
+                new_msg[key] = [_deep_copy_any(item) for item in val]
             elif isinstance(val, dict):
                 new_msg[key] = {k: _deep_copy_any(v) for k, v in val.items()}
 
