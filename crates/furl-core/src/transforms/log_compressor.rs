@@ -169,6 +169,8 @@ pub struct LogCompressorConfig {
     /// Compression ratio threshold for CCR storage. Python defaults to
     /// 0.5 inline; promoted to a config field here.
     pub min_compression_ratio_for_ccr: f64,
+    pub max_unique_logs: usize,
+    pub unique_log_threshold: usize,
 }
 
 impl Default for LogCompressorConfig {
@@ -187,6 +189,8 @@ impl Default for LogCompressorConfig {
             enable_ccr: true,
             min_lines_for_ccr: 50,
             min_compression_ratio_for_ccr: 0.5,
+            max_unique_logs: 10,
+            unique_log_threshold: 3,
         }
     }
 }
@@ -225,6 +229,7 @@ pub struct LogCompressorStats {
     pub lines_dropped_by_global_cap: usize,
     pub ccr_emitted: bool,
     pub ccr_skip_reason: Option<&'static str>,
+    pub unique_logs_kept: usize,
 }
 
 // ─── Format detector ────────────────────────────────────────────────────
@@ -1002,6 +1007,49 @@ impl LogCompressor {
             selected.extend(summaries);
         }
 
+        // ─── Unique/Unexpected Logs Selection ─────────────────────────────────
+        let mut template_counts: BTreeMap<String, usize> = BTreeMap::new();
+        let mut normalized_lines: Vec<String> = Vec::with_capacity(log_lines.len());
+        for line in log_lines {
+            let norm = normalize_for_dedupe(&line.content);
+            *template_counts.entry(norm.clone()).or_insert(0) += 1;
+            normalized_lines.push(norm);
+        }
+
+        let mut unique_candidates: Vec<usize> = Vec::new();
+        for (i, line) in log_lines.iter().enumerate() {
+            if matches!(line.level, LogLevel::Info | LogLevel::Unknown | LogLevel::Debug | LogLevel::Trace)
+                && !line.is_stack_trace
+                && !line.is_summary
+            {
+                let count = *template_counts.get(&normalized_lines[i]).unwrap_or(&0);
+                if count <= self.config.unique_log_threshold {
+                    unique_candidates.push(i);
+                }
+            }
+        }
+
+        unique_candidates.sort_by(|&a, &b| {
+            let count_a = template_counts.get(&normalized_lines[a]).unwrap_or(&0);
+            let count_b = template_counts.get(&normalized_lines[b]).unwrap_or(&0);
+            count_a.cmp(count_b).then_with(|| a.cmp(&b))
+        });
+
+        let mut unique_templates_selected = BTreeSet::new();
+        let mut unique_kept = 0;
+        for &i in &unique_candidates {
+            if unique_kept >= self.config.max_unique_logs {
+                break;
+            }
+            let norm = &normalized_lines[i];
+            if unique_templates_selected.insert(norm.clone()) {
+                selected.insert(i);
+                unique_kept += 1;
+            }
+        }
+        stats.unique_logs_kept = unique_kept;
+        // ──────────────────────────────────────────────────────────────────────
+
         // Add context lines around every selected entry.
         let mut context_indices: BTreeSet<usize> = BTreeSet::new();
         for &idx in &selected {
@@ -1224,7 +1272,7 @@ fn normalize_for_dedupe(content: &str) -> String {
     // after the timestamp) is still preserved by the prefix split below.
     let content = strip_leading_identity(content);
 
-    let split_at = content.find([':', '=']).unwrap_or(content.len());
+    let split_at = content.find([':', '=']).unwrap_or(0);
     let prefix = &content[..split_at];
     let suffix = &content[split_at..];
 
@@ -1781,5 +1829,68 @@ mod tests {
         assert!(line_nums.contains(&4));
         // Third slot goes to the high-scoring middle line.
         assert!(line_nums.contains(&2));
+    }
+
+    #[test]
+    fn test_unique_logs_extracted() {
+        let c = cmp(); // max_unique_logs defaults to 10, unique_log_threshold defaults to 3
+        let mut lines = Vec::new();
+        for i in 0..60 {
+            lines.push(format!("INFO: connection pool status active {}", i % 5)); // highly repetitive
+        }
+        lines[10] = "INFO: unique database checkpoint reached".to_string(); // occurs once
+        lines[30] = "INFO: unexpected background task failed due to disk".to_string(); // occurs once
+
+        let content = lines.join("\n");
+        let (result, stats) = c.compress(&content, 1.0);
+
+        assert_eq!(stats.unique_logs_kept, 2);
+        assert!(result.compressed.contains("unique database checkpoint"));
+        assert!(result.compressed.contains("unexpected background task"));
+    }
+
+    #[test]
+    fn test_unique_logs_deduplicated() {
+        let c = LogCompressor::new(LogCompressorConfig {
+            unique_log_threshold: 3,
+            max_unique_logs: 10,
+            ..Default::default()
+        });
+        let mut lines = Vec::new();
+        for i in 0..60 {
+            lines.push(format!("INFO: heartbeat ping {}", i % 3)); // highly repetitive
+        }
+        lines[10] = "INFO: unique error signature x".to_string(); // occurs twice
+        lines[25] = "INFO: unique error signature x".to_string(); // duplicate template
+
+        let content = lines.join("\n");
+        let (result, stats) = c.compress(&content, 1.0);
+
+        // Count should be 1 because the second one is a duplicate template and gets deduplicated!
+        assert_eq!(stats.unique_logs_kept, 1);
+        assert!(result.compressed.contains("unique error signature x"));
+    }
+
+    #[test]
+    fn test_unique_logs_config_bounds() {
+        let c = LogCompressor::new(LogCompressorConfig {
+            unique_log_threshold: 3,
+            max_unique_logs: 1, // only keep up to 1 unique log
+            ..Default::default()
+        });
+        let mut lines = Vec::new();
+        for i in 0..60 {
+            lines.push(format!("INFO: connection tick {}", i % 5));
+        }
+        lines[10] = "INFO: first unique log line here".to_string();
+        lines[20] = "INFO: second unique log line here".to_string();
+
+        let content = lines.join("\n");
+        let (result, stats) = c.compress(&content, 1.0);
+
+        assert_eq!(stats.unique_logs_kept, 1);
+        // It should keep the first one because they both have count 1, and first one has lower index.
+        assert!(result.compressed.contains("first unique log line"));
+        assert!(!result.compressed.contains("second unique log line"));
     }
 }

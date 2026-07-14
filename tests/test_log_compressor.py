@@ -500,3 +500,68 @@ class TestMinLinesBoundary:
     def test_above_floor_attempts_compression(self):
         result = self._compress(6)
         assert result.compression_ratio < 1.0
+
+
+class TestUniqueUnexpectedLogs:
+    """Integration tests for unique/unexpected logs extraction (test-driven)."""
+
+    def test_python_unique_logs_extraction(self):
+        """Verify unique log lines are extracted and kept in the compressed output."""
+        lines = [f"INFO: connection pool status active {i % 5}" for i in range(100)]
+        lines[15] = "INFO: unique database checkpoint reached"
+        lines[45] = "INFO: unexpected background task failed due to disk"
+        content = "\n".join(lines)
+
+        compressor = LogCompressor(
+            config=LogCompressorConfig(
+                min_lines_for_ccr=50,
+                enable_ccr=False,
+                max_unique_logs=5,
+                unique_log_threshold=3,
+            )
+        )
+        result = compressor.compress(content)
+
+        # Assert unique log lines are preserved and present in output
+        assert "unique database checkpoint" in result.compressed
+        assert "unexpected background task" in result.compressed
+
+    def test_python_unique_logs_deduplicated_by_template(self):
+        """Verify unique log lines are deduplicated by their template to save tokens."""
+        lines = [f"INFO: heartbeat tick {i % 3}" for i in range(100)]
+        lines[15] = "INFO: unique error signature x"
+        lines[35] = "INFO: unique error signature x"  # Duplicate of same unique template
+        content = "\n".join(lines)
+
+        compressor = LogCompressor(
+            config=LogCompressorConfig(
+                min_lines_for_ccr=50,
+                enable_ccr=False,
+                max_unique_logs=5,
+                unique_log_threshold=3,
+            )
+        )
+        result = compressor.compress(content)
+
+        # Output should contain the line, but deduplicated
+        assert "unique error signature x" in result.compressed
+
+    def test_python_unique_logs_config_bounds(self):
+        """Verify max_unique_logs strictly bounds the selection of unique log lines."""
+        lines = [f"INFO: standard line {i % 5}" for i in range(100)]
+        lines[15] = "INFO: first unique message"
+        lines[25] = "INFO: second unique message"
+        content = "\n".join(lines)
+
+        compressor = LogCompressor(
+            config=LogCompressorConfig(
+                min_lines_for_ccr=50,
+                enable_ccr=False,
+                max_unique_logs=1,  # Only allow 1 unique log
+                unique_log_threshold=3,
+            )
+        )
+        result = compressor.compress(content)
+
+        assert "first unique message" in result.compressed
+        assert "second unique message" not in result.compressed

@@ -109,6 +109,8 @@ class LogCompressorConfig:
     max_total_lines: int = 100
     enable_ccr: bool = True
     min_lines_for_ccr: int = 50
+    max_unique_logs: int = 10
+    unique_log_threshold: int = 3
 
 
 @dataclass
@@ -187,6 +189,8 @@ class LogCompressor:
                 enable_ccr=cfg.enable_ccr,
                 min_lines_for_ccr=cfg.min_lines_for_ccr,
                 min_compression_ratio_for_ccr=0.5,
+                max_unique_logs=cfg.max_unique_logs,
+                unique_log_threshold=cfg.unique_log_threshold,
             )
         )
 
