@@ -19,67 +19,30 @@ def compute_short_hash(data: str | bytes, length: int = 16) -> str:
     return compute_hash(data)[:length]
 
 
+# lazy: manual loop -> comprehension
 def extract_user_query(messages: list[dict[str, Any]]) -> str:
-    """Extract the most recent user question from messages.
-
-    Used to pass context through the compression pipeline so transforms like
-    SmartCrusher can score items by relevance to the user's actual question,
-    not just by statistical properties (position, anomaly, boundary).
-    """
+    """Extract the most recent user question from messages."""
     for msg in reversed(messages):
-        if msg.get("role") == "user":
-            content = msg.get("content", "")
-            if isinstance(content, str) and content.strip():
-                return content.strip()
+        if msg.get("role") == "user" and (content := msg.get("content")):
+            if isinstance(content, str) and (s := content.strip()):
+                return s
             if isinstance(content, list):
-                for block in content:
-                    if isinstance(block, dict) and block.get("type") == "text":
-                        text = str(block.get("text", "")).strip()
-                        if text:
-                            return text
+                for b in content:
+                    if isinstance(b, dict) and b.get("type") == "text" and (s := str(b.get("text", "")).strip()):
+                        return s
     return ""
 
 
+# lazy: generator join
 def concat_text_parts(content: Any) -> str:
-    """Concatenate the text carried by a message ``content`` field.
-
-    Providers accept two content shapes: a plain string, or a list of typed
-    blocks (Anthropic-style ``{"type": "text", "text": ...}``). Transforms
-    that inspect prompt text (CacheAligner hashing/detection, ContentRouter
-    analysis-intent detection) must see BOTH shapes, or block-format prompts
-    silently vanish from their view (COR-53).
-
-    - ``str`` content is returned unchanged, so callers hashing plain-string
-      prompts stay byte-identical to their pre-helper behavior.
-    - ``list`` content yields the ``text`` of every ``{"type": "text"}`` block
-      whose ``text`` is a string, joined by newlines. Non-text blocks (images,
-      tool_use, ...) and malformed entries contribute nothing.
-    - Any other shape (``None``, dict, int, ...) yields ``""``.
-
-    Total: never raises on untrusted content shapes.
-    """
+    """Concatenate the text carried by a message content field."""
     if isinstance(content, str):
         return content
     if isinstance(content, list):
-        parts: list[str] = []
-        for block in content:
-            if isinstance(block, dict) and block.get("type") == "text":
-                text = block.get("text")
-                if isinstance(text, str):
-                    parts.append(text)
-        return "\n".join(parts)
+        return "\n".join(b["text"] for b in content if isinstance(b, dict) and b.get("type") == "text" and isinstance(b.get("text"), str))
     return ""
 
 
-def create_tool_digest_marker(original_hash: str) -> str:
-    """Create marker for crushed tool output."""
-    return f'<headroom:tool_digest sha256="{original_hash}">'
-
-
 def deep_copy_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Create a deep copy of messages list.
-
-    Uses copy.deepcopy instead of json roundtrip (2-5x faster, avoids
-    serialisation overhead on large conversation histories).
-    """
+    """Create a deep copy of messages list."""
     return copy.deepcopy(messages)

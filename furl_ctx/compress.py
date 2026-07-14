@@ -64,7 +64,7 @@ from typing import TYPE_CHECKING, Any
 
 from .ccr.marker_grammar import hashes_in_text
 from .config import DEFAULT_MIN_TOKENS_TO_COMPRESS
-from .pipeline import PipelineExtensionManager, PipelineStage, summarize_routing_markers
+from .pipeline import PipelineExtensionManager, PipelineStage
 from .redaction import build_env_redactor, compose_redactors
 from .utils import extract_user_query as _extract_user_query
 
@@ -756,7 +756,8 @@ def compress(
                 warnings=[*compress_warnings, *result.warnings],
             )
 
-        routing_markers = summarize_routing_markers(result.transforms_applied)
+        # lazy: inline marker filter
+        routing_markers = [t for t in result.transforms_applied if t.startswith("router:")]
         if routing_markers:
             routed_event = pipeline_extensions.emit(
                 PipelineStage.INPUT_ROUTED,

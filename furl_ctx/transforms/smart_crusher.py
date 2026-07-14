@@ -54,7 +54,7 @@ from typing import Any
 from ..ccr import marker_grammar
 from ..config import CCRConfig, TransformResult
 from ..tokenizer import Tokenizer
-from ..utils import compute_short_hash, create_tool_digest_marker, deep_copy_messages
+from ..utils import compute_short_hash, deep_copy_messages
 from .base import Transform
 
 logger = logging.getLogger(__name__)
@@ -1148,7 +1148,8 @@ class SmartCrusher(Transform):
                             content, query_context
                         )
                         if was_modified:
-                            marker = create_tool_digest_marker(compute_short_hash(content))
+                            # lazy: inline marker f-string
+                            marker = f"<headroom:tool_digest sha256=\"{compute_short_hash(content)}\">"
                             # Copy-on-write (COR-55): deepcopy preserves
                             # aliasing via its memo, so mutating `msg` in
                             # place would rewrite an aliased occurrence of
@@ -1197,7 +1198,8 @@ class SmartCrusher(Transform):
                                 part_text, query_context
                             )
                             if was_modified:
-                                marker = create_tool_digest_marker(compute_short_hash(part_text))
+                            # lazy: inline marker f-string
+                                marker = f"<headroom:tool_digest sha256=\"{compute_short_hash(part_text)}\">"
                                 if new_parts is None:
                                     new_parts = list(tool_content)
                                 new_parts[j] = {**part, "text": crushed + "\n" + marker}
@@ -1222,7 +1224,8 @@ class SmartCrusher(Transform):
                         tool_content, query_context
                     )
                     if was_modified:
-                        marker = create_tool_digest_marker(compute_short_hash(tool_content))
+                            # lazy: inline marker f-string
+                        marker = f"<headroom:tool_digest sha256=\"{compute_short_hash(tool_content)}\">"
                         if new_content is None:
                             new_content = list(content)
                         new_content[i] = {**block, "content": crushed + "\n" + marker}

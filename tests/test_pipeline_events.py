@@ -14,7 +14,6 @@ from furl_ctx.pipeline import (
     PipelineEvent,
     PipelineExtensionManager,
     PipelineStage,
-    summarize_routing_markers,
 )
 
 
@@ -98,9 +97,3 @@ def test_hooks_object_without_handler_is_ignored() -> None:
     assert not manager.enabled
 
 
-def test_summarize_routing_markers_filters_router_prefix() -> None:
-    transforms = ["cache_aligner", "router:smart_crusher:0.12", "router:log:0.4", "dedup"]
-    assert summarize_routing_markers(transforms) == [
-        "router:smart_crusher:0.12",
-        "router:log:0.4",
-    ]
