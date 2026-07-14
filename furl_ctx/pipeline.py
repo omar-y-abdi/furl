@@ -51,14 +51,27 @@ class PipelineExtensionManager:
         metadata: dict[str, Any] | None = None,
     ) -> PipelineEvent:
         """Emit a canonical lifecycle event and return the final event state."""
-        event = PipelineEvent(stage=stage, operation=operation, model=model, messages=messages, metadata=metadata or {})
+        event = PipelineEvent(
+            stage=stage,
+            operation=operation,
+            model=model,
+            messages=messages,
+            metadata=metadata or {},
+        )
 
         for extension in self._extensions:
             handler = getattr(extension, "on_pipeline_event", None)
-            if not callable(handler): continue
+            if not callable(handler):
+                continue
             try:
                 updated = handler(event)
-                if isinstance(updated, PipelineEvent): event = updated
+                if isinstance(updated, PipelineEvent):
+                    event = updated
             except Exception as exc:
-                log.warning("pipeline extension %r failed during %s: %s", type(extension).__name__, stage.value, exc)
+                log.warning(
+                    "pipeline extension %r failed during %s: %s",
+                    type(extension).__name__,
+                    stage.value,
+                    exc,
+                )
         return event
