@@ -26,8 +26,6 @@
 </p>
 
 ---
-Furl is a context compression and retrieval layer for AI agents. It shrinks large tool outputs, logs, web fetches, and RAG chunks before they consume your agent's context window, while keeping every original byte available for exact retrieval when needed.
-
 
 **Finding yourself always waiting on the next usage limit reset?** 
 
