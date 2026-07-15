@@ -1,0 +1,5 @@
+perf(content_detector): limit string split for large input files
+
+Added `maxsplit` parameter to `content.split` in detection methods.
+This avoids tokenizing entire strings when only the first N lines
+are actually sliced, saving execution time and memory for large inputs.
