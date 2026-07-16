@@ -89,6 +89,7 @@ def _fast_copy_obj(obj: Any) -> Any:
     else:
         return obj
 
+
 def deep_copy_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Create a deep copy of messages list.
 
