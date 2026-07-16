@@ -10,7 +10,7 @@
 
 use serde_json::Value;
 
-use super::compaction::Compaction;
+use super::compaction::{ColumnEncoding, Compaction};
 use super::config::RoutingPolicy;
 use super::crusher::{CrushArrayResult, SmartCrusher};
 use super::field_role::compute_exclude_set;
@@ -806,7 +806,22 @@ impl SmartCrusher {
         //   vs the exact bytes the JSON form would ship.
         if !dropped_summary.is_empty() {
             if let Some(stage) = &self.compaction {
-                let (c, rendered) = stage.run(&result);
+                let (mut c, mut rendered) = stage.run(&result);
+                // review F1b: the survivor render's per-column constant folds
+                // and dictionary encodings are computed over the SURVIVOR subset
+                // only. Left alone they would assert, over the whole array, a
+                // fact that only holds for the shown rows — a false-universal
+                // `col:type=value` constant (e.g. every event is a
+                // `payout_request` when only the payout_request rows survived)
+                // or a `__dict:` that enumerates only the categories present in
+                // the survivors while others live solely in the offloaded rows.
+                // Demote any such encoding that does NOT hold over ALL rows
+                // (checked against the full `items`), then re-render. Lossless:
+                // the IR rows keep every survivor cell, so a demoted column just
+                // renders per-row. Byte-identical when nothing is demoted.
+                if demote_subset_only_encodings(&mut c, items) {
+                    rendered = stage.formatter.format(&c);
+                }
                 if c.is_decoder_verifiable() && !c.contains_opaque_ref() {
                     let sentinel = ccr_sentinel_map(&dropped_summary, row_index_marker.as_deref());
                     let sentinel_line = crate::util::pyjson::python_safe_json_dumps(
@@ -1079,6 +1094,60 @@ fn compaction_kind_str(c: &Compaction) -> &'static str {
     }
 }
 
+/// Demote survivor-render column encodings that hold ONLY over the shown
+/// rows, checked against the FULL `all_rows` array (review F1b).
+///
+/// The survivor compaction stamps constant folds and `DictString`
+/// dictionaries from the kept subset alone, so on the offload path they can
+/// present a subset fact as universal: a `col:type=value` constant that is
+/// false for the offloaded rows, or a `__dict:` that omits categories living
+/// only in offloaded rows. For every column of a flat [`Compaction::Table`], a
+/// `const_value` survives only if EVERY row in `all_rows` holds that exact
+/// value, and a `DictString` survives only if its value list already covers
+/// EVERY string this column takes across `all_rows`. Anything else is cleared.
+///
+/// Demotion is lossless: the IR rows keep every survivor cell, so a cleared
+/// column simply renders per-row. Returns whether anything changed, so the
+/// caller re-renders only then and the offload output stays byte-identical
+/// whenever every survivor encoding was already universal.
+fn demote_subset_only_encodings(c: &mut Compaction, all_rows: &[Value]) -> bool {
+    use std::collections::HashSet;
+
+    let Compaction::Table { schema, .. } = c else {
+        return false;
+    };
+    let mut changed = false;
+    for spec in schema.fields.iter_mut() {
+        let demote_const = match &spec.const_value {
+            Some(v) => !all_rows.iter().all(|row| row.get(&spec.name) == Some(v)),
+            None => false,
+        };
+        if demote_const {
+            spec.const_value = None;
+            changed = true;
+        }
+
+        let demote_dict = match &spec.encoding {
+            Some(ColumnEncoding::DictString { values }) => {
+                let known: HashSet<&str> = values.iter().map(String::as_str).collect();
+                !all_rows.iter().all(|row| match row.get(&spec.name) {
+                    // Only string cells are dictionary-encoded; a non-string,
+                    // absent, or null cell is not represented by the dict and
+                    // cannot make it incomplete.
+                    Some(Value::String(s)) => known.contains(s.as_str()),
+                    _ => true,
+                })
+            }
+            _ => false,
+        };
+        if demote_dict {
+            spec.encoding = None;
+            changed = true;
+        }
+    }
+    changed
+}
+
 /// Approximate byte size of `[v0, v1, ...]` JSON serialization, given
 /// each item's already-serialized form. Adds 2 for outer brackets and
 /// 1 per inter-item comma. Used by the lossless savings-ratio check.
@@ -1141,6 +1210,125 @@ mod tests {
         assert!(compacted.starts_with("[8]{"), "got: {compacted}");
         assert!(result.ccr_hash.is_none());
         assert!(result.dropped_summary.is_empty());
+    }
+
+    #[test]
+    fn demote_clears_subset_only_constant_and_dict_keeps_universal_review_f1b() {
+        use super::super::compaction::{CellValue, FieldSpec, Row, Schema};
+
+        // A survivor render (kept rows all `payout_request`, status all `ok`)
+        // whose header would assert those as universal + a genuinely-constant
+        // `region`.
+        let mut c = Compaction::Table {
+            schema: Schema {
+                fields: vec![
+                    FieldSpec {
+                        name: "event_type".into(),
+                        type_tag: "string".into(),
+                        nullable: false,
+                        const_value: Some(json!("payout_request")),
+                        encoding: None,
+                    },
+                    FieldSpec {
+                        name: "status".into(),
+                        type_tag: "string".into(),
+                        nullable: false,
+                        const_value: None,
+                        encoding: Some(ColumnEncoding::DictString {
+                            values: vec!["ok".into()],
+                        }),
+                    },
+                    FieldSpec {
+                        name: "region".into(),
+                        type_tag: "string".into(),
+                        nullable: false,
+                        const_value: Some(json!("us")),
+                        encoding: None,
+                    },
+                ],
+            },
+            rows: vec![Row(vec![
+                CellValue::Scalar(json!("payout_request")),
+                CellValue::Scalar(json!("ok")),
+                CellValue::Scalar(json!("us")),
+            ])],
+            original_count: 2,
+        };
+
+        // The FULL array disagrees: event_type also has `purchase`, status also
+        // has `fail`; region is genuinely constant `us`.
+        let all_rows = vec![
+            json!({"event_type": "purchase", "status": "fail", "region": "us"}),
+            json!({"event_type": "payout_request", "status": "ok", "region": "us"}),
+        ];
+
+        assert!(demote_subset_only_encodings(&mut c, &all_rows));
+        let Compaction::Table { schema, .. } = &c else {
+            panic!("still a table");
+        };
+        let field = |n: &str| schema.fields.iter().find(|f| f.name == n).unwrap();
+        assert!(
+            field("event_type").const_value.is_none(),
+            "false-universal constant must be demoted",
+        );
+        assert!(
+            field("status").encoding.is_none(),
+            "category-incomplete dict must be demoted",
+        );
+        assert_eq!(
+            field("region").const_value,
+            Some(json!("us")),
+            "a genuinely universal constant must be kept",
+        );
+    }
+
+    #[test]
+    fn demote_is_noop_when_encodings_hold_over_all_rows_review_f1b() {
+        use super::super::compaction::{CellValue, FieldSpec, Row, Schema};
+
+        let mut c = Compaction::Table {
+            schema: Schema {
+                fields: vec![
+                    FieldSpec {
+                        name: "kind".into(),
+                        type_tag: "string".into(),
+                        nullable: false,
+                        const_value: Some(json!("tick")),
+                        encoding: None,
+                    },
+                    FieldSpec {
+                        name: "lvl".into(),
+                        type_tag: "string".into(),
+                        nullable: false,
+                        const_value: None,
+                        encoding: Some(ColumnEncoding::DictString {
+                            values: vec!["a".into(), "b".into()],
+                        }),
+                    },
+                ],
+            },
+            rows: vec![Row(vec![
+                CellValue::Scalar(json!("tick")),
+                CellValue::Scalar(json!("a")),
+            ])],
+            original_count: 3,
+        };
+        // Every row agrees with the survivor encodings — nothing to demote, so
+        // the offload output stays byte-identical.
+        let all_rows = vec![
+            json!({"kind": "tick", "lvl": "a"}),
+            json!({"kind": "tick", "lvl": "b"}),
+            json!({"kind": "tick", "lvl": "a"}),
+        ];
+        assert!(!demote_subset_only_encodings(&mut c, &all_rows));
+        let Compaction::Table { schema, .. } = &c else {
+            panic!("still a table");
+        };
+        assert_eq!(schema.fields[0].const_value, Some(json!("tick")));
+        assert!(matches!(
+            schema.fields[1].encoding,
+            Some(ColumnEncoding::DictString { .. })
+        ));
     }
 
     #[test]

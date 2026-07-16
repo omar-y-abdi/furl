@@ -131,6 +131,20 @@ _SUMMARY_CATEGORICAL_RATIO = 0.02
 _SUMMARY_TOP_VALUES = 20
 _SUMMARY_SAMPLE_ROWS = 6
 
+# Sibling-field preview bounds (review F2). A dominant-array object's OTHER keys
+# (everything besides the array) keep their VALUES, not just their names — a
+# crash report's ``exception``/``termination`` blocks carry the single most
+# important fact (the exception type/signal), and dropping them to bare key
+# names made that fact invisible in the compressed view. Scalars pass through
+# (tiny); small nested objects recurse to _SIBLING_MAX_DEPTH so their scalar
+# leaves survive; a long list (the kind that SHOULD be offloaded) or a deeper
+# structure is elided to a ``[… in CCR]`` note. The whole sibling blob is hard-
+# capped at _SIBLING_FIELDS_MAX_CHARS so the preview stays a few KB.
+_SIBLING_MAX_DEPTH = 4
+_SIBLING_MAX_KEYS = 40
+_SIBLING_MAX_LIST = 10
+_SIBLING_FIELDS_MAX_CHARS = 4000
+
 # Slice guidance carried inside the ``_ccr_summary`` preview: tells the agent how
 # to fetch a NARROW slice of the offloaded rows instead of the whole array back
 # (the ``furl_retrieve`` row-select filters). Domain-agnostic on purpose — it
@@ -706,13 +720,63 @@ class ContentCompressionEngine:
                 row[k] = f"[{type(v).__name__} omitted, in CCR]"
         return row
 
+    @classmethod
+    def _compact_sibling(cls, value: Any, depth: int) -> Any:
+        """One sibling value, compacted for the offload preview (review F2).
+
+        Scalars pass through (long strings truncated to the shared field-char
+        budget); a nested object recurses to ``depth`` levels then notes its
+        remaining size; a short list is kept inline, a long one (the kind that
+        SHOULD be offloaded) is elided. Never raises; anything large or deep
+        becomes a ``[… in CCR]`` string (recovery is the byte-exact original)."""
+        if value is None or isinstance(value, bool) or isinstance(value, (int, float)):
+            return value
+        if isinstance(value, str):
+            if len(value) > _OFFLOAD_PREVIEW_FIELD_CHARS:
+                return value[:_OFFLOAD_PREVIEW_FIELD_CHARS] + f"… [{len(value)} chars, in CCR]"
+            return value
+        if isinstance(value, dict):
+            if depth <= 0:
+                return f"[dict of {len(value)} keys, in CCR]"
+            out: dict[str, Any] = {}
+            for i, (k, v) in enumerate(value.items()):
+                if i >= _SIBLING_MAX_KEYS:
+                    out["_more_keys"] = f"[{len(value) - _SIBLING_MAX_KEYS} more, in CCR]"
+                    break
+                out[str(k)] = cls._compact_sibling(v, depth - 1)
+            return out
+        if isinstance(value, list):
+            if depth <= 0 or len(value) > _SIBLING_MAX_LIST:
+                return f"[list of {len(value)} items, in CCR]"
+            return [cls._compact_sibling(v, depth - 1) for v in value]
+        return f"[{type(value).__name__} omitted, in CCR]"
+
+    @classmethod
+    def _compact_sibling_fields(cls, fields: dict[str, Any]) -> dict[str, Any]:
+        """Bounded ``{key: value}`` preview of a dominant-array object's sibling
+        fields (review F2). Keeps scalar values verbatim — they are tiny and
+        usually the most important fact — and small nested objects to a bounded
+        depth so their scalar leaves survive; large arrays / deep objects are
+        elided. Falls back to scalar-only (every non-scalar sibling elided) when
+        the compacted blob would still exceed _SIBLING_FIELDS_MAX_CHARS, so the
+        preview is always a few KB. Recovery is the byte-exact stored original."""
+        import json
+
+        compact = {k: cls._compact_sibling(v, _SIBLING_MAX_DEPTH) for k, v in fields.items()}
+        if len(json.dumps(compact, ensure_ascii=False, default=str)) > _SIBLING_FIELDS_MAX_CHARS:
+            return {k: cls._compact_sibling(v, 0) for k, v in fields.items()}
+        return compact
+
     @staticmethod
-    def _dominant_array(parsed: Any) -> tuple[str, list[dict[str, Any]], list[str]] | None:
+    def _dominant_array(parsed: Any) -> tuple[str, list[dict[str, Any]], dict[str, Any]] | None:
         """A JSON object with EXACTLY one dominant inner array — a non-empty
         list of dicts (e.g. a Chrome trace's ``traceEvents``). Mirrors
         ``sniff_envelope``'s fail-open "exactly one, else None" rule without its
-        wrapper-key allowlist. Returns ``(key, inner, other_key_names)`` or
-        ``None`` when zero or more than one key qualifies (ambiguous)."""
+        wrapper-key allowlist. Returns ``(key, inner, other_fields)`` — where
+        ``other_fields`` maps each sibling key to its VALUE (not just its name),
+        so tiny scalar siblings (a crash report's exception type/signal, a
+        trace's metadata) survive into the preview (review F2) — or ``None``
+        when zero or more than one key qualifies (ambiguous)."""
         if not isinstance(parsed, dict):
             return None
         matches = [
@@ -723,7 +787,7 @@ class ContentCompressionEngine:
         if len(matches) != 1:
             return None
         key = matches[0]
-        other = [k for k in parsed if k != key]
+        other = {k: v for k, v in parsed.items() if k != key}
         return key, parsed[key], other
 
     @staticmethod
@@ -767,7 +831,7 @@ class ContentCompressionEngine:
         rows: list[dict[str, Any]],
         *,
         key: str | None,
-        other_keys: list[str],
+        other_fields: dict[str, Any],
     ) -> tuple[list[dict[str, Any]], int]:
         """O(n) signal-aware summary of a list of dict rows.
 
@@ -823,7 +887,7 @@ class ContentCompressionEngine:
         summary: dict[str, Any] = {
             "array": key,
             "count": n,
-            "other_keys": other_keys,
+            "other_fields": self._compact_sibling_fields(other_fields),
             "schema": schema,
             "value_counts": summary_value_counts,
             "ranges": ranges,
@@ -972,7 +1036,7 @@ class ContentCompressionEngine:
             parsed = None
         if isinstance(parsed, list) and parsed and all(isinstance(item, dict) for item in parsed):
             try:
-                return self._summarize_rows(parsed, key=None, other_keys=[])
+                return self._summarize_rows(parsed, key=None, other_fields={})
             except Exception:  # noqa: BLE001 - fail-open to the head/tail preview
                 _cr().logger.warning(
                     "ccr_offload: row summary failed; head/tail preview", exc_info=True
@@ -986,9 +1050,9 @@ class ContentCompressionEngine:
 
         dominant = self._dominant_array(parsed)
         if dominant is not None:
-            key, inner, other_keys = dominant
+            key, inner, other_fields = dominant
             try:
-                return self._summarize_rows(inner, key=key, other_keys=other_keys)
+                return self._summarize_rows(inner, key=key, other_fields=other_fields)
             except Exception:  # noqa: BLE001 - fail-open to the head/tail preview
                 _cr().logger.warning(
                     "ccr_offload: array summary failed; head/tail preview", exc_info=True
@@ -1004,7 +1068,7 @@ class ContentCompressionEngine:
                 sample.extend(self._truncate_row(item) for item in inner[-tail:])
             summary = {
                 "_preview": f"'{key}': {len(inner)} items",
-                "_other_keys": other_keys,
+                "_other_fields": self._compact_sibling_fields(other_fields),
             }
             return [summary, *sample], len(inner)
 

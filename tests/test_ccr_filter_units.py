@@ -198,6 +198,39 @@ def test_apply_pattern_numbers_matched_lines() -> None:
     assert out.total_count == 3
 
 
+def test_apply_pattern_matches_substring_in_single_giant_line_review_f3() -> None:
+    # Review F3: a minified / single-line JSON blob stores as ONE line far
+    # longer than the per-line regex cap. A backtracking-bounded pattern (a
+    # literal) must still find a substring that is unambiguously present — pre-
+    # fix the over-long line was silently skipped and matched_count came back 0.
+    blob = '{"exception":{"type":"EXC_BAD_ACCESS","signal":"SIGSEGV"},"frames":['
+    blob += ",".join(f'{{"sym":"frame_{i}","off":{i}}}' for i in range(2000))
+    blob += "]}"
+    assert "\n" not in blob and len(blob) > 10_000
+    for pat in ("EXC_BAD_ACCESS", "SIGSEGV", "exception"):
+        spec = RetrieveFilters.parse({"pattern": pat})
+        assert isinstance(spec, RetrieveFilters)
+        out = apply_filters(blob, spec)
+        assert isinstance(out, FilteredContent)
+        assert out.matched_count == 1, f"{pat!r} present in the single line but not matched"
+        assert out.total_count == 1
+
+
+def test_apply_pattern_with_quantifier_over_long_line_stays_capped_review_f3() -> None:
+    # Review F3 bound: ONLY a backtracking-bounded pattern (no unbounded
+    # quantifier) bypasses the per-line cap. A pattern carrying '+' / '*' / '{'
+    # keeps the conservative cap on an over-long line — even when its target is
+    # present — so there is no new ReDoS surface, and it returns immediately.
+    long_line = "b" * 20_000 + "END"
+    spec = RetrieveFilters.parse({"pattern": "b+END"})
+    assert isinstance(spec, RetrieveFilters)
+    start = time.monotonic()
+    out = apply_filters(long_line, spec)
+    assert time.monotonic() - start < _REDOS_DEADLINE_S
+    assert isinstance(out, FilteredContent)
+    assert out.matched_count == 0
+
+
 # ─── CompressionMode.parse ──────────────────────────────────────────────────
 
 

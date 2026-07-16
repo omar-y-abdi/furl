@@ -438,6 +438,27 @@ def _filter_lines(original_content: str, filters: RetrieveFilters) -> FilteredCo
     )
 
 
+# An unbounded regex quantifier (``*``, ``+``, ``{n,}``) is the only construct
+# that can drive superlinear backtracking; a pattern free of all three matches
+# in time linear in the input length no matter how long a line is. We treat any
+# unescaped ``* + {`` as "risky" (a deliberate over-approximation — an escaped
+# ``\*`` or a class ``[*]`` also trips it, which only means that pattern keeps
+# the conservative per-line cap, never a correctness loss). Alternation ``|`` and
+# the bounded ``?`` are linear without a quantifier and stay allowed.
+_UNBOUNDED_QUANTIFIER_RE = re.compile(r"(?<!\\)[*+{]")
+
+
+def _pattern_backtracking_bounded(pattern: re.Pattern[str]) -> bool:
+    """True when ``pattern`` has no unbounded quantifier, so it is safe to run
+    against a line longer than :data:`_MAX_REGEX_LINE_CHARS` (linear time). This
+    is what lets a literal / character-class / anchored pattern match a substring
+    inside a single giant single-line blob — e.g. a minified JSON crash report
+    stored as one line — instead of that line being silently skipped and the
+    caller told ``matched_count=0`` for a substring that is unambiguously present
+    (review F3)."""
+    return _UNBOUNDED_QUANTIFIER_RE.search(pattern.pattern) is None
+
+
 def _select_matching_with_context(
     windowed: list[tuple[int, str]],
     pattern: re.Pattern[str],
@@ -450,13 +471,19 @@ def _select_matching_with_context(
     range filter is a hard boundary the context cannot leak past — the two
     filters compose without one silently overriding the other.
     """
-    # SEC-2 input bound: a line longer than the cap is skipped from matching
-    # (conservative "no match") so an adversarial pattern cannot backtrack over
-    # an unbounded line. Realistic content lines are far shorter than the cap.
+    # SEC-2 input bound: a pattern that CAN backtrack superlinearly is not run
+    # against a line longer than the cap (conservative "no match") so it cannot
+    # backtrack over an unbounded line. A backtracking-bounded pattern (no
+    # unbounded quantifier) is linear regardless of line length, so it IS run on
+    # long lines — otherwise a substring present in a single giant line (a
+    # minified-JSON crash report stored as ONE line) would be silently reported
+    # as zero matches (review F3). Realistic multi-line content is unaffected:
+    # its lines are far shorter than the cap and always searched.
+    long_line_ok = _pattern_backtracking_bounded(pattern)
     match_indices = [
         idx
         for idx, (_num, text) in enumerate(windowed)
-        if len(text) <= _MAX_REGEX_LINE_CHARS and pattern.search(text)
+        if (long_line_ok or len(text) <= _MAX_REGEX_LINE_CHARS) and pattern.search(text)
     ]
     if not match_indices:
         return []

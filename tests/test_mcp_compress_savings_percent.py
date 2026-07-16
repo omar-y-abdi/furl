@@ -159,3 +159,45 @@ def test_tiny_real_savings_not_mislabeled_as_zero(monkeypatch) -> None:
     assert out["savings_percent"] == 0.0  # rounded display value
     assert "No token savings" not in out["note"]
     assert out["transforms"] == ["log_compressor"]  # still present in the response
+
+
+def test_note_explains_distinct_embedded_marker_hash_review_f6() -> None:
+    """Review F6: a structured compression (here a JSON array tabled by the
+    smart crusher) embeds a granular ``<<ccr:…>>`` marker whose hash DIFFERS
+    from the whole-content ``hash``. Two different-looking hashes for one
+    compression read as a bug unless the note names the relationship. Uses the
+    REAL compress + store path (not the stub) so the embedded marker is real."""
+    import json
+
+    from furl_ctx.cache.compression_store import get_compression_store, reset_compression_store
+    from furl_ctx.ccr.marker_grammar import hashes_in_text
+
+    reset_compression_store()
+    try:
+        rows = [
+            {
+                "event_id": f"e{i}",
+                "amount": round(10 + i * 1.5, 2),
+                "event_type": ["purchase", "refund", "login", "payout_request"][i % 4],
+            }
+            for i in range(200)
+        ]
+        server = types.SimpleNamespace(
+            _get_local_store=lambda: get_compression_store(),
+            _stats=types.SimpleNamespace(record_compression=lambda *a, **k: None),
+        )
+        out = FurlMCPServer._compress_content(server, json.dumps(rows))
+
+        # Durable-success path — the path the finding is about.
+        assert out.get("hash") is not None
+        compressed = out["compressed"]
+        text = compressed if isinstance(compressed, str) else json.dumps(compressed)
+        embedded = [h for h in hashes_in_text(text) if h != out["hash"]]
+        assert embedded, "expected a granular marker whose hash differs from the top-level hash"
+
+        note = out["note"]
+        assert "<<ccr:" in note
+        assert "whole-content hash=" in note
+        assert embedded[0] in note  # the actual differing hash is named
+    finally:
+        reset_compression_store()
