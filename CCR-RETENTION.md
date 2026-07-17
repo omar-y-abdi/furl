@@ -8,6 +8,12 @@
 > retrieve returns a **loud, cause-honest miss** (never a silent `None`). So the
 > invariant — **no silent loss** — holds, but it was never "never evict."
 >
+> Byte-exact here means the raw offloaded bytes for text. A structured JSON array
+> recovers as a semantically-complete re-serialization of the same rows, not the
+> original bytes. `FURL_CCR_TTL_SECONDS` and the other store env vars are read once,
+> when the store is first built in a process, and changing them later in the same
+> process is silently ignored.
+>
 > **Update (Engine P1-7, 2026-07-03):** a durable CCR backend now EXISTS —
 > `SqliteBackend` (`furl_ctx/cache/backends/sqlite.py`), the MCP server's
 > default store backend (`FURL_CCR_BACKEND=memory` opts out; the library
@@ -203,3 +209,6 @@ restarts.
   `_evict_if_needed` (`:1436-1442`) and `retrieve()` (`:614`). Locked by
   `tests/test_ccr_spill_tier.py`.
 - `tests/test_ccr_eviction_loud_miss.py` — the locking regression tests.
+- `furl_ctx/ccr/marker_grammar.py` is the single owner of the CCR marker grammar.
+  It defines all marker shapes and both hash widths; LIBRARY.md has the
+  reader-facing summary.

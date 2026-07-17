@@ -30,6 +30,17 @@ from furl_ctx.transforms.csv_ingest import raw_recovery_hash
 _SECRET = "sk-" + "SUPERSECRETvalue0123456789abcdef"
 
 
+@pytest.fixture(autouse=True)
+def _builtins_off(monkeypatch):
+    """This file pins the CONFIGURED-redactor + byte-exact-default contract in
+    isolation. The ``sk-``-shaped ``_SECRET`` would otherwise also be caught by
+    the ON-by-default built-in credential redactor (audit Crit-4), scrubbing it
+    to a different marker and changing the stored hash. Opt the built-ins out so
+    these tests exercise exactly the configured redactor / raw-store path they
+    were written for; the default-on behavior is pinned in test_redaction_env.py."""
+    monkeypatch.setenv("FURL_REDACT_BUILTINS", "0")
+
+
 def _envelope(secret: str, n: int = 200) -> str:
     """Offload-sized JSON envelope carrying ``secret`` in every row's value.
 

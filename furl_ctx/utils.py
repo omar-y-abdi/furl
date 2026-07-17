@@ -72,8 +72,14 @@ def concat_text_parts(content: Any) -> str:
 
 
 def create_tool_digest_marker(original_hash: str) -> str:
-    """Create marker for crushed tool output."""
-    return f'<headroom:tool_digest sha256="{original_hash}">'
+    """Create marker for crushed tool output.
+
+    Uses the ``<furl:...>`` namespace (A11): the residual ``<headroom:...>``
+    branding from the upstream lineage was renamed to Furl's own name. This is a
+    display annotation on the compressed view, not a stored-then-retrieved marker,
+    so the rename touches no persisted bytes; it aligns with the Rust
+    tag-protector docs, which already reference ``<furl:tool_digest>``."""
+    return f'<furl:tool_digest sha256="{original_hash}">'
 
 
 def deep_copy_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:

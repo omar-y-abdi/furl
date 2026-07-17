@@ -405,3 +405,54 @@ def test_all_unique_field_is_not_treated_as_categorical():
     # ts is numeric => range, not a histogram.
     assert "ts" in summary["ranges"]
     assert "ts" not in summary["value_counts"]
+
+
+# ── Bug-4 / Med-10: error-line preservation in the plain-text head/tail preview ──
+
+
+def _plain_text_log_with_buried_errors() -> str:
+    """A high-entropy plain-text log (not a JSON array) long enough to offload,
+    with an ERROR and a Traceback buried in the omitted MIDDLE (not head/tail)."""
+    lines = [f"paragraph {i}: unique routine narrative content token-{i} tail" for i in range(120)]
+    lines[55] = "paragraph 55: ERROR upstream returned 503 after 3 retries id=req-55"
+    lines[70] = "paragraph 70: Traceback (most recent call last): boom in handler"
+    return "\n".join(lines)
+
+
+def test_plain_text_offload_surfaces_buried_error_lines_bug4():
+    """A buried ERROR/Traceback is visible in the compressed view, not just in CCR."""
+    content = _plain_text_log_with_buried_errors()
+    result = _offload_router().compress(content)
+    view = result.compressed
+    assert "lines omitted, in CCR" in view, "precondition: took the head/tail offload path"
+    assert "error/severity line(s) surfaced" in view
+    assert "ERROR upstream returned 503" in view, "the buried ERROR must be visible inline"
+    assert "Traceback (most recent call last)" in view, "the buried Traceback must be visible"
+
+
+def test_plain_text_offload_still_recovers_byte_exact_bug4():
+    """Surfacing error lines does not change byte-exact recovery of the original."""
+    content = _plain_text_log_with_buried_errors()
+    result = _offload_router().compress(content)
+    assert _recover(result.compressed) == content
+
+
+def test_plain_text_offload_no_false_positive_when_benign():
+    """An all-benign long text takes the plain head/tail path with NO surfaced block."""
+    content = "\n".join(f"paragraph {i}: benign unique content token-{i}" for i in range(120))
+    view = _offload_router().compress(content).compressed
+    assert "lines omitted, in CCR" in view
+    assert "surfaced" not in view
+
+
+def test_error_line_surfacing_is_bounded():
+    """An error-dense middle surfaces at most _OFFLOAD_ERROR_LINES_MAX lines."""
+    from furl_ctx.transforms.router_engine import (
+        _OFFLOAD_ERROR_LINES_MAX,
+        ContentCompressionEngine,
+    )
+
+    eng = ContentCompressionEngine.__new__(ContentCompressionEngine)
+    omitted = [f"ERROR failure number {i}" for i in range(500)]
+    surfaced = eng._extract_error_lines(omitted)
+    assert len(surfaced) == _OFFLOAD_ERROR_LINES_MAX

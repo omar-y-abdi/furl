@@ -7,6 +7,9 @@
     furl retrieve HASH --select-field NAME --select-equals VALUE [--limit N]
     furl retrieve HASH --select-field NAME --select-min 0 --select-max 99 [--limit N]
     furl purge HASH        # delete the stored original for a CCR hash from the store
+    furl list              # list stored CCR entries, newest first (furl_list twin)
+    furl search QUERY      # find a stored original by content (furl_search twin)
+    furl stats             # live store stats + the active CCR profile (furl_stats twin)
     furl eval CORPUS --recall  # corpus compression ratio + needle-recall gate
     furl doctor            # check the install: native core, tokenizer, CCR store
     furl mcp               # run the stdio MCP server (for Claude Code, Cursor, etc.)
@@ -32,16 +35,54 @@ from typing import Any
 
 
 def _read_input(path: str) -> str:
+    """Read UTF-8 text from *path* (or stdin for ``-``/``""``), STRICT.
+
+    Raises ``UnicodeDecodeError`` on non-UTF-8 bytes so callers decide: ``eval``
+    skips such files, while ``compress`` decodes lossily (see
+    :func:`_read_input_tolerant`)."""
     if path in ("-", ""):
         return sys.stdin.read()
     with open(path, encoding="utf-8") as handle:
         return handle.read()
 
 
+def _read_input_tolerant(path: str) -> tuple[str, str | None]:
+    """Read input, decoding non-UTF-8 bytes LOSSILY instead of crashing.
+
+    Returns ``(text, warning_or_None)``. A binary or otherwise undecodable file
+    OR stdin yields a replacement-decoded string plus a warning, so
+    ``furl compress`` on binary input degrades gracefully (audit High-7 / A7) —
+    a clean warning and pass-through, never a raw ``UnicodeDecodeError``
+    traceback — and the file-arg and stdin paths behave identically. Reads the
+    raw bytes (``sys.stdin.buffer`` for stdin, binary ``open`` for a file); a
+    text-only stdin double that exposes no ``buffer`` is already decoded and
+    passes straight through.
+    """
+    if path in ("-", ""):
+        buffer = getattr(sys.stdin, "buffer", None)
+        raw: bytes | str = buffer.read() if buffer is not None else sys.stdin.read()
+    else:
+        with open(path, "rb") as handle:
+            raw = handle.read()
+    if isinstance(raw, str):
+        return raw, None  # a text stream double already decoded it
+    try:
+        return raw.decode("utf-8"), None
+    except UnicodeDecodeError as exc:
+        warning = (
+            f"input is not valid UTF-8 text ({exc.reason} at byte {exc.start}); "
+            "decoded with replacement; furl compresses text, so binary is passed "
+            "through lossily"
+        )
+        return raw.decode("utf-8", errors="replace"), warning
+
+
 def _cmd_compress(args: argparse.Namespace) -> int:
     from furl_ctx import compress
 
-    text = _read_input(args.file)
+    text, decode_warning = _read_input_tolerant(args.file)
+    if decode_warning is not None:
+        sys.stderr.write(f"furl: {decode_warning}\n")
     result = compress([{"role": "tool", "content": text}], model=args.model)
     compressed = result.messages[0]["content"] if result.messages else text
     if args.json:
@@ -51,7 +92,20 @@ def _cmd_compress(args: argparse.Namespace) -> int:
                     "compressed": compressed,
                     "tokens_before": result.tokens_before,
                     "tokens_after": result.tokens_after,
+                    # Crit-2: the headline number is VISIBLE-TOKEN reduction (how
+                    # much the model no longer sees), which INCLUDES CCR-offloaded
+                    # content — hidden but byte-retrievable, not lossless byte
+                    # compression. Labeled explicitly so a high number on
+                    # high-entropy input is not mistaken for lossless shrinkage.
+                    "visible_token_reduction": result.compression_ratio,
+                    # Deprecated alias kept for compatibility — same value.
                     "compression_ratio": result.compression_ratio,
+                    "reduction_note": (
+                        "visible_token_reduction is context reduction, meaning tokens "
+                        "hidden from the model, and it includes content offloaded to "
+                        "the CCR store and retrievable by hash; it is NOT lossless "
+                        "byte compression. See BENCHMARKS.md for the lossless band."
+                    ),
                     "ccr_hashes": result.ccr_hashes,
                     "error": result.error,
                 },
@@ -102,6 +156,73 @@ def _parse_select_equals(value: str) -> Any:
         return value
 
 
+def _resolve_active_profile() -> dict[str, str]:
+    """The effective CCR profile for THIS run — backend, TTL, store scope, and
+    the compress floor — read from the already-resolved environment.
+
+    High-8: each surface (library / CLI / plugin) ships different CCR defaults
+    on purpose (the library stays in-memory + 30 min; the CLI opts into durable
+    sqlite + 24 h; the plugin pins per-project sqlite). That divergence silently
+    surprised users, so every ``furl`` run now surfaces the profile it is
+    actually using. Read from the environment ONLY (no store construction), so
+    building the banner never creates or opens a store as a side effect. Total:
+    never raises.
+    """
+    from .config import DEFAULT_MIN_TOKENS_TO_COMPRESS
+
+    scope = os.environ.get("FURL_CCR_PROJECT_DIR") or os.environ.get("FURL_CCR_NAMESPACE")
+    return {
+        "backend": os.environ.get("FURL_CCR_BACKEND", "memory"),
+        "ttl_seconds": os.environ.get("FURL_CCR_TTL_SECONDS", "1800"),
+        "scope": scope or "global (~/.furl)",
+        "min_tokens_to_compress": str(DEFAULT_MIN_TOKENS_TO_COMPRESS),
+    }
+
+
+def _profile_banner_enabled() -> bool:
+    """Whether to emit the one-line profile banner (High-8). Default ON;
+    ``FURL_PROFILE_BANNER=0`` (or false/no/off/disabled) silences it so clean
+    pipelines stay quiet."""
+    raw = os.environ.get("FURL_PROFILE_BANNER", "1").strip().lower()
+    return raw not in ("0", "false", "no", "off", "disabled")
+
+
+def _emit_profile_banner() -> None:
+    """Write the active-profile banner to STDERR (never stdout, so it never
+    corrupts piped compressed output).
+
+    Fail-open: a diagnostic banner must never break the command it precedes.
+    """
+    if not _profile_banner_enabled():
+        return
+    try:
+        profile = _resolve_active_profile()
+        sys.stderr.write(
+            f"furl profile: backend={profile['backend']} ttl={profile['ttl_seconds']}s "
+            f"scope={profile['scope']} min_tokens={profile['min_tokens_to_compress']} "
+            "(FURL_PROFILE_BANNER=0 to silence)\n"
+        )
+    except Exception:  # noqa: BLE001 — observability must never be fatal
+        pass
+
+
+def _invalid_hash_message(hash_value: str) -> str | None:
+    """Return an error string iff *hash_value* is not a syntactically valid CCR
+    hash (12 or 24 lowercase-hex), else ``None``.
+
+    Med-11: the MCP ``furl_retrieve`` / ``furl_purge`` handlers reject a
+    malformed hash up front via ``marker_grammar.is_valid_ccr_hash``; the CLI
+    used to pass any string straight to the store and report a generic MISS,
+    conflating "you typed a bad hash" with "that hash expired or was evicted".
+    This gives the CLI the same guard, and the same message, the MCP server uses.
+    """
+    from furl_ctx.ccr.marker_grammar import is_valid_ccr_hash
+
+    if is_valid_ccr_hash(hash_value):
+        return None
+    return f"invalid hash format: {hash_value!r} (expected 12 or 24 lowercase-hex chars)"
+
+
 def _ccr_store_search_target() -> tuple[str, bool]:
     """Describe WHERE ``furl retrieve`` just looked, and whether that store is
     volatile (process-local memory).
@@ -144,6 +265,14 @@ def _ccr_store_search_target() -> tuple[str, bool]:
 
 def _cmd_retrieve(args: argparse.Namespace) -> int:
     from furl_ctx import retrieve
+
+    # Reject a malformed hash up front with the SAME guard/message the MCP
+    # server uses (Med-11), so "you typed a bad hash" (exit 2, usage error) is
+    # never silently reported as an expired/evicted MISS (exit 1).
+    hash_error = _invalid_hash_message(args.hash)
+    if hash_error is not None:
+        sys.stderr.write(f"furl: {hash_error}\n")
+        return 2
 
     # Build kwargs only from flags the user actually passed (SUPPRESS default).
     # This keeps the no-flag path a plain full retrieve with no extra arguments.
@@ -199,6 +328,12 @@ def _cmd_retrieve(args: argparse.Namespace) -> int:
 def _cmd_purge(args: argparse.Namespace) -> int:
     from furl_ctx import purge
 
+    # Same up-front hash-format guard as retrieve / the MCP server (Med-11).
+    hash_error = _invalid_hash_message(args.hash)
+    if hash_error is not None:
+        sys.stderr.write(f"furl: {hash_error}\n")
+        return 2
+
     if purge(args.hash):
         sys.stdout.write(f"furl: purged {args.hash} from the CCR store\n")
         return 0
@@ -207,6 +342,205 @@ def _cmd_purge(args: argparse.Namespace) -> int:
         "(never stored, already purged, evicted, or expired)\n"
     )
     return 1
+
+
+# furl_search preview bounds (mirrors the MCP furl_search tool's slice-before-
+# redact discipline). The credential regexes are O(N^2) on long token runs, so
+# the redactor must never see a whole multi-MB original — only a MARGIN-widened
+# window around the match, so a secret straddling a display edge is masked whole
+# before any truncation.
+_SEARCH_PREVIEW_RADIUS = 60  # chars of context each side of the match
+_SEARCH_PREVIEW_MARGIN = 256  # extra chars redacted (edge-straddling secrets)
+_SEARCH_PREVIEW_MAX = 200  # hard char cap on a displayed preview
+_SEARCH_SCAN_CAP = 5000  # bound the linear scan over live entries
+
+
+_LIST_PREVIEW_MAX = 80  # hard char cap on a `furl list` preview
+
+
+def _redacted_list_preview(original: str, redactor: Any) -> str:
+    """The leading, credential-redacted window of *original* for ``furl list``.
+
+    Same discipline as :func:`_redacted_search_preview` (RG4): slice-before-redact
+    with a margin, so the O(N^2)-on-long-hex-runs credential regexes never see the
+    whole original, and a secret straddling the 80-char display edge is still seen
+    whole and masked before truncation. Total: never raises — a redactor error
+    yields the raw window rather than crashing the listing.
+    """
+    window = original[: _LIST_PREVIEW_MAX + _SEARCH_PREVIEW_MARGIN]
+    if redactor is not None:
+        try:
+            window = redactor(window)
+        except Exception:  # noqa: BLE001 — a preview must never break the listing
+            pass
+    return window.replace("\n", " ")[:_LIST_PREVIEW_MAX]
+
+
+def _redacted_search_preview(original: str, match_idx: int, needle_len: int, redactor: Any) -> str:
+    """A short, credential-redacted window of *original* around a substring match.
+
+    Slice-before-redact: redact only a margin-widened window (never the whole
+    original — the credential regexes are O(N^2) on long base64/hex runs), so a
+    secret straddling a display edge is seen whole and masked before truncation.
+    Total: never raises (redaction is fail-open — a redactor error yields the
+    raw window rather than crashing the search).
+    """
+    lo = max(0, match_idx - _SEARCH_PREVIEW_RADIUS - _SEARCH_PREVIEW_MARGIN)
+    hi = min(
+        len(original), match_idx + needle_len + _SEARCH_PREVIEW_RADIUS + _SEARCH_PREVIEW_MARGIN
+    )
+    window = original[lo:hi]
+    if redactor is not None:
+        try:
+            window = redactor(window)
+        except Exception:  # noqa: BLE001 — a preview must never break the search
+            pass
+    return window.replace("\n", " ").strip()[:_SEARCH_PREVIEW_MAX]
+
+
+def _live_store_entries(limit: int) -> list[tuple[str, Any]]:
+    """Newest-first ``(hash, entry)`` pairs from the active CLI store, expired
+    rows dropped, capped at *limit*.
+
+    Reads the SAME store seam ``furl retrieve`` consults
+    (``_active_ccr_store(None, None)``) and mirrors the MCP ``_live_entries``
+    read: snapshot ``backend.items()`` UNDER the store lock (an unlocked
+    ``list(dict.items())`` racing a concurrent write raises "dictionary changed
+    size during iteration" on the in-memory backend), then filter expiry and
+    sort on the local snapshot outside the lock.
+    """
+    import time
+
+    from furl_ctx.cache.compression_store import _active_ccr_store
+
+    store = _active_ccr_store(None, None)
+    now = time.time()
+    with store._lock:
+        snapshot = list(store._backend.items())
+    live = [(h, e) for h, e in snapshot if not e.is_expired(now)]
+    live.sort(key=lambda pair: pair[1].created_at, reverse=True)
+    return live[:limit]
+
+
+def _cmd_list(args: argparse.Namespace) -> int:
+    """``furl list`` — newest-first directory of stored CCR entries (MCP parity).
+
+    The CLI twin of the ``furl_list`` MCP tool: inspect what originals the store
+    is holding (hash, age, size, kind, a short credential-redacted preview) so a
+    lost ``<<ccr:HASH>>`` marker can be recovered by eye, then retrieved by hash.
+    The preview is redacted exactly like ``furl search``'s (RG4): the store holds
+    whatever the agent compressed, so a listing must not print a secret back out.
+    """
+    import time
+
+    from furl_ctx.redaction import build_store_redactor
+
+    entries = _live_store_entries(args.limit)
+    if args.json:
+        now = time.time()
+        payload = [
+            {
+                "hash": hash_key,
+                "age_seconds": round(now - entry.created_at),
+                "size": len(entry.original_content),
+                "content_kind": entry.tool_name,
+            }
+            for hash_key, entry in entries
+        ]
+        sys.stdout.write(json.dumps(payload, indent=2) + "\n")
+        return 0
+    if not entries:
+        sys.stdout.write("furl: no live entries in the CCR store\n")
+        return 0
+    now = time.time()
+    redactor = build_store_redactor()
+    for hash_key, entry in entries:
+        preview = _redacted_list_preview(entry.original_content, redactor)
+        age = round(now - entry.created_at)
+        sys.stdout.write(
+            f"{hash_key}  age={age}s  size={len(entry.original_content)}  "
+            f"kind={entry.tool_name}  {preview!r}\n"
+        )
+    return 0
+
+
+def _cmd_search(args: argparse.Namespace) -> int:
+    """``furl search`` — find a stored original by content, get its hash back.
+
+    The CLI twin of the ``furl_search`` MCP tool: case-insensitive SUBSTRING
+    match (no regex — no ReDoS/injection surface) over live stored originals,
+    newest first, each with a short credential-redacted preview around the
+    match so a lost ``<<ccr:HASH>>`` marker is recoverable without leaking a
+    secret. Bounded: scans at most ``_SEARCH_SCAN_CAP`` entries, returns at most
+    ``--limit`` hits.
+    """
+    from furl_ctx.redaction import build_store_redactor
+
+    if not args.query.strip():
+        sys.stderr.write("furl: search query must be a non-empty string\n")
+        return 2
+
+    needle = args.query.lower()
+    redactor = build_store_redactor()
+    matches: list[tuple[str, Any, str]] = []
+    for hash_key, entry in _live_store_entries(_SEARCH_SCAN_CAP):
+        original = entry.original_content
+        idx = original.lower().find(needle)
+        if idx < 0:
+            continue
+        preview = _redacted_search_preview(original, idx, len(args.query), redactor)
+        matches.append((hash_key, entry, preview))
+        if len(matches) >= args.limit:
+            break
+
+    if args.json:
+        payload = [
+            {"hash": hash_key, "content_kind": entry.tool_name, "preview": preview}
+            for hash_key, entry, preview in matches
+        ]
+        sys.stdout.write(json.dumps(payload, indent=2) + "\n")
+        return 0
+    if not matches:
+        sys.stdout.write(f"furl: no stored original matches {args.query!r}\n")
+        return 0
+    for hash_key, entry, preview in matches:
+        sys.stdout.write(f"{hash_key}  kind={entry.tool_name}  {preview!r}\n")
+    return 0
+
+
+def _cmd_stats(args: argparse.Namespace) -> int:
+    """``furl stats`` — live store stats + the active CCR profile (MCP parity).
+
+    The CLI twin of the ``furl_stats`` MCP tool, scoped to what the CLI can
+    honestly report: the live, cross-process store figures (``get_stats``, which
+    also prunes expired rows) plus the resolved profile (High-8) so the numbers
+    are never read against the wrong backend/TTL.
+    """
+    from furl_ctx.cache.compression_store import _active_ccr_store
+
+    store = _active_ccr_store(None, None)
+    stats = store.get_stats()
+    profile = _resolve_active_profile()
+    store_desc, _volatile = _ccr_store_search_target()
+    if args.json:
+        sys.stdout.write(
+            json.dumps(
+                {"profile": profile, "store_descriptor": store_desc, "store": stats}, indent=2
+            )
+            + "\n"
+        )
+        return 0
+    sys.stdout.write(
+        "furl store stats\n"
+        f"  store: {store_desc}\n"
+        f"  scope: {profile['scope']}\n"
+        f"  entries: {stats['entry_count']} (max {stats['max_entries']})\n"
+        f"  default TTL: {stats['default_ttl_seconds']}s\n"
+        f"  original tokens: {stats['total_original_tokens']}\n"
+        f"  compressed tokens: {stats['total_compressed_tokens']}\n"
+        f"  retrievals: {stats['total_retrievals']}\n"
+    )
+    return 0
 
 
 def _corpus_files(path: str) -> list[str]:
@@ -295,16 +629,22 @@ def _cmd_eval(args: argparse.Namespace) -> int:
         tokens_after += result.tokens_after
 
     ratio = (tokens_before - tokens_after) / tokens_before if tokens_before else 0.0
-    recall = _engine_needle_recall()
 
     sys.stdout.write(
         f"files: {len(files)}  tokens: {tokens_before} -> {tokens_after}\n"
-        f"corpus compression ratio: {ratio * 100:.1f}%\n"
+        f"corpus visible-token reduction: {ratio * 100:.1f}% "
+        "(context hidden, not lossless compression; originals stay CCR-retrievable)\n"
     )
-    if recall < 0:
-        sys.stdout.write("engine needle-recall (trust gate): unavailable (benchmarks not found)\n")
-    else:
-        sys.stdout.write(f"engine needle-recall (trust gate): {recall * 100:.1f}%\n")
+    # The needle-recall gate runs an extra benchmark grid, so it is opt-in via
+    # --recall (the flag now conveys a real choice, not a mandatory no-op).
+    if args.recall:
+        recall = _engine_needle_recall()
+        if recall < 0:
+            sys.stdout.write(
+                "engine needle-recall (trust gate): unavailable (benchmarks not found)\n"
+            )
+        else:
+            sys.stdout.write(f"engine needle-recall (trust gate): {recall * 100:.1f}%\n")
     return 0
 
 
@@ -342,6 +682,15 @@ def _cmd_doctor(_args: argparse.Namespace) -> int:
 
     for name, passed, detail in checks:
         sys.stdout.write(f"[{'OK' if passed else 'FAIL'}] {name}: {detail}\n")
+
+    # High-8: the resolved CCR profile this install will use, so `doctor` answers
+    # "which backend/TTL/scope am I actually on?" — the surface-specific defaults
+    # that otherwise surprise users.
+    profile = _resolve_active_profile()
+    sys.stdout.write(
+        f"[--] profile: backend={profile['backend']} ttl={profile['ttl_seconds']}s "
+        f"scope={profile['scope']} min_tokens={profile['min_tokens_to_compress']}\n"
+    )
     return 0 if all(passed for _, passed, _ in checks) else 1
 
 
@@ -507,10 +856,35 @@ def main(argv: list[str] | None = None) -> int:
     p_purge.add_argument("hash")
     p_purge.set_defaults(func=_cmd_purge)
 
+    # CLI parity with the MCP tools (Med-11): list / search / stats over the same
+    # store `furl compress` writes to and `furl retrieve` reads from.
+    p_list = sub.add_parser("list", help="list stored CCR entries, newest first")
+    p_list.add_argument(
+        "--limit", type=int, default=20, metavar="N", help="max entries to show (default 20)"
+    )
+    p_list.add_argument("--json", action="store_true", help="emit entries as JSON")
+    p_list.set_defaults(func=_cmd_list)
+
+    p_search = sub.add_parser(
+        "search", help="find a stored original by content and get its hash back"
+    )
+    p_search.add_argument("query", help="text to search for across stored originals")
+    p_search.add_argument(
+        "--limit", type=int, default=10, metavar="N", help="max ranked hits (default 10)"
+    )
+    p_search.add_argument("--json", action="store_true", help="emit matches as JSON")
+    p_search.set_defaults(func=_cmd_search)
+
+    p_stats = sub.add_parser("stats", help="show live CCR store stats + active profile")
+    p_stats.add_argument("--json", action="store_true", help="emit stats as JSON")
+    p_stats.set_defaults(func=_cmd_stats)
+
     p_eval = sub.add_parser("eval", help="compression ratio + needle recall over a corpus")
     p_eval.add_argument("corpus", help="a file or a directory of files to evaluate")
     p_eval.add_argument(
-        "--recall", action="store_true", required=True, help="report needle-recall %%"
+        "--recall",
+        action="store_true",
+        help="also run the engine needle-recall trust gate (extra work; off by default)",
     )
     p_eval.add_argument("--model", default="claude-sonnet-4-5-20250929")
     p_eval.set_defaults(func=_cmd_eval)
@@ -523,6 +897,10 @@ def main(argv: list[str] | None = None) -> int:
     p_mcp.set_defaults(func=_cmd_mcp)
 
     args = parser.parse_args(argv)
+    # High-8: surface the active CCR profile (backend/TTL/scope) on every run so
+    # a surface's non-obvious defaults never silently surprise the user. STDERR
+    # only (stdout stays pure compressed output); opt out with FURL_PROFILE_BANNER=0.
+    _emit_profile_banner()
     return int(args.func(args))
 
 

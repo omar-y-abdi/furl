@@ -33,6 +33,7 @@ from typing import Any, cast
 from benchmarks import datasets as ds_mod
 from benchmarks.metrics import (
     BENCH_MODEL,
+    BenchmarkAbortedError,
     CaseMetrics,
     measure_case,
     measure_conversation_case,
@@ -51,7 +52,7 @@ DATA_DIR = HERE / "data"
 
 # Default out-dir for normal (non-re-baselining) runs.
 # Must be outside benchmarks/ so default runs leave `git status benchmarks/` clean.
-DEFAULT_OUT_DIR: Path = Path(tempfile.gettempdir()) / "headroom_bench"
+DEFAULT_OUT_DIR: Path = Path(tempfile.gettempdir()) / "furl_bench"
 
 
 # ---------------------------------------------------------------------------
@@ -384,6 +385,25 @@ def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     refresh = "--refresh" in args
 
+    # A2: fail CLOSED on a broken engine. Running `python -m benchmarks.run_bench`
+    # from the repo root puts the extension-less source tree ahead of the built
+    # wheel on sys.path, so every compress() fail-opens ("No module named
+    # 'furl_ctx._core'") and the harness would otherwise write a plausible-looking
+    # all-zero baseline (0% reduction, "lossless", 100% recall). Verify the native
+    # core imports up front and abort BEFORE measuring or writing anything.
+    try:
+        import furl_ctx._core  # noqa: F401  (native extension presence check)
+    except Exception as exc:  # noqa: BLE001 - any import failure is fatal here
+        print(
+            "ERROR: furl_ctx._core native extension is not importable "
+            f"({exc}).\n  compress() would fail open on every case and produce a "
+            "fictional all-zero baseline. Build/install the wheel (maturin develop) "
+            "and run from OUTSIDE the source tree, or `pip install -e .`. "
+            "Refusing to write a misleading baseline.",
+            file=sys.stderr,
+        )
+        return 1
+
     # Parse --out <dir>
     out_dir = DEFAULT_OUT_DIR
     if "--out" in args:
@@ -415,8 +435,14 @@ def main(argv: list[str] | None = None) -> int:
     if refresh:
         ds_mod.all_datasets(refresh=True)
 
-    cases = run_datasets()
-    needles = run_needle_recall()
+    # A2: any per-item compress() fail-open aborts the whole run BEFORE the write
+    # below, so a broken engine never produces a baseline file at all.
+    try:
+        cases = run_datasets()
+        needles = run_needle_recall()
+    except BenchmarkAbortedError as exc:
+        print(f"ERROR: benchmark aborted (fail-closed): {exc}", file=sys.stderr)
+        return 1
 
     print_table(cases, needles)
 

@@ -612,7 +612,20 @@ class SessionStats:
             "total_input_tokens": self.total_input_tokens,
             "total_output_tokens": self.total_output_tokens,
             "total_tokens_saved": self.total_tokens_saved,
+            # Crit-2: this is VISIBLE-TOKEN reduction (context hidden from the
+            # model), which INCLUDES CCR-offloaded content — retrievable by hash,
+            # not lossless byte compression. Labeled explicitly so a high number
+            # on high-entropy input is not read as lossless shrinkage.
+            "visible_token_reduction_percent": savings_pct,
+            # Deprecated alias kept for compatibility — same value.
             "savings_percent": savings_pct,
+            "reduction_note": (
+                "visible_token_reduction_percent is context reduction, meaning tokens "
+                "hidden from the model, and it includes content offloaded to the CCR "
+                "store and retrievable by hash; it is NOT lossless byte compression. "
+                "estimated_cost_saved_usd is derived from it and is likewise a "
+                "context-reduction estimate, not a guaranteed billing delta."
+            ),
             "estimated_cost_saved_usd": cost_saved,
             "recent_events": self.events[-10:],
         }
@@ -888,17 +901,19 @@ class FurlMCPServer:
         Returns dict with compressed text, token counts, hash, etc.
         """
         from furl_ctx.compress import compress
-        from furl_ctx.redaction import build_env_redactor
+        from furl_ctx.redaction import build_store_redactor
 
-        # Env-expressible redaction (FURL_REDACT_PATTERNS): scrub secrets from
-        # the content BEFORE it is compressed, previewed, OR stored. compress()
-        # redacts its own message copy, but this tool stores ``original=content``
-        # verbatim (and _compress_filtered stores runs of it), so the redaction
-        # MUST also happen here or the raw secret would persist in the CCR store
-        # — the exact leak the plugin-reachable redaction closes. Shares the
-        # builder with the hook and library so one env var governs all three;
-        # no patterns set => None => content unchanged (byte-identical).
-        _redactor = build_env_redactor()
+        # Pre-store redaction: scrub secrets from the content BEFORE it is
+        # compressed, previewed, OR stored. compress() redacts its own message
+        # copy, but this tool stores ``original=content`` verbatim (and
+        # _compress_filtered stores runs of it), so the redaction MUST also happen
+        # here or the raw secret would persist in the CCR store — the exact leak
+        # the plugin-reachable redaction closes. The ON-by-default built-in
+        # credential patterns (audit Crit-4 / B3) plus ``FURL_REDACT_PATTERNS``
+        # both apply; shares the builder with the hook and library so one config
+        # governs all three. None (built-ins opted out AND no env patterns) =>
+        # content unchanged (byte-identical).
+        _redactor = build_store_redactor()
         if _redactor is not None:
             content = _redactor(content)
 
@@ -983,14 +998,18 @@ class FurlMCPServer:
                 require_durable=True,
             )
         except DurableWriteError as exc:
-            # Durable write lost the whole lock-contention retry budget and fell
-            # open to THIS process's volatile tier. The entry IS retrievable now
-            # under exc.hash_key — carry it forward so the response stays honest
-            # (return the hash + a precise caveat) instead of dropping it. The
-            # exception message names the likely cause (a sibling MCP server).
-            volatile_hash = exc.hash_key
+            # The durable write did not land. A cheap read-back distinguishes the
+            # two causes so the response stays honest (Bug-6):
+            #   (a) it fell open to THIS process's volatile tier — still
+            #       retrievable now under exc.hash_key; carry it forward.
+            #   (b) the binding was DROPPED entirely (a true hash collision) —
+            #       nothing is retrievable; revert to the original, claim nothing.
+            volatile_hash = exc.hash_key if store.exists(exc.hash_key) else None
             logger.warning(
-                "event=mcp_compress_volatile_fallback hash=%s error=%s", volatile_hash, exc
+                "event=mcp_compress_durable_veto hash=%s retrievable=%s error=%s",
+                exc.hash_key,
+                volatile_hash is not None,
+                exc,
             )
             hash_key = None
 
@@ -1002,6 +1021,29 @@ class FurlMCPServer:
 
         tokens_saved = max(0, input_tokens - output_tokens)
         savings_pct = round(tokens_saved / input_tokens * 100, 1) if input_tokens > 0 else 0
+
+        if hash_key is None and volatile_hash is None:
+            # Collision-drop veto (Bug-6): a true hash collision made the binding
+            # ambiguous, so it was dropped to avoid serving foreign content and
+            # NOTHING is retrievable. Return the ORIGINAL uncompressed content and
+            # say so plainly — no hash, no false "retrievable" claim.
+            return {
+                "compressed": content,
+                "hash": None,
+                "durably_stored": False,
+                "original_tokens": input_tokens,
+                "compressed_tokens": input_tokens,
+                "tokens_saved": 0,
+                "visible_token_reduction_percent": 0,
+                "savings_percent": 0,
+                "transforms": [],
+                "note": (
+                    "Not stored: a hash collision made the binding ambiguous, so it was "
+                    "dropped to avoid serving foreign content. The original is returned "
+                    "uncompressed and unchanged; retry to store it under a fresh "
+                    "compression."
+                ),
+            }
 
         if hash_key is None:
             # Durability veto: the write fell open to THIS process's volatile
@@ -1801,13 +1843,21 @@ class FurlMCPServer:
         if not isinstance(content, str):
             return _err(f"content parameter must be a string, got {type(content).__name__}")
 
-        # Reject oversized input before compressing it (OOM DoS guard). ``content``
-        # is text, so the cap is measured in characters against the same byte-scale
-        # ceiling used by furl_read — well above any realistic tool output.
-        if len(content) > _MAX_READ_BYTES:
+        # Reject oversized input before compressing it (OOM DoS guard). The cap
+        # is a BYTE ceiling (matching furl_read's byte-measured limit), so measure
+        # the encoded byte length, not the character count (Bug-8) — on multibyte
+        # content a char count is up to ~4x short and lets an over-ceiling payload
+        # through. Cheap bounds avoid encoding the common small case: chars are a
+        # lower bound on UTF-8 bytes and 4*chars an upper bound.
+        _char_len = len(content)
+        _too_large = _char_len > _MAX_READ_BYTES or (
+            _char_len * 4 > _MAX_READ_BYTES
+            and len(content.encode("utf-8", errors="replace")) > _MAX_READ_BYTES
+        )
+        if _too_large:
+            _byte_len = len(content.encode("utf-8", errors="replace"))
             return _err(
-                f"Content too large to compress: {len(content)} chars "
-                f"(limit {_MAX_READ_BYTES} chars)"
+                f"Content too large to compress: {_byte_len} bytes (limit {_MAX_READ_BYTES} bytes)"
             )
 
         # NR2-2 feature c: aggressiveness/filter mode. Both default to today's
@@ -2130,7 +2180,13 @@ class FurlMCPServer:
             )
 
         if all_arg:
-            deleted = await asyncio.to_thread(self._purge_all)
+            deleted, still_present = await asyncio.to_thread(self._purge_all)
+            if still_present:
+                return _err(
+                    f"purge verification FAILED: {still_present} entr"
+                    f"{'y is' if still_present == 1 else 'ies are'} still in the store "
+                    "after clear(). No data was confirmed erased; retry or inspect the store."
+                )
             plural = "y" if deleted == 1 else "ies"
             return [
                 TextContent(
@@ -2154,7 +2210,46 @@ class FurlMCPServer:
             return _err("invalid hash format (expected 12 or 24 lowercase-hex chars)")
         hash_key = hash_arg.lower()
 
-        deleted_one = await asyncio.to_thread(self._purge_one, hash_key)
+        deleted_one, nested_count, survivors, kept_shared = await asyncio.to_thread(
+            self._purge_one, hash_key
+        )
+        deleted_total = (1 if deleted_one else 0) + nested_count
+        if survivors:
+            # Read-back verification failed (A1/RG6): something the cascade decided
+            # to delete is STILL retrievable. Report it loudly, naming every
+            # survivor, rather than claim success — a purge that does not purge is
+            # the top data-safety bug in the audits, and an incomplete cascade is
+            # invisible if only the top hash is re-checked.
+            return _err(
+                f"purge verification FAILED: {len(survivors)} entr"
+                f"{'y is' if len(survivors) == 1 else 'ies are'} still retrievable "
+                f"after delete: {', '.join(survivors)}. No data was confirmed erased; "
+                "retry or inspect the store."
+            )
+        if nested_count:
+            note = (
+                f"Entry {hash_key} and {nested_count} nested offloaded "
+                f"blob{'s' if nested_count != 1 else ''} erased from the CCR store "
+                "(verified no longer retrievable)."
+            )
+        elif deleted_one:
+            note = f"Entry {hash_key} erased from the CCR store (verified no longer retrievable)."
+        else:
+            note = (
+                f"No entry {hash_key} in the store (already erased, evicted, or "
+                "never stored); nothing to delete."
+            )
+        if kept_shared:
+            # B2: a blob deliberately RETAINED because another live entry still
+            # references it must be disclosed. Without this the agent reads
+            # "verified no longer retrievable" while the content is still there,
+            # which is exactly the false-erase claim the read-back exists to
+            # prevent. The retention is correct (RG3); hiding it is not.
+            note += (
+                f" {len(kept_shared)} nested blob{'s' if len(kept_shared) != 1 else ''} "
+                f"kept because another live entry still references "
+                f"{'them' if len(kept_shared) != 1 else 'it'}: {', '.join(kept_shared)}."
+            )
         return [
             TextContent(
                 type="text",
@@ -2163,42 +2258,79 @@ class FurlMCPServer:
                         "purged": "hash",
                         "hash": hash_key,
                         "found": deleted_one,
-                        "deleted_count": 1 if deleted_one else 0,
-                        "note": (
-                            f"Entry {hash_key} erased from the CCR store."
-                            if deleted_one
-                            else (
-                                f"No entry {hash_key} in the store (already erased, "
-                                "evicted, or never stored); nothing to delete."
-                            )
-                        ),
+                        "deleted_count": deleted_total,
+                        "nested_deleted": nested_count,
+                        "nested_kept_shared": list(kept_shared),
+                        "note": note,
                     },
                     indent=2,
                 ),
             )
         ]
 
-    def _purge_one(self, hash_key: str) -> bool:
-        """Delete one entry via the library purge primitive (runs off the loop).
+    def _purge_one(self, hash_key: str) -> tuple[bool, int, tuple[str, ...], tuple[str, ...]]:
+        """Cascade-delete one entry via the library purge primitive (off-loop).
 
-        ``CompressionStore.delete`` is exactly what ``furl_ctx.retrieve.purge``
-        delegates to; calling it on THIS server's store handle — the same one
-        the retrieve path reads — guarantees a purged hash is no longer
-        retrievable. Returns True when an entry went, False when it was already
-        absent.
+        ``CompressionStore.delete_cascade_detailed`` is exactly what
+        ``furl_ctx.retrieve.purge`` delegates to; calling it on THIS server's
+        store handle — the same one the retrieve path reads — guarantees a purged
+        hash (and every nested ``<<ccr:HASH>>`` blob it owned) is no longer
+        retrievable. A read-back with
+        :meth:`CompressionStore.exists_any_tier` VERIFIES the erase actually took
+        (A1: a purge that silently does not purge is the top data-safety bug in
+        both audits).
+
+        The read-back covers the FULL set the cascade decided to delete — the top
+        hash AND every nested hash it removed (RG6). Verifying only the top hash
+        could not detect an incomplete cascade, which is the exact failure the
+        cascade exists to prevent. Hashes deliberately SKIPPED as still-shared
+        (RG3) are not verified: they are meant to survive.
+
+        It uses ``exists_any_tier``, not ``exists`` (review B3): ``exists`` is
+        primary-only while ``retrieve`` falls back to the spill tier, so a
+        primary-only read-back could report success on an entry that is still
+        retrievable through the spill after a fail-open spill delete.
+
+        Returns ``(top_deleted, nested_deleted_count, survivors, kept_shared)``:
+        ``survivors`` names every hash that should be gone but is still
+        retrievable (empty on success), and ``kept_shared`` names every nested
+        blob deliberately RETAINED because another live entry still references it
+        — the agent is told about those rather than left to infer an erase that
+        did not happen (review B2).
         """
-        return bool(self._get_local_store().delete(hash_key))
+        store = self._get_local_store()
+        outcome = store.delete_cascade_detailed(hash_key)
+        # The named hash is always verified (even when it was already absent, so a
+        # delete that silently no-ops on a live entry is still caught); the nested
+        # hashes verified are the ones the cascade actually removed. dict.fromkeys
+        # dedupes while keeping order -- the top hash appears in both sources.
+        expected_gone = dict.fromkeys((hash_key, *outcome.deleted_hashes(hash_key)))
+        survivors = tuple(h for h in expected_gone if store.exists_any_tier(h))
+        return (
+            outcome.top_deleted,
+            len(outcome.nested_deleted),
+            survivors,
+            outcome.nested_shared_skipped,
+        )
 
-    def _purge_all(self) -> int:
-        """Wipe every entry; return how many live entries were removed (off-loop).
+    def _purge_all(self) -> tuple[int, int]:
+        """Wipe every entry; return ``(removed, still_present)`` (off-loop).
 
         Reads the live ``entry_count`` before ``clear()`` so the reported count
         reflects what was actually erasable (get_stats prunes expired rows first).
+        ``clear()`` itself returns the read-back (reviewer #13, review F1): the
+        single-hash path verifies its erase with ``exists_any_tier``, and claiming
+        "erased N entries" without checking is the same unverified claim on a
+        wider blast radius. Crucially ``clear`` now counts EVERY tier, so a spill
+        whose own clear failed -- leaving rows retrievable while ``get_stats``
+        (primary-only) shows an empty store -- comes back as ``still_present > 0``
+        and the handler fails the purge loudly instead of reporting a false
+        all-clear. ``still_present`` is 0 on success.
         """
         store = self._get_local_store()
         count = int(store.get_stats().get("entry_count", 0))
-        store.clear()
-        return count
+        still_present = store.clear()
+        return count, still_present
 
     async def _handle_search(self, arguments: dict[str, Any]) -> list[TextContent]:
         """Handle furl_search — case-insensitive SUBSTRING search over originals.
@@ -2355,7 +2487,7 @@ class FurlMCPServer:
         """Blocking body of :meth:`_handle_read` (runs off the loop)."""
         import hashlib
 
-        from furl_ctx.redaction import build_env_redactor
+        from furl_ctx.redaction import build_store_redactor
 
         path = Path(file_path).expanduser().resolve()
 
@@ -2466,15 +2598,15 @@ class FurlMCPServer:
         # char on invalid bytes is acceptable).
         content = _safe_decode_for_logging(raw)
 
-        # Env-expressible redaction (FURL_REDACT_PATTERNS), applied AFTER decode
-        # and BEFORE the hash / cache / store / served output — furl_read stored
-        # and served the raw file verbatim, bypassing the redaction the other
-        # store paths got (review F1). Redacting before the content_hash keeps
+        # Credential redaction (built-in patterns ON by default + FURL_REDACT_PATTERNS),
+        # applied AFTER decode and BEFORE the hash / cache / store / served output —
+        # furl_read stored and served the raw file verbatim, bypassing the redaction
+        # the other store paths got (review F1). Redacting before the content_hash keeps
         # the file cache coherent: same file + same patterns hash identically
         # (cache hit), while a pattern change hashes differently and forces a
         # fresh (re-redacted) read. The served numbered output is scrubbed too,
         # consistent with the hook. Unset patterns => None => byte-identical.
-        _read_redactor = build_env_redactor()
+        _read_redactor = build_store_redactor()
         if _read_redactor is not None:
             content = _read_redactor(content)
 

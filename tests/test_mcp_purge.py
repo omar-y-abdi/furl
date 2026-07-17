@@ -118,6 +118,246 @@ async def test_purge_absent_hash_is_clean_not_error(server) -> None:
     assert env["found"] is False
 
 
+async def test_purge_hash_cascades_to_nested_offloaded_blobs(server) -> None:
+    # An offloaded original (outer) whose compressed view references a nested
+    # dropped-rows blob under another hash. Purging the outer must ALSO erase the
+    # nested blob — else a "purged" secret survives under the nested hash (B3 /
+    # audit non-cascading-purge; A1).
+    nested = "d" * 24
+    store = server._get_local_store()
+    store.store(original=f"the dropped {_API_KEY} rows", compressed="x", explicit_hash=nested)
+    store.store(
+        original="full original payload",
+        compressed=f"summary <<ccr:{nested}>> tail",
+        explicit_hash=_HASH_A,
+    )
+
+    purged = _envelope(await server._handle_purge({"hash": _HASH_A}))
+    assert purged["deleted_count"] == 2
+    assert purged["nested_deleted"] == 1
+    assert "nested" in purged["note"]
+
+    # BOTH the outer and the nested blob are now unretrievable (verified by the
+    # handler's read-back too).
+    for h in (_HASH_A, nested):
+        gone = _envelope(await server._handle_retrieve({"hash": h}))
+        assert "error" in gone, f"{h} still retrievable after cascade purge"
+
+
+async def test_purge_readback_detects_a_surviving_nested_blob(server) -> None:
+    """RG6: read-back must verify the FULL set the cascade decided to delete.
+
+    Before RG6 the read-back checked only ``store.exists(top_hash)``, so a nested
+    blob that survived an incomplete cascade was invisible and the handler
+    reported success. Simulate that by making ``delete`` a no-op for the nested
+    hash only: the top goes, the nested does not, and the handler must say so
+    loudly and NAME the survivor.
+    """
+    nested = "d" * 24
+    store = server._get_local_store()
+    store.store(original=f"the dropped {_API_KEY} rows", compressed="x", explicit_hash=nested)
+    store.store(
+        original="full original payload",
+        compressed=f"summary <<ccr:{nested}>> tail",
+        explicit_hash=_HASH_A,
+    )
+
+    real_delete = store.delete
+
+    def _delete_except_nested(hash_key: str) -> bool:
+        if hash_key == nested:
+            return True  # claims success, erases nothing (an incomplete cascade)
+        return real_delete(hash_key)
+
+    store.delete = _delete_except_nested  # type: ignore[method-assign]
+    envelope = _envelope(await server._handle_purge({"hash": _HASH_A}))
+    assert "error" in envelope, "an incomplete cascade must not report success"
+    assert nested in envelope["error"], "the error must NAME the surviving hash"
+    assert "verification FAILED" in envelope["error"]
+
+
+async def test_purge_readback_passes_on_a_complete_cascade(server) -> None:
+    """RG6 control: the widened read-back must not false-positive a clean purge."""
+    nested = "d" * 24
+    store = server._get_local_store()
+    store.store(original="dropped rows", compressed="x", explicit_hash=nested)
+    store.store(
+        original="payload",
+        compressed=f"summary <<ccr:{nested}>> tail",
+        explicit_hash=_HASH_A,
+    )
+    envelope = _envelope(await server._handle_purge({"hash": _HASH_A}))
+    assert "error" not in envelope
+    assert envelope["deleted_count"] == 2
+    assert envelope["nested_deleted"] == 1
+
+
+async def test_purge_keeps_a_nested_blob_another_live_entry_shares(server) -> None:
+    """RG3 at the MCP surface: purging A must not break B's retrieval of shared C."""
+    nested = "d" * 24
+    store = server._get_local_store()
+    store.store(original="shared dropped rows", compressed="x", explicit_hash=nested)
+    store.store(original="A payload", compressed=f"A <<ccr:{nested}>>", explicit_hash=_HASH_A)
+    store.store(original="B payload", compressed=f"B <<ccr:{nested}>>", explicit_hash=_HASH_B)
+
+    envelope = _envelope(await server._handle_purge({"hash": _HASH_A}))
+    assert "error" not in envelope, "skipping a shared blob is not a verification failure"
+    assert envelope["nested_deleted"] == 0
+    # B still resolves its marker; the shared blob was never the caller's to purge.
+    still = _envelope(await server._handle_retrieve({"hash": nested}))
+    assert "error" not in still, "shared nested blob was erased out from under B"
+
+
+async def test_purge_discloses_a_nested_blob_it_kept_as_shared(server) -> None:
+    """B2: retaining a shared blob is correct; NOT SAYING SO is the bug.
+
+    The response used to read "erased ... (verified no longer retrievable)" with
+    ``nested_deleted: 0`` while the shared blob was still fully retrievable, and
+    the agent had no field to learn otherwise. The retention must be disclosed.
+    """
+    nested = "d" * 24
+    store = server._get_local_store()
+    store.store(original="shared dropped rows", compressed="x", explicit_hash=nested)
+    store.store(original="A payload", compressed=f"A <<ccr:{nested}>>", explicit_hash=_HASH_A)
+    store.store(original="B payload", compressed=f"B <<ccr:{nested}>>", explicit_hash=_HASH_B)
+
+    envelope = _envelope(await server._handle_purge({"hash": _HASH_A}))
+    assert envelope["nested_kept_shared"] == [nested], "the kept blob must be named"
+    assert nested in envelope["note"], "the note must disclose what was kept"
+    assert "still references" in envelope["note"]
+    # The claim in the note is TRUE: the blob really is still retrievable.
+    assert store.exists(nested) is True
+
+
+async def test_purge_reports_no_kept_shared_when_nothing_was_kept(server) -> None:
+    """B2 control: the disclosure must not appear on an ordinary complete purge."""
+    nested = "d" * 24
+    store = server._get_local_store()
+    store.store(original="dropped rows", compressed="x", explicit_hash=nested)
+    store.store(original="payload", compressed=f"s <<ccr:{nested}>> t", explicit_hash=_HASH_A)
+
+    envelope = _envelope(await server._handle_purge({"hash": _HASH_A}))
+    assert envelope["nested_kept_shared"] == []
+    assert "still references" not in envelope["note"]
+
+
+async def test_purge_readback_detects_a_survivor_in_the_spill_tier(server) -> None:
+    """B3: the read-back must interrogate the tier ``retrieve`` actually reads.
+
+    ``exists`` is primary-only, but ``retrieve`` falls back to the spill tier. With
+    ``delete``'s fail-open spill delete, a raising spill backend leaves the entry
+    RETRIEVABLE while a primary-only read-back reports it gone — the tool then
+    claims "verified no longer retrievable" about live content.
+    """
+    store = server._get_local_store()
+    store.store(original="payload", compressed="summary", explicit_hash=_HASH_A)
+    spilled_copy = store._backend.get(_HASH_A)
+    assert spilled_copy is not None
+
+    class _RaisingSpill:
+        """A spill tier still holding the entry, whose delete fails (fail-open)."""
+
+        def get(self, hash_key: str):
+            return spilled_copy if hash_key == _HASH_A else None
+
+        def delete(self, hash_key: str) -> bool:
+            raise OSError("spill delete failed")
+
+    store._spill = _RaisingSpill()  # type: ignore[assignment]
+    envelope = _envelope(await server._handle_purge({"hash": _HASH_A}))
+    assert "error" in envelope, "an entry still readable via spill is not erased"
+    assert _HASH_A in envelope["error"]
+    assert "verification FAILED" in envelope["error"]
+
+
+async def test_purge_all_readback_detects_entries_that_survived_clear(server) -> None:
+    """Reviewer #13: `purge --all` claimed "Erased N entries" with no read-back.
+
+    The single-hash path verifies its erase; the wider blast radius should not be
+    the one that trusts `clear()`. `clear()` now returns the count still reachable
+    after the wipe, and a positive residual is reported as failure, not success.
+    """
+    store = server._get_local_store()
+    store.store(original="payload", compressed="summary", explicit_hash=_HASH_A)
+    store.clear = lambda: 1  # type: ignore[method-assign]  # clear leaves 1 entry behind
+
+    envelope = _envelope(await server._handle_purge({"all": True}))
+    assert "error" in envelope, "a clear() that erased nothing must not report success"
+    assert "verification FAILED" in envelope["error"]
+
+
+async def test_purge_all_readback_detects_a_survivor_in_the_spill_tier(server) -> None:
+    """F1: `purge --all`'s read-back must cover the spill tier, like single-hash does.
+
+    `get_stats()["entry_count"]` counts the PRIMARY tier only, and `clear()` used to
+    swallow a raising `spill.clear()` (Q10 fail-open). Together that let `--all`
+    report "Erased N entries" while the rows were still RETRIEVABLE through the spill
+    — the single-hash path already fail-CLOSES on exactly this condition. `clear()`
+    now returns a spill-aware residual, so the wider wipe fails just as loudly, and
+    the failure is truthful: the content really is still there.
+    """
+    store = server._get_local_store()
+    store.store(original="payload", compressed="summary", explicit_hash=_HASH_A)
+    spilled_copy = store._backend.get(_HASH_A)
+    assert spilled_copy is not None
+
+    class _RaisingClearSpill:
+        """A spill whose clear() raises but still holds — and can count — its row."""
+
+        def get(self, hash_key: str):
+            return spilled_copy if hash_key == _HASH_A else None
+
+        def clear(self) -> None:
+            raise OSError("spill clear failed")
+
+        def count(self) -> int:
+            return 1
+
+    store._spill = _RaisingClearSpill()  # type: ignore[assignment]
+
+    envelope = _envelope(await server._handle_purge({"all": True}))
+    assert "error" in envelope, "a spill row that survived clear() must not report success"
+    assert "verification FAILED" in envelope["error"]
+
+    # The alarm is not spurious: retrieve falls through to the spill and returns the
+    # payload, so the entry genuinely was NOT erased.
+    got = _envelope(await server._handle_retrieve({"hash": _HASH_A}))
+    assert "error" not in got, "the surviving spill row must still be retrievable"
+
+
+async def test_purge_all_reports_success_when_the_spill_clears_cleanly(server) -> None:
+    """F1 must not over-report: a spill that clears cleanly leaves zero residual, so
+    `--all` still succeeds. Guards against the fix turning every wipe into a failure."""
+    store = server._get_local_store()
+    store.store(original="payload", compressed="summary", explicit_hash=_HASH_A)
+
+    class _CleanSpill:
+        def get(self, hash_key: str):
+            return None
+
+        def clear(self) -> None:
+            return None
+
+        def count(self) -> int:
+            return 0
+
+    store._spill = _CleanSpill()  # type: ignore[assignment]
+
+    envelope = _envelope(await server._handle_purge({"all": True}))
+    assert envelope.get("purged") == "all", envelope
+    assert "error" not in envelope
+
+
+async def test_purge_is_cycle_safe_on_self_referencing_marker(server) -> None:
+    # A compressed view whose marker points back at its OWN hash must not recurse
+    # forever — the visited set bounds it, and the entry is still erased once.
+    store = server._get_local_store()
+    store.store(original="payload", compressed=f"self <<ccr:{_HASH_A}>>", explicit_hash=_HASH_A)
+    purged = _envelope(await server._handle_purge({"hash": _HASH_A}))
+    assert purged["deleted_count"] == 1
+    assert purged["nested_deleted"] == 0
+
+
 async def test_purge_all_empties_the_store(server) -> None:
     _seed(server, _HASH_A, "one")
     _seed(server, _HASH_B, "two")

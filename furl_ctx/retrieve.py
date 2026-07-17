@@ -136,12 +136,20 @@ def purge(hash: str, *, session_id: str | None = None, agent_id: str | None = No
     only ever touches the caller's own tenant store — an entry another tenant
     stored is neither visible nor deletable here.
 
+    CASCADES to nested ``<<ccr:HASH>>`` blobs (B3 / audit): a compressed view
+    offloads dropped rows to their own store entries, so erasing only the named
+    hash would leave those originals independently retrievable — a copy of the
+    "purged" data surviving under another hash. This follows the markers the
+    entry references and erases them too (cycle-safe), so ``retrieve`` misses on
+    the whole tree afterward.
+
     Returns:
-        ``True`` if an entry was removed, ``False`` if the hash was absent
+        ``True`` if the named entry was removed, ``False`` if the hash was absent
         (never stored, already purged, or already evicted/expired out of the
         store window). Total: never raises for a missing hash.
     """
-    return _active_ccr_store(session_id, agent_id).delete(hash)
+    top_deleted, _nested = _active_ccr_store(session_id, agent_id).delete_cascade(hash)
+    return top_deleted
 
 
 def resolve_markers(
@@ -162,6 +170,16 @@ def resolve_markers(
     so markers a namespaced compress just emitted actually expand instead of
     silently window-missing against the global store.
     """
+    # Bug-12: a public API must fail with a typed, actionable error on the wrong
+    # shape, not a bare ``AttributeError`` from ``str.get`` when a plain string is
+    # iterated char-by-char. The documented input is a list of message dicts.
+    if not isinstance(messages, list):
+        raise TypeError(
+            "resolve_markers expects a list of message dicts "
+            "(e.g. [{'role': 'tool', 'content': '...'}]), got "
+            f"{type(messages).__name__}"
+        )
+
     active = store or _active_ccr_store(session_id, agent_id)
 
     def _expand(text: str) -> str:
@@ -179,6 +197,12 @@ def resolve_markers(
 
     resolved: list[dict[str, Any]] = []
     for message in messages:
+        # A non-dict element passes through untouched (total) rather than
+        # crashing on ``.get`` — mirrors the "non-string content is passed
+        # through" contract one level up.
+        if not isinstance(message, dict):
+            resolved.append(message)
+            continue
         content = message.get("content")
         if isinstance(content, str):
             resolved.append({**message, "content": _expand(content)})

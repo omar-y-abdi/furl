@@ -150,12 +150,16 @@ def _extract_text(tool_response: Any) -> str | None:
                                           compressible AND retrievable.
       * ``{"result": <str>, ..}``      -> WebFetch (its answer lives in ``result``).
       * ``{"text": <str>, ..}``        -> generic single-text-field results.
+      * ``{"query","results":[..]}``   -> WebSearch: the ``results`` list of objects
+                                          is returned AS JSON so the engine's
+                                          structured crush compresses it (Bug-14 —
+                                          it is matched, so it must be compressible,
+                                          not silently passed through).
 
     Returns ``None`` for anything else — images, mixed non-text blocks, empty
-    output, and structured payloads with no free-text field (e.g. WebSearch's
-    ``{"query","results":[{title,url}..]}`` link list, deliberately left to pass
-    through rather than forced through a prose compressor). Totality is preserved:
-    unknown shape -> ``None`` -> caller passes the original through untouched.
+    output, and structured payloads with no free-text field AND no ``results``
+    array. Totality is preserved: unknown shape -> ``None`` -> caller passes the
+    original through untouched.
     """
     if isinstance(tool_response, str):
         return tool_response or None
@@ -185,6 +189,18 @@ def _extract_text(tool_response: Any) -> str | None:
             value = tool_response.get(key)
             if isinstance(value, str):
                 return value or None
+
+        # WebSearch (Bug-14): {"query": ..., "results": [{title, url, ...}, ...]}.
+        # The hook matches WebSearch but this shape has no free-text field, so it
+        # used to return None and pass through UNCOMPRESSED despite being matched.
+        # The results are a JSON array of objects, so hand the whole payload to the
+        # engine as JSON: the router's structured (dominant-array) crush handles it
+        # byte-exact-recoverably, not the prose compressor the old comment feared.
+        results = tool_response.get("results")
+        if isinstance(results, list) and results and all(isinstance(r, dict) for r in results):
+            import json as _json
+
+            return _json.dumps(tool_response, ensure_ascii=False)
 
         return None
 
@@ -303,25 +319,25 @@ def _passthrough(reason: str | None = None) -> NoReturn:
 
 
 def _apply_env_redaction(text: str) -> str:
-    """Scrub ``FURL_REDACT_PATTERNS`` secrets from *text* before any gate.
+    """Scrub credentials from *text* before any gate.
 
-    Applied here (not only inside ``compress()``) so a below-threshold output
-    that never reaches the compressor still has configured secrets removed from
-    what the model sees — matching the library redactor, which redacts every
-    message regardless of whether anything compresses. One env var
-    (``FURL_REDACT_PATTERNS``) governs the hook, the MCP server, and the library
-    via the shared ``furl_ctx.redaction`` builder.
+    Applies the ON-by-default built-in credential patterns AND
+    ``FURL_REDACT_PATTERNS`` here (not only inside ``compress()``) so a
+    below-threshold output that never reaches the compressor still has secrets
+    removed from what the model sees — matching the library redactor, which
+    redacts every message regardless of whether anything compresses. The shared
+    ``furl_ctx.redaction`` builder governs the hook, the MCP server, and the
+    library identically; disable the built-ins with ``FURL_REDACT_BUILTINS=0``.
 
     Fail-open and total: if ``furl_ctx`` is not importable (the same degraded
-    env where compression itself no-ops) or the redactor is off, the text is
-    returned unchanged — so with no patterns configured the hook is
-    byte-identical. Never raises."""
+    env where compression itself no-ops) or every redactor is off, the text is
+    returned unchanged. Never raises."""
     try:
-        from furl_ctx.redaction import build_env_redactor
+        from furl_ctx.redaction import build_store_redactor
     except Exception:
         return text
     try:
-        redactor = build_env_redactor()
+        redactor = build_store_redactor()
         if redactor is None:
             return text
         return redactor(text)

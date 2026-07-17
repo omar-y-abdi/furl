@@ -50,7 +50,7 @@ import time
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Final
 
 from .. import paths as _paths
 from ..relevance.bm25 import BM25Scorer
@@ -88,6 +88,53 @@ class DurableWriteError(RuntimeError):
     def __init__(self, message: str, *, hash_key: str) -> None:
         super().__init__(message)
         self.hash_key = hash_key
+
+
+# Cheap pre-check that skips the marker regex scan for the common raw original
+# that embeds no marker at all. Case-INSENSITIVE (RG5): the marker grammar's
+# ``GENERIC_BRACKET_PATTERN`` is itself ``re.IGNORECASE``, so an uppercase
+# ``HASH=`` marker IS a real reference; a case-sensitive pre-check skipped it and
+# silently left its blob behind on a cascade purge.
+_MARKER_HINTS: Final = ("ccr:", "hash=")
+
+
+def _may_reference_marker(text: str) -> bool:
+    """Whether *text* might carry a CCR marker (cheap, case-insensitive).
+
+    Uses ``casefold``, not ``lower`` (review B6): the grammar's ``re.IGNORECASE``
+    applies full Unicode case-folding, which is WIDER than ``str.lower``, so this
+    pre-check must fold at least as widely or it skips entries the grammar would
+    have matched. Measured bypass: ``ſ`` (U+017F LATIN SMALL LETTER LONG S) is
+    unchanged by ``lower`` but folds to ``s``, so a marker written
+    ``[10 rows compressed to 2. Retrieve more: haſh=<24hex>]`` matched the grammar
+    while this screen returned False, silently orphaning the nested blob.
+
+    Over-matching is safe here: a false positive only costs one grammar scan that
+    finds nothing. A false NEGATIVE is a data-safety bug, which is the asymmetry
+    this screen must be tuned for.
+    """
+    folded = text.casefold()
+    return any(hint in folded for hint in _MARKER_HINTS)
+
+
+@dataclass(frozen=True)
+class CascadeOutcome:
+    """What one :meth:`CompressionStore.delete_cascade_detailed` actually did.
+
+    ``nested_deleted`` is the DISTINCT nested hashes the cascade removed;
+    ``nested_shared_skipped`` is those it deliberately left because another live
+    entry still references them (RG3). ``deleted_hashes`` is the full set a
+    read-back should find gone (RG6) — the top hash only when it truly went.
+    """
+
+    top_deleted: bool
+    nested_deleted: tuple[str, ...] = ()
+    nested_shared_skipped: tuple[str, ...] = ()
+
+    def deleted_hashes(self, hash_key: str) -> tuple[str, ...]:
+        """Every hash this cascade decided to delete, for read-back verification."""
+        top = (hash_key,) if self.top_deleted else ()
+        return top + self.nested_deleted
 
 
 # Session-scale default (Engine P0-3): agentic sessions routinely outlive
@@ -637,6 +684,8 @@ class CompressionStore:
             compression_strategy=compression_strategy,
         )
 
+        durable = False
+        collision_dropped = False
         with self._lock:
             self._evict_if_needed()
 
@@ -668,21 +717,42 @@ class CompressionStore:
                         len(original),
                     )
                     # Drop the stored entry so retrieve() loud-misses instead of
-                    # serving foreign bytes; its heap tuple is now stale.
+                    # serving foreign bytes; its heap tuple is now stale. The
+                    # binding reached NEITHER a durable nor a volatile tier, so a
+                    # require_durable caller must veto below (Bug-6) rather than
+                    # receive the hash as if the content were stored.
                     self._backend.delete(hash_key)
                     self._stale_heap_entries += 1
-                    return hash_key
-                # Same content being stored again - this is fine, just update
-                logger.debug(
-                    "Duplicate store for hash=%s, updating entry",
-                    hash_key,
-                )
-                # Mark old heap entry as stale since we're replacing
-                self._stale_heap_entries += 1
+                    collision_dropped = True
+                else:
+                    # Same content being stored again - this is fine, just update
+                    logger.debug(
+                        "Duplicate store for hash=%s, updating entry",
+                        hash_key,
+                    )
+                    # Mark old heap entry as stale since we're replacing
+                    self._stale_heap_entries += 1
 
-            durable = self._persist_and_report_durability(hash_key, entry)
-            # Add to eviction heap for O(log n) eviction
-            heapq.heappush(self._eviction_heap, (entry.created_at, hash_key))
+            if not collision_dropped:
+                durable = self._persist_and_report_durability(hash_key, entry)
+                # Add to eviction heap for O(log n) eviction
+                heapq.heappush(self._eviction_heap, (entry.created_at, hash_key))
+
+        # Collision-drop veto (Bug-6): the ambiguous binding was dropped, so
+        # NOTHING is retrievable under this key. A require_durable caller reverts
+        # to the original (the veto contract) exactly as for a failed durable
+        # write; a non-durable caller keeps today's behavior (the returned hash
+        # loud-misses, never serves foreign content).
+        if collision_dropped:
+            if require_durable:
+                raise DurableWriteError(
+                    f"CCR store for hash {hash_key} hit a true hash collision "
+                    "(different content, same key); the ambiguous binding was dropped "
+                    "so NEITHER content is served. The original was NOT stored — revert "
+                    "to the uncompressed content.",
+                    hash_key=hash_key,
+                )
+            return hash_key
 
         # Contention retry BEFORE the veto (store-concurrency-honesty). A durable
         # write that reported non-durable most often lost a brief cross-process
@@ -1396,6 +1466,50 @@ class CompressionStore:
                 return False
             return True
 
+    def exists_any_tier(self, hash_key: str) -> bool:
+        """Whether *hash_key* is still retrievable from ANY tier. Never raises.
+
+        :meth:`exists` is primary-tier only, but :meth:`retrieve` falls through to
+        the durable spill tier on a primary miss (Q10). Verifying an erase with
+        ``exists`` therefore interrogates a tier ``retrieve`` can bypass: with
+        ``delete``'s fail-open spill delete, a purge can leave an entry
+        RETRIEVABLE while ``exists`` reports it gone (review B3). This is the
+        predicate a read-back must use — it asks the same question ``retrieve``
+        answers: can a caller still get this content back?
+
+        ``exists``'s primary-only semantics are deliberately left alone; other
+        callers (capacity/liveness checks) depend on them.
+
+        Mirrors ``_recover_from_spill``'s semantics exactly, because agreeing with
+        ``retrieve`` is the entire point: TTL is honored in BOTH tiers (an expired
+        row is not retrievable, so it is not a survivor), and a spill hit is NOT
+        promoted back into the primary — a read-back must observe, never mutate.
+        Unlike ``_recover_from_spill`` it also does not reap the expired spill row,
+        keeping this a pure check like ``exists(clean_expired=False)``.
+
+        Acquires ``self._lock`` and is NOT re-entrant (review F5): never call it
+        while already holding the lock -- take the read-back after the locked
+        mutation returns, as the purge paths do.
+        """
+        with self._lock:
+            now = self._now()
+            # Mirror exists(): an expired primary entry is not retrievable. A
+            # miss (or an expired hit) still has to check the spill below.
+            entry = self._backend.get(hash_key)
+            if entry is not None and not entry.is_expired(now):
+                return True
+            if self._spill is None:
+                return False
+            try:
+                spilled = self._spill.get(hash_key)
+            except Exception as exc:  # noqa: BLE001 — a spill that cannot be read
+                # cannot prove the entry is GONE. Treat an unreadable spill as
+                # "still there": a false survivor is a loud, retryable purge
+                # error; a false all-clear is the silent data-safety bug.
+                logger.warning("CCR spill existence check failed (assuming present): %s", exc)
+                return True
+            return spilled is not None and not spilled.is_expired(now)
+
     def get_entry_status(
         self,
         hash_key: str,
@@ -1538,21 +1652,186 @@ class CompressionStore:
                     logger.warning("CCR spill delete failed (non-fatal): %s", exc)
             return primary_deleted or spill_deleted
 
-    def clear(self) -> None:
-        """Clear all entries. Mainly for testing."""
+    def _entry_marker_hashes(self, entry: CompressionEntry, *, exclude: str) -> list[str]:
+        """Marker hashes referenced by *entry*, minus *exclude*, first-seen order."""
+        from furl_ctx.ccr.marker_grammar import hashes_in_text
+
+        seen: dict[str, None] = {}
+        for text in (entry.compressed_content, entry.original_content):
+            if isinstance(text, str) and _may_reference_marker(text):
+                for nested_hash in hashes_in_text(text):
+                    seen.setdefault(nested_hash, None)
+        return [h for h in seen if h != exclude]
+
+    def _is_co_referenced(self, nested_hash: str, *, ignoring: set[str]) -> bool:
+        """Whether a LIVE entry outside *ignoring* still references *nested_hash*.
+
+        The store is content-addressed and deduped, so two compressions that drop
+        identical content share ONE nested entry. Deleting it because one parent
+        was purged would leave the OTHER parent's ``<<ccr:HASH>>`` marker pointing
+        at nothing — a loud miss for content the user never asked to purge (RG3).
+        *ignoring* carries this cascade's own hashes so an entry being torn down
+        does not count as a live referent.
+
+        Cost: one pass over live entries per nested candidate. Purge is a rare,
+        explicit operation and correctness outranks speed here; the cheap
+        marker pre-check skips the common marker-free original outright.
+        """
+        with self._lock:
+            items = list(self._backend.items())
+        for key, entry in items:
+            if key == nested_hash or key in ignoring:
+                continue
+            for text in (entry.compressed_content, entry.original_content):
+                if not isinstance(text, str) or not _may_reference_marker(text):
+                    continue
+                from furl_ctx.ccr.marker_grammar import hashes_in_text
+
+                if nested_hash in hashes_in_text(text):
+                    return True
+        return False
+
+    def delete_cascade(self, hash_key: str) -> tuple[bool, int]:
+        """Delete *hash_key* AND every nested blob only it referenced.
+
+        Back-compat wrapper over :meth:`delete_cascade_detailed`; returns
+        ``(top_deleted, nested_deleted_count)``.
+        """
+        outcome = self.delete_cascade_detailed(hash_key)
+        return (outcome.top_deleted, len(outcome.nested_deleted))
+
+    def delete_cascade_detailed(
+        self, hash_key: str, *, _visited: set[str] | None = None
+    ) -> CascadeOutcome:
+        """Delete *hash_key* AND every nested ``<<ccr:HASH>>`` blob it alone owns.
+
+        A compressed view offloads dropped rows to their OWN store entries under
+        markers embedded in the entry's ``compressed_content`` (and, for a
+        multi-level crush, in those blobs in turn). A plain :meth:`delete` removes
+        only the named entry, leaving those nested originals independently
+        retrievable — so a caller who purged sensitive data believes it gone while
+        a copy survives under another hash (the audit's non-cascading-purge
+        finding, B3). This reads the entry's stored text FIRST, collects the
+        markers it references (in the compressed view AND the original), deletes
+        the entry, then recurses into each nested hash. The ``_visited`` set makes
+        it cycle-safe and idempotent — a marker pointing back at an ancestor, or a
+        blob shared by two parents, is followed at most once.
+
+        SHARED-BLOB RULE (RG3): the NAMED top hash always deletes, but a NESTED
+        hash is skipped when another LIVE entry still references it. Dedup means
+        two compressions of identical dropped content share one nested entry;
+        cascading through it would silently break the other parent's retrieval.
+        A skipped hash is reported in ``nested_shared_skipped``, never counted as
+        deleted, and is NOT added to ``_visited`` — a later parent in the same
+        cascade may legitimately own it once its own referents are gone.
+
+        ``nested_deleted`` and ``nested_shared_skipped`` are DISJOINT: a diamond
+        can skip a hash under one branch and delete it under a later one, and the
+        deletion is the truth (see the dedupe at the end of this method).
+
+        Known, deliberately deferred (tracked, not dropped):
+
+        * #11 — two entries whose markers reference EACH OTHER protect one another
+          forever, so neither is cascade-deleted while both are live. Reaching it
+          needs a contrived mutual reference (content-derived hashes make a natural
+          cycle near-impossible), and each is still individually purgeable by name.
+        """
+        visited = _visited if _visited is not None else set()
+        if hash_key in visited:
+            return CascadeOutcome(top_deleted=False)
+        visited.add(hash_key)
+
+        # Read the entry's stored text BEFORE deleting so nested markers are
+        # recoverable.
+        with self._lock:
+            entry = self._backend.get(hash_key)
+        nested = [] if entry is None else self._entry_marker_hashes(entry, exclude=hash_key)
+
+        top_deleted = self.delete(hash_key)
+        deleted: list[str] = []
+        skipped: list[str] = []
+        for nested_hash in nested:
+            if nested_hash in visited:
+                continue
+            if self._is_co_referenced(nested_hash, ignoring=visited):
+                skipped.append(nested_hash)
+                continue
+            child = self.delete_cascade_detailed(nested_hash, _visited=visited)
+            if child.top_deleted:
+                deleted.append(nested_hash)
+            deleted.extend(child.nested_deleted)
+            skipped.extend(child.nested_shared_skipped)
+        # A hash can be skipped by one branch and then legitimately deleted by a
+        # later one (a skip deliberately does not enter ``visited``, so a diamond
+        # T->[A,B] with A->[C] and B->[C] skips C under A, then deletes it under
+        # B once A is gone). DELETED WINS: the erase is what actually happened,
+        # and reporting C as "kept because another entry references it" would be
+        # a false claim about live data -- the exact class of bug the read-back
+        # and the kept-shared disclosure exist to prevent.
+        deleted_set = set(deleted)
+        return CascadeOutcome(
+            top_deleted=top_deleted,
+            nested_deleted=tuple(deleted),
+            nested_shared_skipped=tuple(h for h in skipped if h not in deleted_set),
+        )
+
+    def clear(self) -> int:
+        """Clear all entries; return the count STILL reachable after the wipe.
+
+        Mainly for testing, but also the wipe primitive behind ``furl_purge
+        all=true``. Returns how many entries remain reachable via
+        :meth:`retrieve` once the wipe has run (0 on a clean wipe), so the purge
+        path can VERIFY the erase instead of claiming success blindly (review
+        F1). The single-hash path already read-backs each deletion with
+        :meth:`exists_any_tier`; ``--all`` was the one erase that trusted a
+        primary-only count and could report "erased" while spill rows stayed
+        retrievable.
+
+        The primary reset ALWAYS proceeds -- every caller that ignores the
+        return value still gets a working reset. The honesty was lost in the
+        spill clear: it used to swallow its own failure silently (Q10 fail-open),
+        leaving rows RETRIEVABLE through the spill tier while ``get_stats``
+        (primary-only) reported an empty store. An un-cleared spill is now
+        surfaced as residual, fail-CLOSED like :meth:`exists_any_tier`: a spill
+        that cannot be cleared -- or cannot even be counted -- is reported as
+        ``>= 1`` survivor, a loud retryable purge error, never a false all-clear.
+        """
         with self._lock:
             self._backend.clear()
-            # Q10 spill tier: clear the durable spill too, so ``clear`` empties
-            # every place an entry can live. Fail-open — a spill clear error
-            # must not break the primary reset.
-            if self._spill is not None:
-                try:
-                    self._spill.clear()
-                except Exception as exc:  # noqa: BLE001 — fail-open, logged below
-                    logger.warning("CCR spill clear failed (non-fatal): %s", exc)
+            spill_residual = self._clear_spill_residual()
             self._retrieval_events.clear()
             self._eviction_heap.clear()  # Clear heap too
             self._stale_heap_entries = 0  # CRITICAL FIX: Reset stale counter
+            return self._backend.count() + spill_residual
+
+    def _clear_spill_residual(self) -> int:
+        """Clear the durable spill; return how many rows survived the attempt.
+
+        Called with ``self._lock`` held. Returns 0 when the spill is disabled or
+        cleanly emptied. A spill whose ``clear`` raises still holds its rows
+        (reachable via :meth:`retrieve`), so they are COUNTED and surfaced rather
+        than swallowed -- that swallow was the ``furl_purge all=true`` false-erase
+        bug (review F1: ``get_stats`` counts the primary tier only, so a spill
+        survivor was invisible and the purge claimed success).
+
+        Fail-CLOSED, matching :meth:`exists_any_tier`: if the survivors cannot
+        even be counted, return 1 -- an un-provably-empty spill is a survivor,
+        not an all-clear. ``count`` is a Protocol method the sqlite/in-memory
+        backends never raise from; the guard covers a hostile or degraded spill.
+        """
+        if self._spill is None:
+            return 0
+        try:
+            self._spill.clear()
+        except Exception as exc:  # noqa: BLE001 — surfaced as residual, not raised
+            logger.warning("CCR spill clear failed (entries may remain): %s", exc)
+        else:
+            return 0
+        try:
+            return self._spill.count()
+        except Exception as exc:  # noqa: BLE001 — cannot prove the spill empty
+            logger.warning("CCR spill count after failed clear failed: %s", exc)
+            return 1
 
     def close(self) -> None:
         """Release backend resources (sqlite connections / file descriptors).
