@@ -117,12 +117,16 @@ def test_real_webfetch_result_is_extracted() -> None:
     assert _hook._extract_text(_REAL_WEBFETCH) == 'The page title is "Example Domain".'
 
 
-def test_bash_stderr_appended_when_nonempty() -> None:
-    """RED on old code. stderr must stay compressible+retrievable, clearly separated."""
+def test_bash_prefers_stdout_and_never_merges_stderr() -> None:
+    """Fold-fix (shape-fix): exactly ONE field is extracted. With a non-empty
+    stdout the compressed text must map back onto ``stdout`` ALONE — folding a
+    ``[stderr]`` tail in destroys the engine's structured-array detection (a JSON
+    stdout drops from ~98% to 0%) and has no single home in the mirrored object.
+    stderr rides through verbatim in its own field via ``_reinject``, never merged
+    into stdout."""
     out = _hook._extract_text({"stdout": "ok-line", "stderr": "boom-error", "interrupted": False})
-    assert out is not None
-    assert "ok-line" in out and "boom-error" in out
-    assert out.index("ok-line") < out.index("boom-error")  # stdout precedes stderr
+    assert out == "ok-line"
+    assert "boom-error" not in out
 
 
 def test_bash_stderr_only_when_stdout_empty() -> None:
@@ -147,17 +151,18 @@ def test_real_agent_content_blocks_extracted() -> None:
     assert _hook._extract_text(_REAL_AGENT) == "PINEAPPLE"
 
 
-def test_real_websearch_results_extracted_as_json_bug14() -> None:
-    """WebSearch is matched by the hook, so it must be compressible (Bug-14).
-
-    It has no free-text field, but its ``results`` are a JSON array of objects,
-    so the extractor returns the payload AS JSON for the engine's structured
-    (byte-exact-recoverable) crush rather than passing it through uncompressed.
-    """
-    out = _hook._extract_text(_REAL_WEBSEARCH)
-    assert out is not None
-    parsed = json.loads(out)
-    assert parsed == _REAL_WEBSEARCH  # lossless: the whole payload is handed to the engine
+def test_real_websearch_passes_through_unmatched() -> None:
+    """WebSearch ({"query","results":[...]}) has no single free-text field — the
+    whole object is the payload. An earlier revision extracted it as
+    ``json.dumps(tool_response)`` (its "Bug-14"), but that text could only be
+    emitted as a bare string, which Claude Code >= 2.1.163 validates against
+    WebSearch's output schema and DROPS on mismatch (#68951) — so no model ever saw
+    a compressed WebSearch result on this path. The shape-fix mirrors ONE field of
+    the incoming object (``_reinject``); whole-object JSON has no single field to
+    map the compressed text back onto, so this shape now passes through UNMATCHED
+    (extract -> None -> passthrough) rather than emit a value the host rejects. A
+    schema-valid WebSearch mirror is tracked as future work."""
+    assert _hook._extract_text(_REAL_WEBSEARCH) is None
 
 
 def test_dict_without_results_or_text_is_still_none() -> None:
