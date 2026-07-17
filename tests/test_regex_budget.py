@@ -357,6 +357,46 @@ def test_normal_patterns_still_accepted_without_re2(without_re2: None, pattern: 
 
 
 # ---------------------------------------------------------------------------
+# F2 -- a large bounded repetition is refused, with an HONEST diagnosis
+# ---------------------------------------------------------------------------
+
+
+LARGE_BOUNDED_REPS = ["a{0,2000}", "[0-9]{0,1200}", "a{0,1001}"]
+
+
+@pytest.mark.skipif(not re2_available(), reason="RE2 sets the repetition ceiling it enforces")
+@pytest.mark.parametrize("pattern", LARGE_BOUNDED_REPS)
+def test_large_bounded_repetition_is_unboundable(pattern: str) -> None:
+    """F2: RE2 refuses ``{m,n}`` with n>1000, so classify calls it UNBOUNDABLE. A
+    deliberate over-approximation (a lone ``a{0,2000}`` is linear under ``re``), kept
+    because proving it linear is exactly RE2's job and ``(a*){0,2000}`` is not."""
+    assert regex_budget.classify_boundability(pattern) is regex_budget.Boundability.UNBOUNDABLE
+
+
+@pytest.mark.skipif(not re2_available(), reason="ingress cannot pre-judge without RE2")
+@pytest.mark.parametrize("pattern", LARGE_BOUNDED_REPS)
+def test_large_bounded_repetition_reject_names_the_real_cause(pattern: str) -> None:
+    """F2: the reject message must not blame "lookaround/backreferences" for a pattern
+    whose only sin is a big bounded repetition -- the earlier wording was a factually
+    wrong diagnosis. It now names the repetition and the 1000 ceiling on BOTH paths."""
+    error = _reject_pathological_pattern(pattern)
+    assert error is not None
+    assert "repetition" in error.reason and "1000" in error.reason, error.reason
+    compress_error = _validate_pattern(pattern, "include")
+    assert compress_error is not None
+    assert "repetition" in compress_error and "1000" in compress_error, compress_error
+
+
+@pytest.mark.skipif(not re2_available(), reason="the 1000 ceiling is RE2's")
+def test_bounded_repetition_at_the_ceiling_is_still_accepted() -> None:
+    """F2: the threshold is exactly 1000 -- ``a{0,1000}`` is fine, so the fix must not
+    over-correct into rejecting benign reps at or below the limit."""
+    assert regex_budget.classify_boundability("a{0,1000}") is regex_budget.Boundability.BOUNDABLE
+    assert _reject_pathological_pattern("a{0,1000}") is None
+    assert _validate_pattern("a{0,1000}", "include") is None
+
+
+# ---------------------------------------------------------------------------
 # B5 -- RE2 must not silently drop a caller's regex flags
 # ---------------------------------------------------------------------------
 
@@ -392,6 +432,46 @@ def test_inline_flags_stay_on_the_re2_path() -> None:
     start = time.monotonic()
     assert matches_within_budget(re.compile("(?i)(a|b|ab)+Z"), "ab" * 2600) is False
     assert time.monotonic() - start < _CEILING_SECONDS
+
+
+# ---------------------------------------------------------------------------
+# F3 -- the agent filter call sites must compile FLAGLESS, so a future
+#       constructor flag cannot silently reopen the unbudgeted residual
+# ---------------------------------------------------------------------------
+
+
+def test_retrieve_filter_compiles_the_pattern_flagless() -> None:
+    """F3: ``RetrieveFilters.parse`` compiles the agent pattern with NO constructor
+    flags. If a future edit added e.g. ``re.IGNORECASE`` there, ``_re2_sees_same_flags``
+    would skip RE2 at match time and a BOUNDABLE pattern would run UNBUDGETED on the
+    worker thread -- B1 again. Pin the invariant the residual safety rests on: the
+    compiled flags must equal a flagless recompile of the same source."""
+    source = "Error[0-9]+"
+    parsed = RetrieveFilters.parse({"pattern": source})
+    assert isinstance(parsed, RetrieveFilters)
+    assert parsed.pattern is not None
+    assert parsed.pattern.flags == re.compile(source).flags
+
+
+def test_compress_filter_compiles_the_pattern_flagless() -> None:
+    """F3: ``_resolve_matcher`` (the furl_compress include/exclude path) compiles
+    flagless too. The compiled object is captured in a closure, so spy on ``re.compile``
+    and assert every call the matcher made passed no flags argument."""
+    from unittest import mock
+
+    real_compile = re.compile
+    calls: list[tuple[object, int]] = []
+
+    def _spy(pattern, flags=0):
+        calls.append((pattern, flags))
+        return real_compile(pattern, flags)
+
+    with mock.patch.object(re, "compile", _spy):
+        _resolve_matcher("Error[0-9]+")
+    assert calls, "the matcher must have compiled the pattern"
+    assert all(flags == 0 for _pattern, flags in calls), (
+        f"a filter call site added constructor flags, which reopens the residual: {calls}"
+    )
 
 
 # ---------------------------------------------------------------------------

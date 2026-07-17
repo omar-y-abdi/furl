@@ -274,16 +274,78 @@ async def test_purge_all_readback_detects_entries_that_survived_clear(server) ->
     """Reviewer #13: `purge --all` claimed "Erased N entries" with no read-back.
 
     The single-hash path verifies its erase; the wider blast radius should not be
-    the one that trusts `clear()`. A clear that silently leaves entries behind now
-    reports failure instead of success.
+    the one that trusts `clear()`. `clear()` now returns the count still reachable
+    after the wipe, and a positive residual is reported as failure, not success.
     """
     store = server._get_local_store()
     store.store(original="payload", compressed="summary", explicit_hash=_HASH_A)
-    store.clear = lambda: None  # type: ignore[method-assign]  # a clear that does nothing
+    store.clear = lambda: 1  # type: ignore[method-assign]  # clear leaves 1 entry behind
 
     envelope = _envelope(await server._handle_purge({"all": True}))
     assert "error" in envelope, "a clear() that erased nothing must not report success"
     assert "verification FAILED" in envelope["error"]
+
+
+async def test_purge_all_readback_detects_a_survivor_in_the_spill_tier(server) -> None:
+    """F1: `purge --all`'s read-back must cover the spill tier, like single-hash does.
+
+    `get_stats()["entry_count"]` counts the PRIMARY tier only, and `clear()` used to
+    swallow a raising `spill.clear()` (Q10 fail-open). Together that let `--all`
+    report "Erased N entries" while the rows were still RETRIEVABLE through the spill
+    — the single-hash path already fail-CLOSES on exactly this condition. `clear()`
+    now returns a spill-aware residual, so the wider wipe fails just as loudly, and
+    the failure is truthful: the content really is still there.
+    """
+    store = server._get_local_store()
+    store.store(original="payload", compressed="summary", explicit_hash=_HASH_A)
+    spilled_copy = store._backend.get(_HASH_A)
+    assert spilled_copy is not None
+
+    class _RaisingClearSpill:
+        """A spill whose clear() raises but still holds — and can count — its row."""
+
+        def get(self, hash_key: str):
+            return spilled_copy if hash_key == _HASH_A else None
+
+        def clear(self) -> None:
+            raise OSError("spill clear failed")
+
+        def count(self) -> int:
+            return 1
+
+    store._spill = _RaisingClearSpill()  # type: ignore[assignment]
+
+    envelope = _envelope(await server._handle_purge({"all": True}))
+    assert "error" in envelope, "a spill row that survived clear() must not report success"
+    assert "verification FAILED" in envelope["error"]
+
+    # The alarm is not spurious: retrieve falls through to the spill and returns the
+    # payload, so the entry genuinely was NOT erased.
+    got = _envelope(await server._handle_retrieve({"hash": _HASH_A}))
+    assert "error" not in got, "the surviving spill row must still be retrievable"
+
+
+async def test_purge_all_reports_success_when_the_spill_clears_cleanly(server) -> None:
+    """F1 must not over-report: a spill that clears cleanly leaves zero residual, so
+    `--all` still succeeds. Guards against the fix turning every wipe into a failure."""
+    store = server._get_local_store()
+    store.store(original="payload", compressed="summary", explicit_hash=_HASH_A)
+
+    class _CleanSpill:
+        def get(self, hash_key: str):
+            return None
+
+        def clear(self) -> None:
+            return None
+
+        def count(self) -> int:
+            return 0
+
+    store._spill = _CleanSpill()  # type: ignore[assignment]
+
+    envelope = _envelope(await server._handle_purge({"all": True}))
+    assert envelope.get("purged") == "all", envelope
+    assert "error" not in envelope
 
 
 async def test_purge_is_cycle_safe_on_self_referencing_marker(server) -> None:

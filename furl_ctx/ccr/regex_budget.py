@@ -188,9 +188,15 @@ class Boundability(Enum):
     """RE2 compiles it: the match is linear-time on any thread."""
 
     UNBOUNDABLE = "unboundable"
-    """A valid Python regex that RE2 refuses (lookaround/backreferences).
+    """A valid Python regex RE2 refuses: lookaround, a backreference, or a
+    bounded repetition larger than RE2 allows (``{m,n}`` with ``n`` above 1000).
 
-    Off the main thread nothing can bound it -- the B1 process-wide freeze.
+    Off the main thread nothing can bound it -- the B1 process-wide freeze. The
+    repetition case is an over-approximation (a lone ``a{0,2000}`` is linear
+    under ``re``), but RE2's refusal is the only CHEAP proof of time-boundedness
+    on hand, and separating a benign ``a{0,2000}`` from a catastrophic
+    ``(a*){0,2000}`` needs exactly the analysis RE2 does -- so the whole class is
+    rejected rather than guessed at, and the reject message names the cause.
     """
 
     UNKNOWN = "unknown"

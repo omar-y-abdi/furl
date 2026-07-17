@@ -1486,6 +1486,10 @@ class CompressionStore:
         promoted back into the primary — a read-back must observe, never mutate.
         Unlike ``_recover_from_spill`` it also does not reap the expired spill row,
         keeping this a pure check like ``exists(clean_expired=False)``.
+
+        Acquires ``self._lock`` and is NOT re-entrant (review F5): never call it
+        while already holding the lock -- take the read-back after the locked
+        mutation returns, as the purge paths do.
         """
         with self._lock:
             now = self._now()
@@ -1771,21 +1775,63 @@ class CompressionStore:
             nested_shared_skipped=tuple(h for h in skipped if h not in deleted_set),
         )
 
-    def clear(self) -> None:
-        """Clear all entries. Mainly for testing."""
+    def clear(self) -> int:
+        """Clear all entries; return the count STILL reachable after the wipe.
+
+        Mainly for testing, but also the wipe primitive behind ``furl_purge
+        all=true``. Returns how many entries remain reachable via
+        :meth:`retrieve` once the wipe has run (0 on a clean wipe), so the purge
+        path can VERIFY the erase instead of claiming success blindly (review
+        F1). The single-hash path already read-backs each deletion with
+        :meth:`exists_any_tier`; ``--all`` was the one erase that trusted a
+        primary-only count and could report "erased" while spill rows stayed
+        retrievable.
+
+        The primary reset ALWAYS proceeds -- every caller that ignores the
+        return value still gets a working reset. The honesty was lost in the
+        spill clear: it used to swallow its own failure silently (Q10 fail-open),
+        leaving rows RETRIEVABLE through the spill tier while ``get_stats``
+        (primary-only) reported an empty store. An un-cleared spill is now
+        surfaced as residual, fail-CLOSED like :meth:`exists_any_tier`: a spill
+        that cannot be cleared -- or cannot even be counted -- is reported as
+        ``>= 1`` survivor, a loud retryable purge error, never a false all-clear.
+        """
         with self._lock:
             self._backend.clear()
-            # Q10 spill tier: clear the durable spill too, so ``clear`` empties
-            # every place an entry can live. Fail-open — a spill clear error
-            # must not break the primary reset.
-            if self._spill is not None:
-                try:
-                    self._spill.clear()
-                except Exception as exc:  # noqa: BLE001 — fail-open, logged below
-                    logger.warning("CCR spill clear failed (non-fatal): %s", exc)
+            spill_residual = self._clear_spill_residual()
             self._retrieval_events.clear()
             self._eviction_heap.clear()  # Clear heap too
             self._stale_heap_entries = 0  # CRITICAL FIX: Reset stale counter
+            return self._backend.count() + spill_residual
+
+    def _clear_spill_residual(self) -> int:
+        """Clear the durable spill; return how many rows survived the attempt.
+
+        Called with ``self._lock`` held. Returns 0 when the spill is disabled or
+        cleanly emptied. A spill whose ``clear`` raises still holds its rows
+        (reachable via :meth:`retrieve`), so they are COUNTED and surfaced rather
+        than swallowed -- that swallow was the ``furl_purge all=true`` false-erase
+        bug (review F1: ``get_stats`` counts the primary tier only, so a spill
+        survivor was invisible and the purge claimed success).
+
+        Fail-CLOSED, matching :meth:`exists_any_tier`: if the survivors cannot
+        even be counted, return 1 -- an un-provably-empty spill is a survivor,
+        not an all-clear. ``count`` is a Protocol method the sqlite/in-memory
+        backends never raise from; the guard covers a hostile or degraded spill.
+        """
+        if self._spill is None:
+            return 0
+        try:
+            self._spill.clear()
+        except Exception as exc:  # noqa: BLE001 — surfaced as residual, not raised
+            logger.warning("CCR spill clear failed (entries may remain): %s", exc)
+        else:
+            return 0
+        try:
+            return self._spill.count()
+        except Exception as exc:  # noqa: BLE001 — cannot prove the spill empty
+            logger.warning("CCR spill count after failed clear failed: %s", exc)
+            return 1
 
     def close(self) -> None:
         """Release backend resources (sqlite connections / file descriptors).

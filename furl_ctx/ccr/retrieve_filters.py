@@ -227,11 +227,12 @@ def _reject_pathological_pattern(pattern: str) -> FilterError | None:
     The actual bound is the per-match budget applied in ``_line_matches``.
 
     The FOURTH screen is the bound for the one case the budget cannot cover (B1):
-    a pattern RE2 refuses (lookaround/backreferences) cannot be time-bounded on a
-    worker thread, where the MCP server runs this match, and a wedged match there
-    freezes the whole event loop for every session on the process. Such a pattern
-    is rejected here rather than accepted and run unbounded. When RE2 is absent
-    boundability is not knowable, so nothing is rejected on that basis; see
+    a pattern RE2 refuses (lookaround, a backreference, or a bounded repetition
+    above 1000) cannot be time-bounded on a worker thread, where the MCP server
+    runs this match, and a wedged match there freezes the whole event loop for
+    every session on the process. Such a pattern is rejected here rather than
+    accepted and run unbounded. When RE2 is absent boundability is not knowable,
+    so nothing is rejected on that basis; see
     :func:`furl_ctx.ccr.regex_budget.classify_boundability`.
     """
     if len(pattern) > _MAX_PATTERN_CHARS:
@@ -241,8 +242,10 @@ def _reject_pathological_pattern(pattern: str) -> FilterError | None:
         )
     if classify_boundability(pattern) is Boundability.UNBOUNDABLE:
         return FilterError(
-            "pattern rejected: lookaround/backreferences cannot be time-bounded "
-            "off the main thread; anchor or rewrite the pattern without lookaround"
+            "pattern rejected: lookaround, a backreference, or a bounded "
+            "repetition larger than RE2 allows (max 1000, e.g. a{0,2000}) cannot "
+            "be time-bounded off the main thread; remove the "
+            "lookaround/backreference or lower the repetition to 1000 or less"
         )
     if _NESTED_QUANTIFIER_RE.search(pattern):
         return FilterError(

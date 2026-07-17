@@ -2317,15 +2317,20 @@ class FurlMCPServer:
         """Wipe every entry; return ``(removed, still_present)`` (off-loop).
 
         Reads the live ``entry_count`` before ``clear()`` so the reported count
-        reflects what was actually erasable (get_stats prunes expired rows first),
-        then reads it back AFTER (reviewer #13): the single-hash path verifies its
-        erase, and claiming "erased N entries" without checking is the same
-        unverified claim on a wider blast radius. ``still_present`` is 0 on success.
+        reflects what was actually erasable (get_stats prunes expired rows first).
+        ``clear()`` itself returns the read-back (reviewer #13, review F1): the
+        single-hash path verifies its erase with ``exists_any_tier``, and claiming
+        "erased N entries" without checking is the same unverified claim on a
+        wider blast radius. Crucially ``clear`` now counts EVERY tier, so a spill
+        whose own clear failed -- leaving rows retrievable while ``get_stats``
+        (primary-only) shows an empty store -- comes back as ``still_present > 0``
+        and the handler fails the purge loudly instead of reporting a false
+        all-clear. ``still_present`` is 0 on success.
         """
         store = self._get_local_store()
         count = int(store.get_stats().get("entry_count", 0))
-        store.clear()
-        return count, int(store.get_stats().get("entry_count", 0))
+        still_present = store.clear()
+        return count, still_present
 
     async def _handle_search(self, arguments: dict[str, Any]) -> list[TextContent]:
         """Handle furl_search — case-insensitive SUBSTRING search over originals.

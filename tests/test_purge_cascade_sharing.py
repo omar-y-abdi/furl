@@ -253,3 +253,61 @@ def test_unicode_folded_marker_also_counts_as_sharing() -> None:
     outcome = store.delete_cascade_detailed(PARENT_A)
     assert outcome.nested_shared_skipped == (NESTED_HASH,)
     assert store.exists(NESTED_HASH) is True
+
+
+def test_clear_reports_zero_residual_on_a_clean_wipe() -> None:
+    """F1: ``clear`` returns the count still reachable after the wipe. A store with no
+    spill (or a cleanly-cleared one) empties completely, so the residual is 0 and the
+    purge path can honestly report success."""
+    store = CompressionStore()
+    store.store("A original", "A view", explicit_hash=PARENT_A)
+    store.store("B original", "B view", explicit_hash=PARENT_B)
+    assert store.clear() == 0
+    assert store.exists_any_tier(PARENT_A) is False
+
+
+def test_clear_surfaces_a_spill_that_would_not_clear() -> None:
+    """F1: a spill whose ``clear`` raises still holds its rows (retrievable through the
+    spill tier). ``clear`` must COUNT them as residual instead of swallowing the error
+    — that swallow was the ``furl_purge all=true`` false-erase bug (``get_stats`` is
+    primary-only, so a spill survivor was invisible)."""
+    store = CompressionStore()
+    store.store("payload", "view", explicit_hash=PARENT_A)
+    live_copy = store._backend.get(PARENT_A)
+    assert live_copy is not None
+
+    class _RaisingClearSpill:
+        def get(self, hash_key: str):
+            return live_copy if hash_key == PARENT_A else None
+
+        def clear(self) -> None:
+            raise OSError("spill clear failed")
+
+        def count(self) -> int:
+            return 1
+
+    store._spill = _RaisingClearSpill()  # type: ignore[assignment]
+    assert store.clear() == 1, "a spill that would not clear is a survivor, not an all-clear"
+    # Truthful: the row really is still reachable via the spill tier.
+    assert store.retrieve(PARENT_A) is not None
+
+
+def test_clear_fails_closed_when_the_spill_cannot_even_be_counted() -> None:
+    """F1: if a broken spill raises from BOTH ``clear`` and ``count``, ``clear`` cannot
+    prove the spill empty, so it reports >=1 residual -- a loud retryable purge error,
+    never a false all-clear (mirrors ``exists_any_tier``'s unreadable-spill stance)."""
+    store = CompressionStore()
+    store.store("payload", "view", explicit_hash=PARENT_A)
+
+    class _BrokenSpill:
+        def get(self, hash_key: str):
+            return None
+
+        def clear(self) -> None:
+            raise OSError("spill clear failed")
+
+        def count(self) -> int:
+            raise OSError("spill count failed")
+
+    store._spill = _BrokenSpill()  # type: ignore[assignment]
+    assert store.clear() == 1, "an un-countable spill must fail closed"
