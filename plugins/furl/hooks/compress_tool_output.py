@@ -6,7 +6,12 @@ Contract (Claude Code PostToolUse hook):
              ``session_id``, ``hook_event_name``.
   - stdout : to REPLACE the output the model sees, emit
              ``{"hookSpecificOutput": {"hookEventName": "PostToolUse",
-                "updatedToolOutput": "<compressed text>"}}`` and exit 0.
+                "updatedToolOutput": <tool_response mirrored, text field compressed>}}``
+             and exit 0. The value MIRRORS the incoming ``tool_response`` shape
+             (see ``_reinject``): Claude Code >= 2.1.163 validates it against the
+             tool's output schema and silently drops a mismatched value, so a bare
+             string never replaced a Bash ``{stdout, ...}`` object
+             (anthropics/claude-code#68951).
   - stdout empty + exit 0 : original tool output passes through unchanged.
 
 Design invariant — FAIL OPEN. Any error (bad stdin, missing furl_ctx, compression
@@ -144,21 +149,21 @@ def _extract_text(tool_response: Any) -> str | None:
       * ``[{"type":"text","text":.}]`` -> MCP-style content blocks.
       * ``{"content": <str|blocks>}``  -> wrapped result; also the Task/``Agent``
                                           sub-agent answer (content blocks).
-      * ``{"stdout","stderr",..}``     -> Bash. Uses ``stdout``; appends ``stderr``
-                                          only when non-empty, under a clear
-                                          ``[stderr]`` separator, so error text stays
-                                          compressible AND retrievable.
+      * ``{"stdout","stderr",..}``     -> Bash. Extracts exactly ONE field:
+                                          ``stdout`` when non-empty, else a non-empty
+                                          ``stderr``. Never a merge — the compressed
+                                          text must map back onto a single field of
+                                          the mirrored Bash object (see ``_reinject``),
+                                          and folding stderr into stdout also destroys
+                                          the engine's structured-array detection.
       * ``{"result": <str>, ..}``      -> WebFetch (its answer lives in ``result``).
       * ``{"text": <str>, ..}``        -> generic single-text-field results.
-      * ``{"query","results":[..]}``   -> WebSearch: the ``results`` list of objects
-                                          is returned AS JSON so the engine's
-                                          structured crush compresses it (Bug-14 —
-                                          it is matched, so it must be compressible,
-                                          not silently passed through).
 
     Returns ``None`` for anything else — images, mixed non-text blocks, empty
-    output, and structured payloads with no free-text field AND no ``results``
-    array. Totality is preserved: unknown shape -> ``None`` -> caller passes the
+    output, and structured payloads with no free-text field (including WebSearch's
+    ``{"query","results":[..]}``, whose whole object is the payload and so has no
+    single field to mirror the compressed text back onto — see the ``_reinject``
+    note). Totality is preserved: unknown shape -> ``None`` -> caller passes the
     original through untouched.
     """
     if isinstance(tool_response, str):
@@ -176,13 +181,19 @@ def _extract_text(tool_response: Any) -> str | None:
                 return text
 
         # Bash: {"stdout","stderr","interrupted","isImage","noOutputExpected"}.
+        # Exactly ONE field is ever extracted (stdout preferred, stderr as the
+        # fallback for stderr-only output), so the compressed text has exactly one
+        # home in the mirrored object (``_reinject``) and a structured-array stdout
+        # keeps its compression ratio — folding a ``[stderr]`` tail onto it dropped
+        # a 23,890-char JSON stdout from ~98% to 0%.
         stdout = tool_response.get("stdout")
         if isinstance(stdout, str):
+            if stdout:
+                return stdout
             stderr = tool_response.get("stderr")
             if isinstance(stderr, str) and stderr.strip():
-                combined = f"{stdout}\n\n[stderr]\n{stderr}" if stdout else stderr
-                return combined or None
-            return stdout or None
+                return stderr
+            return None
 
         # WebFetch ("result") and other single-text-field results ("text").
         for key in ("result", "text"):
@@ -190,18 +201,18 @@ def _extract_text(tool_response: Any) -> str | None:
             if isinstance(value, str):
                 return value or None
 
-        # WebSearch (Bug-14): {"query": ..., "results": [{title, url, ...}, ...]}.
-        # The hook matches WebSearch but this shape has no free-text field, so it
-        # used to return None and pass through UNCOMPRESSED despite being matched.
-        # The results are a JSON array of objects, so hand the whole payload to the
-        # engine as JSON: the router's structured (dominant-array) crush handles it
-        # byte-exact-recoverably, not the prose compressor the old comment feared.
-        results = tool_response.get("results")
-        if isinstance(results, list) and results and all(isinstance(r, dict) for r in results):
-            import json as _json
-
-            return _json.dumps(tool_response, ensure_ascii=False)
-
+        # WebSearch: {"query": ..., "results": [{title, url, ...}, ...]}. The whole
+        # object is the payload — there is no single free-text field. An earlier
+        # revision extracted it AS ``json.dumps(tool_response)`` (its "Bug-14"), but
+        # that text could only ever be emitted as a bare string, which Claude Code
+        # >= 2.1.163 validates against WebSearch's output schema and DROPS on
+        # mismatch (the exact #68951 class this fix removes) — so no model ever saw
+        # a compressed WebSearch result on this path. Shape-mirroring (``_reinject``)
+        # replaces ONE field of the incoming object; whole-object JSON has no single
+        # field to map the compressed text back onto, so this shape now passes
+        # through UNMATCHED rather than emit a value the host rejects. A schema-valid
+        # WebSearch mirror that compresses each result's fields in place is future
+        # work (see the PR's follow-up note), not a shape this hook can invent.
         return None
 
     if isinstance(tool_response, list):
@@ -217,6 +228,78 @@ def _extract_text(tool_response: Any) -> str | None:
             parts.append(text)
         joined = "".join(parts)
         return joined or None
+
+    return None
+
+
+def _reinject(tool_response: Any, compressed: str) -> Any | None:
+    """Mirror *tool_response*'s shape with the compressed text swapped in.
+
+    The dual of :func:`_extract_text`: whatever shape the host handed this hook is
+    the shape handed back as ``updatedToolOutput``, with ONLY the text field
+    ``_extract_text`` read replaced by *compressed*. Claude Code >= 2.1.163
+    validates ``updatedToolOutput`` against the originating tool's output schema
+    (e.g. Bash requires ``{stdout: str, stderr: str, interrupted: bool, ...}``) and
+    silently keeps the ORIGINAL output on any mismatch — a bare string is why hook
+    compression never reached the model (anthropics/claude-code#68951). Mirroring
+    the incoming shape passes that validation by construction: no shape is ever
+    invented, so every field the tool's schema requires is present because it was
+    present in the response being replaced.
+
+    Branch order matches :func:`_extract_text` exactly (``content`` before
+    ``stdout`` before ``result``/``text``), so the field replaced is precisely the
+    one the compressed text came from. Totality via the leading oracle check:
+    returns ``None`` exactly when ``_extract_text`` returns ``None`` (WebSearch's
+    whole-object shape included — it extracts to ``None``, so it mirrors to
+    ``None``), and the caller falls back to passthrough — fail-open, never a
+    mismatched emit.
+
+    Bash detail: the compressed text lands in the ONE field ``_extract_text`` read
+    — ``stdout`` when non-empty, else ``stderr`` — and the other field rides
+    through byte-identical (but the preserved stderr is still redaction-scrubbed,
+    since the legacy merge used to run the whole blob through redaction and the
+    mirror must not weaken that). No merging, no emptying: placement stays
+    faithful, and the byte-exact original of the replaced field stays retrievable
+    from the CCR store.
+    """
+    if _extract_text(tool_response) is None:
+        return None
+
+    if isinstance(tool_response, str):
+        return compressed
+
+    if isinstance(tool_response, dict):
+        content = tool_response.get("content")
+        if content is not None and _extract_text(content) is not None:
+            replaced = _reinject(content, compressed)
+            if replaced is not None:
+                return {**tool_response, "content": replaced}
+
+        stdout = tool_response.get("stdout")
+        if isinstance(stdout, str):
+            if stdout:
+                updated: dict[str, Any] = {**tool_response, "stdout": compressed}
+                stderr = tool_response.get("stderr")
+                if isinstance(stderr, str) and stderr:
+                    # The preserved (non-compressed) field must still honor
+                    # FURL_REDACT_PATTERNS: the legacy merge ran the whole blob
+                    # through redaction, so the mirrored stderr may not weaken that
+                    # guarantee. Identity when no patterns are configured.
+                    updated["stderr"] = _apply_env_redaction(stderr)
+                return updated
+            stderr = tool_response.get("stderr")
+            if isinstance(stderr, str) and stderr.strip():
+                return {**tool_response, "stderr": compressed}
+            return None
+
+        for key in ("result", "text"):
+            if isinstance(tool_response.get(key), str):
+                return {**tool_response, key: compressed}
+
+        return None
+
+    if isinstance(tool_response, list):
+        return [{"type": "text", "text": compressed}]
 
     return None
 
@@ -348,7 +431,38 @@ def _apply_env_redaction(text: str) -> str:
         return text
 
 
-def _emit(output_text: str, *, compressed: bool) -> NoReturn:
+def _redaction_changed_visible_output(tool_response: Any, text: str, redacted: str) -> bool:
+    """True iff redaction changed a field the model would see on a NON-compressing
+    passthrough (below-min-chars / no-savings), so the gate must emit the scrubbed
+    mirror instead of passing the original through.
+
+    ``redacted != text`` covers the EXTRACTED field. The Bash preserved field
+    (``stderr``) needs its own check: ``_extract_text`` reads only ``stdout`` when
+    ``stdout`` is non-empty, so a clean small ``stdout`` hid a secret in ``stderr``
+    that the old extracted-field-only gate passed straight through — the emit path
+    scrubs that ``stderr`` (``_reinject``) but the passthrough paths never did
+    (review Finding 1).
+
+    Field-aware on purpose: a plain ``_reinject(...) != tool_response`` gate would
+    also fire when ``_reinject`` merely CANONICALIZES a multi-block list / content
+    wrapper with NO redaction at all, breaking "zero change when nothing was
+    redacted". Non-Bash shapes carry no second independent text field, so the
+    extracted-field check governs them alone. Total and fail-open:
+    ``_apply_env_redaction`` never raises, so neither does this."""
+    if redacted != text:
+        return True
+    if isinstance(tool_response, dict):
+        stdout = tool_response.get("stdout")
+        stderr = tool_response.get("stderr")
+        # Only when stdout is the extracted field (non-empty) is stderr the
+        # *preserved* one; an stderr-only output extracts stderr itself and is
+        # already covered by ``redacted != text`` above.
+        if isinstance(stdout, str) and stdout and isinstance(stderr, str) and stderr:
+            return _apply_env_redaction(stderr) != stderr
+    return False
+
+
+def _emit(tool_response: Any, output_text: str, *, compressed: bool) -> NoReturn:
     """Replace the model-visible tool output with *output_text* and exit 0.
 
     The single writer of the PostToolUse ``updatedToolOutput`` contract, used by
@@ -358,16 +472,23 @@ def _emit(output_text: str, *, compressed: bool) -> NoReturn:
     observability outcome bucket so counters stay honest: a redaction-only emit
     is NOT a compression.
 
-    NOTE (anthropics/claude-code#68951): Claude Code >=2.1.163 currently DROPS
-    this ``updatedToolOutput`` — the model still sees the original. The emission
-    is kept so the feature revives automatically when upstream fixes the drop;
-    until then real savings come from the on-by-default PreToolUse pipe
-    (FURL_PRETOOL_PIPE=0 disables it), and the counters here surface whether the
-    drop is happening."""
+    Shape contract (anthropics/claude-code#68951): Claude Code >= 2.1.163
+    validates ``updatedToolOutput`` against the originating tool's output schema
+    and silently keeps the ORIGINAL output when it does not parse (2.1.212 logs
+    ``PostToolUse hook returned updatedToolOutput that does not match <tool>'s
+    output shape`` and falls back). A bare string therefore never replaced a Bash
+    ``{stdout, stderr, interrupted, ...}`` object — the reason compression did not
+    reach the model. ``_reinject`` mirrors the incoming ``tool_response`` shape
+    around *output_text* so the emitted value passes that validation by
+    construction; if the shape cannot be mirrored the hook passes through rather
+    than emit a value the host would reject (fail-open)."""
+    updated = _reinject(tool_response, output_text)
+    if updated is None:
+        _passthrough("reinject-unmatched")
     output = {
         "hookSpecificOutput": {
             "hookEventName": "PostToolUse",
-            "updatedToolOutput": output_text,
+            "updatedToolOutput": updated,
         }
     }
     try:
@@ -436,7 +557,8 @@ def main() -> None:
         _passthrough("excluded-tool")
 
     # --- extract text; bail on non-text / empty / unrecognized payloads ---
-    text = _extract_text(payload.get("tool_response"))
+    tool_response = payload.get("tool_response")
+    text = _extract_text(tool_response)
     if text is None:
         _passthrough("shape-unmatched")
 
@@ -452,10 +574,12 @@ def main() -> None:
 
     # --- size gate ---
     if len(redacted) < _min_chars():
-        # Below the compression threshold. If redaction changed the bytes, still
-        # emit the scrubbed form so the secret never reaches the model.
-        if redacted != text:
-            _emit(redacted, compressed=False)
+        # Below the compression threshold. If redaction changed ANY model-visible
+        # field — the extracted one OR a preserved Bash stderr — emit the fully
+        # scrubbed mirror so no secret reaches the model (review Finding 1);
+        # otherwise keep a byte-identical passthrough.
+        if _redaction_changed_visible_output(tool_response, text, redacted):
+            _emit(tool_response, redacted, compressed=False)
         _passthrough("below-min-chars")
 
     # --- compress (returns None + a distinct reason unless it genuinely helped) ---
@@ -465,10 +589,12 @@ def main() -> None:
     tool_label = tool_name if isinstance(tool_name, str) and tool_name else None
     compressed, compress_fail_reason = _compress_text(redacted, tool_label)
     if compressed is None:
-        # Compression did not help. Emit the redacted text if it changed;
-        # otherwise leave the original untouched (byte-identical passthrough).
-        if redacted != text:
-            _emit(redacted, compressed=False)
+        # Compression did not help. Emit the fully scrubbed mirror if redaction
+        # changed any model-visible field (extracted OR a preserved Bash stderr —
+        # review Finding 1); otherwise leave the original untouched (byte-identical
+        # passthrough).
+        if _redaction_changed_visible_output(tool_response, text, redacted):
+            _emit(tool_response, redacted, compressed=False)
         _passthrough(compress_fail_reason or "no-savings")
 
     # --- optional one-line stderr annotation (FURL_HOOK_VERBOSE) ---
@@ -480,7 +606,7 @@ def main() -> None:
         )
 
     # --- replace the tool output the model sees ---
-    _emit(compressed, compressed=True)
+    _emit(tool_response, compressed, compressed=True)
 
 
 if __name__ == "__main__":
