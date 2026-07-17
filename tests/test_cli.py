@@ -50,6 +50,31 @@ def test_compress_json_reports_token_savings() -> None:
     assert "compressed" in out and out["error"] is None
 
 
+def test_compress_binary_file_is_graceful_not_a_traceback(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    # Bug-1 / High-7 / A7: a binary FILE arg must not crash with a raw
+    # UnicodeDecodeError traceback. It decodes lossily, warns once, and exits 0.
+    binfile = tmp_path / "blob.bin"
+    binfile.write_bytes(bytes(range(256)) * 8)
+    proc = _run(["compress", str(binfile)])
+    assert proc.returncode == 0, proc.stderr
+    assert "Traceback" not in proc.stderr
+    assert "not valid UTF-8" in proc.stderr
+
+
+def test_compress_binary_stdin_matches_file_graceful_behavior() -> None:
+    # A7: binary STDIN must be as graceful as the file-arg path (no traceback,
+    # same warning). Uses raw bytes stdin, so the CLI reads via sys.stdin.buffer.
+    proc = subprocess.run(
+        [sys.executable, "-m", "furl_ctx.cli", "compress"],
+        input=bytes(range(256)) * 8,
+        capture_output=True,
+        env={**os.environ, "FURL_CCR_BACKEND": "memory"},
+    )
+    assert proc.returncode == 0
+    assert b"Traceback" not in proc.stderr
+    assert b"not valid UTF-8" in proc.stderr
+
+
 def test_retrieve_unknown_hash_exits_1() -> None:
     proc = _run(["retrieve", "0" * 24])
     assert proc.returncode == 1
@@ -67,7 +92,7 @@ def test_eval_recall_over_corpus_dir(tmp_path) -> None:  # type: ignore[no-untyp
     assert proc.returncode == 0, proc.stderr
     assert "files: 2" in proc.stdout
     # The corpus array compresses (ratio strictly between none and all).
-    ratio = float(proc.stdout.split("corpus compression ratio:")[1].split("%")[0])
+    ratio = float(proc.stdout.split("corpus visible-token reduction:")[1].split("%")[0])
     assert 0.0 < ratio < 100.0
     # The needle-recall trust gate is 100% on a healthy engine (the naming arm
     # recalls its needle by construction); it drops if compression starts
@@ -76,12 +101,21 @@ def test_eval_recall_over_corpus_dir(tmp_path) -> None:  # type: ignore[no-untyp
     assert recall == 100.0
 
 
-def test_eval_requires_recall_flag(tmp_path) -> None:  # type: ignore[no-untyped-def]
+def test_eval_recall_is_optional_not_a_mandatory_flag(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    # Bug-13: --recall was a REQUIRED store_true flag (a mandatory flag conveying
+    # no choice). It is now optional — eval reports the ratio without it, and the
+    # (extra-work) needle-recall gate runs only when --recall is passed.
     corpus = tmp_path / "rows.json"
     corpus.write_text(_big_array(), encoding="utf-8")
-    proc = _run(["eval", str(corpus)])
-    assert proc.returncode == 2  # argparse: missing required --recall
-    assert "--recall" in proc.stderr
+
+    without = _run(["eval", str(corpus)])
+    assert without.returncode == 0, without.stderr
+    assert "visible-token reduction:" in without.stdout
+    assert "trust gate" not in without.stdout  # recall gate is opt-in
+
+    with_recall = _run(["eval", str(corpus), "--recall"])
+    assert with_recall.returncode == 0, with_recall.stderr
+    assert "trust gate" in with_recall.stdout
 
 
 def test_eval_missing_corpus_exits_1(tmp_path) -> None:  # type: ignore[no-untyped-def]
@@ -266,9 +300,16 @@ def inprocess_memory_store(monkeypatch: pytest.MonkeyPatch):  # type: ignore[no-
     reset_compression_store()
 
 
-def test_purge_removes_a_stored_hash_then_second_purge_misses(inprocess_memory_store) -> None:  # type: ignore[no-untyped-def]
+def test_purge_removes_a_stored_hash_then_second_purge_misses(
+    inprocess_memory_store, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
     """``furl purge HASH`` deletes a live original (exit 0), then a repeat purge misses (exit 1)."""
     from furl_ctx import retrieve
+
+    # Silence the High-8 profile banner so this asserts the strong invariant:
+    # a successful purge itself emits NOTHING on stderr (the banner is unrelated
+    # diagnostic output, covered by its own test).
+    monkeypatch.setenv("FURL_PROFILE_BANNER", "0")
 
     h = _compress_and_get_hash()
     assert retrieve(h) is not None, "precondition: the hash must be stored before purge"
@@ -370,6 +411,10 @@ def test_mcp_missing_dependency_surfaces_clean_error_exit_1(
         raise ImportError("No module named 'mcp'")
 
     monkeypatch.setattr(mcp_mod, "main", _boom)
+    # Silence the High-8 profile banner so this asserts the clean-error contract
+    # on its own (the banner is separately tested); the ImportError must surface
+    # as a `furl:`-prefixed stderr line with no traceback.
+    monkeypatch.setenv("FURL_PROFILE_BANNER", "0")
     rc, _stdout, stderr = _call_main(["mcp"])
     assert rc == 1
     assert stderr.startswith("furl: ")
@@ -502,7 +547,7 @@ def test_eval_inprocess_over_dir_reports_ratio_and_full_recall(
     rc, stdout, _stderr = _call_main(["eval", str(tmp_path), "--recall"])
     assert rc == 0
     assert "files: 2" in stdout
-    ratio = float(stdout.split("corpus compression ratio:")[1].split("%")[0])
+    ratio = float(stdout.split("corpus visible-token reduction:")[1].split("%")[0])
     assert 0.0 < ratio < 100.0
     recall = float(stdout.split("trust gate):")[1].split("%")[0])
     assert recall == 100.0
@@ -564,3 +609,145 @@ def test_doctor_reports_fail_when_native_core_unavailable(monkeypatch: pytest.Mo
     assert rc == 1
     assert "[FAIL] native _core:" in stdout
     assert "compression fails open to 0%" in stdout
+
+
+# ── Med-11: list / search / stats CLI parity ─────────────────────────────────
+
+
+def test_list_shows_a_stored_entry(inprocess_memory_store) -> None:  # type: ignore[no-untyped-def]
+    """After a compress offloads to CCR, ``furl list`` shows the hash + preview.
+
+    A 200-row array offloads the whole array PLUS a per-row entry for sliceable
+    retrieval, so the array marker is the OLDEST of many; use a high --limit so
+    the newest-first page reaches it.
+    """
+    h = _compress_and_get_hash()
+    rc, stdout, _stderr = _call_main(["list", "--limit", "300"])
+    assert rc == 0
+    assert h in stdout, "the stored hash must appear in the listing"
+    assert "kind=" in stdout
+
+
+def test_list_json_is_machine_readable(inprocess_memory_store) -> None:  # type: ignore[no-untyped-def]
+    """``furl list --json`` emits a JSON array carrying the stored hash."""
+    h = _compress_and_get_hash()
+    rc, stdout, _stderr = _call_main(["list", "--json", "--limit", "300"])
+    assert rc == 0
+    payload = json.loads(stdout)
+    assert any(entry["hash"] == h for entry in payload)
+
+
+def test_list_empty_store_is_a_clean_message(inprocess_memory_store) -> None:  # type: ignore[no-untyped-def]
+    """``furl list`` on an empty store is a clean note, exit 0 (not a crash)."""
+    rc, stdout, _stderr = _call_main(["list"])
+    assert rc == 0
+    assert "no live entries" in stdout
+
+
+def test_search_finds_a_stored_original_by_content(inprocess_memory_store) -> None:  # type: ignore[no-untyped-def]
+    """``furl search`` substring-matches stored originals and returns hits with a preview."""
+    _compress_and_get_hash()  # rows carry name="event_<i>"
+    # Substring (not token) match: a partial token like "event_" finds "event_199".
+    rc, stdout, _stderr = _call_main(["search", "event_"])
+    assert rc == 0
+    assert "no stored original matches" not in stdout
+    assert "event_" in stdout, "the redacted preview should show the matched text"
+    assert "kind=" in stdout
+
+
+def test_search_no_match_is_a_clean_message(inprocess_memory_store) -> None:  # type: ignore[no-untyped-def]
+    """A query that matches nothing is a clean note, exit 0."""
+    _compress_and_get_hash()
+    rc, stdout, _stderr = _call_main(["search", "zzz_no_such_token_zzz"])
+    assert rc == 0
+    assert "no stored original matches" in stdout
+
+
+def test_stats_reports_entries_and_profile(inprocess_memory_store) -> None:  # type: ignore[no-untyped-def]
+    """``furl stats`` reports the live entry count and the active profile scope."""
+    _compress_and_get_hash()
+    rc, stdout, _stderr = _call_main(["stats"])
+    assert rc == 0
+    assert "entries:" in stdout
+    assert "default TTL:" in stdout
+
+
+def test_stats_json_carries_profile_and_store(inprocess_memory_store) -> None:  # type: ignore[no-untyped-def]
+    """``furl stats --json`` carries both the resolved profile and store block."""
+    _compress_and_get_hash()
+    rc, stdout, _stderr = _call_main(["stats", "--json"])
+    assert rc == 0
+    payload = json.loads(stdout)
+    assert "profile" in payload and "store" in payload
+    assert payload["profile"]["backend"] == "memory"
+
+
+# ── Med-11: hash-format validation parity with the MCP server ────────────────
+
+
+def test_retrieve_rejects_malformed_hash_with_exit_2(inprocess_memory_store) -> None:  # type: ignore[no-untyped-def]
+    """A malformed hash is a usage error (exit 2 + clean message), not a silent miss."""
+    rc, stdout, stderr = _call_main(["retrieve", "not-a-hash"])
+    assert rc == 2
+    assert stdout == ""
+    assert "invalid hash format" in stderr
+
+
+def test_purge_rejects_malformed_hash_with_exit_2(inprocess_memory_store) -> None:  # type: ignore[no-untyped-def]
+    """``furl purge`` applies the same up-front hash-format guard as the MCP server."""
+    rc, stdout, stderr = _call_main(["purge", "XYZ"])
+    assert rc == 2
+    assert stdout == ""
+    assert "invalid hash format" in stderr
+
+
+def test_valid_but_unknown_hash_is_a_miss_not_a_format_error(inprocess_memory_store) -> None:  # type: ignore[no-untyped-def]
+    """A well-formed but unstored hash stays a MISS (exit 1), distinct from a format error."""
+    rc, _stdout, stderr = _call_main(["retrieve", "0" * 24])
+    assert rc == 1
+    assert "not found" in stderr
+    assert "invalid hash format" not in stderr
+
+
+# ── High-8: active-profile banner ────────────────────────────────────────────
+
+
+def test_profile_banner_on_by_default(inprocess_memory_store) -> None:  # type: ignore[no-untyped-def]
+    """Every run surfaces the active profile on stderr by default (High-8)."""
+    rc, _stdout, stderr = _call_main(["stats"])
+    assert rc == 0
+    assert "furl profile:" in stderr
+    assert "backend=memory" in stderr
+
+
+def test_profile_banner_suppressible(
+    inprocess_memory_store, monkeypatch: pytest.MonkeyPatch
+) -> None:  # type: ignore[no-untyped-def]
+    """FURL_PROFILE_BANNER=0 silences the banner for clean pipelines."""
+    monkeypatch.setenv("FURL_PROFILE_BANNER", "0")
+    rc, _stdout, stderr = _call_main(["stats"])
+    assert rc == 0
+    assert "furl profile:" not in stderr
+
+
+def test_doctor_reports_active_profile(inprocess_memory_store) -> None:  # type: ignore[no-untyped-def]
+    """``doctor`` prints the resolved profile line (backend/TTL/scope)."""
+    rc, stdout, _stderr = _call_main(["doctor"])
+    assert "profile: backend=" in stdout
+
+
+def test_search_preview_redacts_credentials(inprocess_memory_store) -> None:  # type: ignore[no-untyped-def]
+    """A credential in a stored original never leaks through a ``furl search`` preview."""
+    from furl_ctx.cache.compression_store import get_compression_store
+
+    secret = "AK" + "IA" + "IOSFODNN7" + "EXAMPLE"  # built from parts (env secret-guard)
+    store = get_compression_store()
+    store.store(
+        f"log before\nkey={secret}\nlog after the credential region here",
+        "compressed-view",
+        tool_name="TestTool",
+    )
+    rc, stdout, _stderr = _call_main(["search", "credential"])
+    assert rc == 0
+    assert secret not in stdout, "the raw credential must never appear in a search preview"
+    assert "[REDACTED" in stdout

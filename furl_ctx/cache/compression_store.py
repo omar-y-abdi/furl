@@ -637,6 +637,8 @@ class CompressionStore:
             compression_strategy=compression_strategy,
         )
 
+        durable = False
+        collision_dropped = False
         with self._lock:
             self._evict_if_needed()
 
@@ -668,21 +670,42 @@ class CompressionStore:
                         len(original),
                     )
                     # Drop the stored entry so retrieve() loud-misses instead of
-                    # serving foreign bytes; its heap tuple is now stale.
+                    # serving foreign bytes; its heap tuple is now stale. The
+                    # binding reached NEITHER a durable nor a volatile tier, so a
+                    # require_durable caller must veto below (Bug-6) rather than
+                    # receive the hash as if the content were stored.
                     self._backend.delete(hash_key)
                     self._stale_heap_entries += 1
-                    return hash_key
-                # Same content being stored again - this is fine, just update
-                logger.debug(
-                    "Duplicate store for hash=%s, updating entry",
-                    hash_key,
-                )
-                # Mark old heap entry as stale since we're replacing
-                self._stale_heap_entries += 1
+                    collision_dropped = True
+                else:
+                    # Same content being stored again - this is fine, just update
+                    logger.debug(
+                        "Duplicate store for hash=%s, updating entry",
+                        hash_key,
+                    )
+                    # Mark old heap entry as stale since we're replacing
+                    self._stale_heap_entries += 1
 
-            durable = self._persist_and_report_durability(hash_key, entry)
-            # Add to eviction heap for O(log n) eviction
-            heapq.heappush(self._eviction_heap, (entry.created_at, hash_key))
+            if not collision_dropped:
+                durable = self._persist_and_report_durability(hash_key, entry)
+                # Add to eviction heap for O(log n) eviction
+                heapq.heappush(self._eviction_heap, (entry.created_at, hash_key))
+
+        # Collision-drop veto (Bug-6): the ambiguous binding was dropped, so
+        # NOTHING is retrievable under this key. A require_durable caller reverts
+        # to the original (the veto contract) exactly as for a failed durable
+        # write; a non-durable caller keeps today's behavior (the returned hash
+        # loud-misses, never serves foreign content).
+        if collision_dropped:
+            if require_durable:
+                raise DurableWriteError(
+                    f"CCR store for hash {hash_key} hit a true hash collision "
+                    "(different content, same key); the ambiguous binding was dropped "
+                    "so NEITHER content is served. The original was NOT stored — revert "
+                    "to the uncompressed content.",
+                    hash_key=hash_key,
+                )
+            return hash_key
 
         # Contention retry BEFORE the veto (store-concurrency-honesty). A durable
         # write that reported non-durable most often lost a brief cross-process
@@ -1537,6 +1560,54 @@ class CompressionStore:
                 except Exception as exc:  # noqa: BLE001 — fail-open, logged below
                     logger.warning("CCR spill delete failed (non-fatal): %s", exc)
             return primary_deleted or spill_deleted
+
+    def delete_cascade(
+        self, hash_key: str, *, _visited: set[str] | None = None
+    ) -> tuple[bool, int]:
+        """Delete *hash_key* AND every nested ``<<ccr:HASH>>`` blob it references.
+
+        A compressed view offloads dropped rows to their OWN store entries under
+        markers embedded in the entry's ``compressed_content`` (and, for a
+        multi-level crush, in those blobs in turn). A plain :meth:`delete` removes
+        only the named entry, leaving those nested originals independently
+        retrievable — so a caller who purged sensitive data believes it gone while
+        a copy survives under another hash (the audit's non-cascading-purge
+        finding, B3). This reads the entry's stored text FIRST, collects the
+        markers it references (in the compressed view AND the original), deletes
+        the entry, then recurses into each nested hash. The ``_visited`` set makes
+        it cycle-safe and idempotent — a marker pointing back at an ancestor, or a
+        blob shared by two parents, is followed at most once.
+
+        Returns ``(top_deleted, nested_deleted_count)`` — whether the named entry
+        went, and how many DISTINCT nested entries were additionally removed.
+        """
+        from furl_ctx.ccr.marker_grammar import hashes_in_text
+
+        visited = _visited if _visited is not None else set()
+        if hash_key in visited:
+            return (False, 0)
+        visited.add(hash_key)
+
+        # Read the entry's stored text BEFORE deleting so nested markers are
+        # recoverable. The cheap ``ccr:``/``hash=`` pre-check skips the regex scan
+        # for the common raw original that embeds no marker at all.
+        nested: list[str] = []
+        with self._lock:
+            entry = self._backend.get(hash_key)
+        if entry is not None:
+            seen: dict[str, None] = {}
+            for text in (entry.compressed_content, entry.original_content):
+                if isinstance(text, str) and ("ccr:" in text or "hash=" in text):
+                    for nested_hash in hashes_in_text(text):
+                        seen.setdefault(nested_hash, None)
+            nested = [h for h in seen if h != hash_key]
+
+        top_deleted = self.delete(hash_key)
+        nested_removed = 0
+        for nested_hash in nested:
+            child_top, child_nested = self.delete_cascade(nested_hash, _visited=visited)
+            nested_removed += (1 if child_top else 0) + child_nested
+        return (top_deleted, nested_removed)
 
     def clear(self) -> None:
         """Clear all entries. Mainly for testing."""

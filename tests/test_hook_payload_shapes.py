@@ -147,13 +147,22 @@ def test_real_agent_content_blocks_extracted() -> None:
     assert _hook._extract_text(_REAL_AGENT) == "PINEAPPLE"
 
 
-def test_real_websearch_structured_results_passthrough() -> None:
-    """WebSearch has no free-text field (structured link list) -> None by design.
+def test_real_websearch_results_extracted_as_json_bug14() -> None:
+    """WebSearch is matched by the hook, so it must be compressible (Bug-14).
 
-    Fail-open: forcing structured link objects through the prose compressor would be
-    low value and would break totality, so the hook leaves them untouched.
+    It has no free-text field, but its ``results`` are a JSON array of objects,
+    so the extractor returns the payload AS JSON for the engine's structured
+    (byte-exact-recoverable) crush rather than passing it through uncompressed.
     """
-    assert _hook._extract_text(_REAL_WEBSEARCH) is None
+    out = _hook._extract_text(_REAL_WEBSEARCH)
+    assert out is not None
+    parsed = json.loads(out)
+    assert parsed == _REAL_WEBSEARCH  # lossless: the whole payload is handed to the engine
+
+
+def test_dict_without_results_or_text_is_still_none() -> None:
+    # Totality preserved: a dict with no text field AND no results array is None.
+    assert _hook._extract_text({"foo": "bar", "count": 3}) is None
 
 
 # --- legacy shapes: must keep working exactly as before (no regression) --------

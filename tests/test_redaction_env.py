@@ -416,3 +416,91 @@ def test_mcp_compress_filtered_runs_are_redacted(
     assert entries, "filtered compress should have stored per-run entries"
     for _hash, entry in entries:
         assert SECRET not in entry.original_content
+
+
+# ─── built-in credential patterns (ON by default — audit Crit-4 / B3) ────────
+# Assembled from parts so no verbatim credential literal sits in source.
+
+from furl_ctx.redaction import (  # noqa: E402
+    FURL_REDACT_BUILTINS_ENV,
+    build_default_redactor,
+    build_store_redactor,
+)
+
+_CRED_CASES = [
+    ("openai", "sk-" + "A" * 24),
+    ("github", "ghp" + "_" + "B" * 30),
+    ("aws", "AK" + "IA" + "IOSFODNN7" + "EXAMPLE"),
+    ("gcp", "AIza" + "C" * 35),
+    ("slack", "xoxb-" + "1" * 20),
+]
+
+
+def test_builtins_on_by_default_redacts_each_credential_shape() -> None:
+    redactor = build_default_redactor({})
+    assert redactor is not None  # ON with no config at all
+    for name, secret in _CRED_CASES:
+        line = f"config {name} = {secret} end"
+        out = redactor(line)
+        assert secret not in out, f"{name}: credential survived default redaction"
+        assert "[REDACTED:" in out
+
+
+def test_builtins_redacts_private_key_block() -> None:
+    redactor = build_default_redactor({})
+    assert redactor is not None
+    header = "-----BEGIN " + "RSA PRIVATE KEY" + "-----"
+    assert header not in redactor(f"key:\n{header}\nMII...\n")
+
+
+@pytest.mark.parametrize("off", ["0", "false", "no", "off", "FALSE", " Off "])
+def test_builtins_opt_out_returns_none(off) -> None:
+    assert build_default_redactor({FURL_REDACT_BUILTINS_ENV: off}) is None
+
+
+def test_builtins_do_not_fire_on_ordinary_content() -> None:
+    # No false positives on normal dev output — byte-identical.
+    redactor = build_default_redactor({})
+    assert redactor is not None
+    for benign in (
+        'def login(password): return db.query("SELECT id FROM users")',
+        "ERROR 2026-07-17 disk 95% /var/log/app.log processed 4321 rows",
+        "sk-short",  # below the 20-char tail bound → not a credential
+        "the quick brown fox jumps over the lazy dog",
+    ):
+        assert redactor(benign) == benign, f"false positive on: {benign!r}"
+
+
+def test_store_redactor_composes_builtins_then_env_patterns() -> None:
+    # Built-ins AND FURL_REDACT_PATTERNS both apply (defense in depth).
+    env = {"FURL_REDACT_PATTERNS": PATTERN}  # TOPSECRET-[0-9]{6}
+    redactor = build_store_redactor(env)
+    assert redactor is not None
+    secret = "sk-" + "Z" * 24
+    out = redactor(f"{secret} and {SECRET}")
+    assert secret not in out  # built-in caught the credential
+    assert SECRET not in out  # env pattern caught the operator's secret
+
+
+def test_store_redactor_none_only_when_both_off() -> None:
+    both_off = {FURL_REDACT_BUILTINS_ENV: "0"}  # builtins off, no env patterns
+    assert build_store_redactor(both_off) is None
+
+
+def test_compress_default_redacts_credential_in_stored_original() -> None:
+    # End-to-end with NO config: a credential in tool output is scrubbed from the
+    # stored original, so retrieve() can never return it.
+    from furl_ctx import compress, retrieve
+    from furl_ctx.cache.compression_store import reset_compression_store
+
+    reset_compression_store()
+    try:
+        secret = "sk-" + "Q" * 30
+        rows = [{"id": i, "note": f"token={secret}"} for i in range(200)]
+        result = compress([{"role": "tool", "content": json.dumps(rows)}], model="gpt-4o")
+        assert result.error is None
+        for h in result.ccr_hashes:
+            recovered = retrieve(h)
+            assert recovered is None or secret not in recovered
+    finally:
+        reset_compression_store()

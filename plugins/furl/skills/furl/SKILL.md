@@ -14,8 +14,10 @@ every dropped byte **retrievable on demand**. It ships two things to this sessio
 
 **Retrieval is pull-based, not push-based.** The compressed text you read does not
 contain the dropped rows. To inspect a specific dropped item, call `furl_retrieve` for
-it by pattern, field, or line range. Retrieval is byte-exact and nothing is lost, but a
-one-off anomaly buried in otherwise-repetitive data will not appear in the compressed
+it by pattern, field, or line range. Retrieval is byte-exact for raw text, and a
+structured JSON array comes back as a semantically-complete re-serialization of the
+same rows rather than the original bytes. Nothing is lost, but a one-off anomaly
+buried in otherwise-repetitive data will not appear in the compressed
 view unless you query for it. Trust a compressed summary for the shape of the data, not
 for surfacing an anomaly you were not already looking for.
 
@@ -97,16 +99,24 @@ payload) passes the original output through unchanged. It never blocks a tool ca
 
 Compression is often *lossy-but-reversible* (CCR = Compressed Context Retrieval).
 Instead of shrinking large low-redundancy content, Furl offloads it to a local
-store and leaves a marker like `<<ccr:a1b2c3>>` in its place.
+store and leaves a marker like `<<ccr:a1b2c3>>` in its place. `<<ccr:a1b2c3>>` is
+the representative shape. The engine emits several marker shapes across two hash
+widths, including bracket forms like `[N items compressed to M. Retrieve more:
+hash=H]`. They all retrieve the same way: pass the hash to `furl_retrieve`.
+LIBRARY.md carries the full CCR marker grammar.
 
 When you need the full content behind a marker, **call `furl_retrieve` with that
-hash** — it returns the byte-exact original, as long as the entry is still within
-its retention window. **The plugin keeps offloaded originals for 24 hours by
+hash** — it returns the stored original, byte-exact for raw text and a
+semantically-complete re-serialization for a structured JSON array, as long as the
+entry is still within its retention window. **The plugin keeps offloaded originals for 24 hours by
 default (`FURL_CCR_TTL_SECONDS=86400`); lower it to expire them sooner or raise it
 for a longer window.** After that the entry expires and a retrieve is a loud miss,
 never a silent wrong answer. The hook and the `furl` MCP server share one durable
-SQLite store (`~/.furl/ccr.sqlite3`), so markers the hook creates are retrievable
-through `furl_retrieve`.
+per-project SQLite store, `~/.furl/ccr-ns-<hash>.sqlite3`, keyed by
+`FURL_CCR_PROJECT_DIR` so one project never sees another's entries. The global
+`~/.furl/ccr.sqlite3` is used only when project scoping is turned off, and it is the
+`furl` CLI default. Either way, markers the hook creates are retrievable through
+`furl_retrieve`.
 
 What a marker leaves in place depends on the offloaded **input shape** — the
 columnar table is not the universal case:
@@ -116,7 +126,9 @@ columnar table is not the universal case:
 - A **JSON object with one dominant inner array** (e.g. a Chrome trace) leaves an
   `_ccr_summary` preview: schema, per-field value histograms, and numeric ranges.
 - **Line-oriented text** (logs, stack traces) is *not* tabled — it leaves a head+tail
-  excerpt with the full text behind the marker.
+  excerpt, plus any ERROR, Traceback, or other severity lines lifted from the omitted
+  middle so a buried error stays visible in the compressed view, with the full text
+  behind the marker.
 
 For the array and summary cases you usually want a **slice, not the whole thing**.
 The summary carries a `retrieve` hint telling you which fields to filter on. Pass a

@@ -118,6 +118,42 @@ async def test_purge_absent_hash_is_clean_not_error(server) -> None:
     assert env["found"] is False
 
 
+async def test_purge_hash_cascades_to_nested_offloaded_blobs(server) -> None:
+    # An offloaded original (outer) whose compressed view references a nested
+    # dropped-rows blob under another hash. Purging the outer must ALSO erase the
+    # nested blob — else a "purged" secret survives under the nested hash (B3 /
+    # audit non-cascading-purge; A1).
+    nested = "d" * 24
+    store = server._get_local_store()
+    store.store(original=f"the dropped {_API_KEY} rows", compressed="x", explicit_hash=nested)
+    store.store(
+        original="full original payload",
+        compressed=f"summary <<ccr:{nested}>> tail",
+        explicit_hash=_HASH_A,
+    )
+
+    purged = _envelope(await server._handle_purge({"hash": _HASH_A}))
+    assert purged["deleted_count"] == 2
+    assert purged["nested_deleted"] == 1
+    assert "nested" in purged["note"]
+
+    # BOTH the outer and the nested blob are now unretrievable (verified by the
+    # handler's read-back too).
+    for h in (_HASH_A, nested):
+        gone = _envelope(await server._handle_retrieve({"hash": h}))
+        assert "error" in gone, f"{h} still retrievable after cascade purge"
+
+
+async def test_purge_is_cycle_safe_on_self_referencing_marker(server) -> None:
+    # A compressed view whose marker points back at its OWN hash must not recurse
+    # forever — the visited set bounds it, and the entry is still erased once.
+    store = server._get_local_store()
+    store.store(original="payload", compressed=f"self <<ccr:{_HASH_A}>>", explicit_hash=_HASH_A)
+    purged = _envelope(await server._handle_purge({"hash": _HASH_A}))
+    assert purged["deleted_count"] == 1
+    assert purged["nested_deleted"] == 0
+
+
 async def test_purge_all_empties_the_store(server) -> None:
     _seed(server, _HASH_A, "one")
     _seed(server, _HASH_B, "two")

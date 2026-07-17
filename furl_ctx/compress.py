@@ -65,7 +65,7 @@ from typing import TYPE_CHECKING, Any
 from .ccr.marker_grammar import hashes_in_text
 from .config import DEFAULT_MIN_TOKENS_TO_COMPRESS
 from .pipeline import PipelineExtensionManager, PipelineStage, summarize_routing_markers
-from .redaction import build_env_redactor, compose_redactors
+from .redaction import build_store_redactor, compose_redactors
 from .utils import extract_user_query as _extract_user_query
 
 if TYPE_CHECKING:
@@ -553,6 +553,19 @@ def compress(
             protect_recent=0,
         )
     """
+    # A6: validate the message-list shape at the boundary so a programmer error
+    # (a bare string / dict instead of a list of message dicts) is ONE concise,
+    # actionable TypeError — not a bare ``str.get`` AttributeError raised from the
+    # redaction step, nor the doubled fail-open + token-count-fallback tracebacks
+    # the hook and MCP paths otherwise spilled on every such call. Mirrors the
+    # unexpected-kwarg TypeError raised at this same boundary below.
+    if not isinstance(messages, list):
+        raise TypeError(
+            "compress() expects a list of message dicts "
+            "(e.g. [{'role': 'tool', 'content': '...'}]), got "
+            f"{type(messages).__name__}"
+        )
+
     if not messages or not optimize:
         return CompressResult(messages=messages)
 
@@ -586,14 +599,16 @@ def compress(
     # succeeds, every downstream step (pipeline, offload, store) only ever sees
     # redacted content — so a later retrieve() returns the REDACTED original.
     #
-    # Two redactors compose here (both apply, defense in depth): the
+    # Three redactors compose here (all apply, defense in depth): the ON-by-default
+    # built-in credential patterns (audit Crit-4 / B3) run FIRST, then the
     # env-expressible ``FURL_REDACT_PATTERNS`` redactor — the ONLY redaction
-    # channel the env-configured Claude Code plugin (hook + MCP server) can
-    # reach — runs FIRST, then the library ``CompressConfig.redactor`` callback.
-    # ``build_env_redactor()`` is ``None`` when the var is unset/empty, so with
-    # no env patterns AND no callback this whole block is a no-op and behavior
-    # is byte-identical.
-    _active_redactor = compose_redactors(build_env_redactor(), cfg.redactor)
+    # channels the env-configured Claude Code plugin (hook + MCP server) can reach
+    # — then the library ``CompressConfig.redactor`` callback. ``build_store_redactor()``
+    # is ``None`` only when the built-ins are opted out (``FURL_REDACT_BUILTINS=0``)
+    # AND no env patterns are set, so a caller who disables both plus passes no
+    # callback keeps byte-identical behavior; otherwise credentials are scrubbed
+    # before anything is compressed, offloaded, or stored.
+    _active_redactor = compose_redactors(build_store_redactor(), cfg.redactor)
     if _active_redactor is not None:
         messages = _redact_messages(messages, _active_redactor)
 

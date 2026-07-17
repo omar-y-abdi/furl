@@ -13,6 +13,11 @@ Linux arm64/x86_64):
 pip install "furl-ctx[all]"
 ```
 
+**Windows has no prebuilt wheel.** PyPI ships wheels for macOS arm64/x86_64 and
+Linux arm64/x86_64 only. On Windows, pip falls back to a source build, which
+needs a Rust toolchain. Install Rust first with rustup and a stable toolchain,
+or run under WSL where the Linux wheel applies.
+
 Granular extras: `[mcp]` (MCP server), `[code]` (tree-sitter AST-verified code
 compression, ~50 MB, opt-in), `[dev]`. Requires **Python 3.10+**.
 
@@ -27,6 +32,10 @@ from furl_ctx import compress
 result = compress(messages, model="claude-sonnet-4")
 # result.messages  → compressed; CCR keeps originals retrievable
 ```
+
+First-call warmup: the first `compress()` in a fresh process takes about 6
+seconds while the tokenizer and store initialize. Every later call in that same
+process runs in about 0.02 to 0.5 seconds.
 
 ```bash
 # Or run the MCP server for Claude Code / Cursor / any MCP host
@@ -72,22 +81,26 @@ docker run --rm -i -v furl-store:/home/furl/.furl furl-mcp
 **Retrieval is pull-based, not push-based.** A `<<ccr:HASH>>` marker replaces the
 dropped content in the compressed output, so the dropped rows are not in the view the
 model reads. To get a specific one back, an agent has to call `retrieve()` for it by
-pattern, field, or line range. The store is byte-exact and nothing is lost, but a lone
+pattern, field, or line range. Recovery is byte-exact for raw text, and a structured
+JSON array comes back as a semantically-complete re-serialization of the same rows
+rather than the original bytes. Nothing is lost, but a lone
 anomaly inside otherwise-repetitive data will not surface in the compressed view unless
 someone queries for it. A compressed summary is trustworthy for the shape of the data,
 not for spotting an outlier no one thought to look for.
 
 `compress()` offloads large, low-redundancy content to the CCR store and leaves a
 `<<ccr:HASH>>` marker. `retrieve(hash)` turns a marker's hash back into content.
-With **no filter argument it is byte-identical to the full stored original** (or
-`None` if the hash has left the store window — a loud, explicit miss). Passing a
+With **no filter argument it returns the full stored original**. That is
+byte-identical for a raw-text offload, and a semantically-complete re-serialization
+of the rows for a structured JSON array. If the hash has left the store window it
+returns `None`, a loud and explicit miss. Passing a
 filter narrows what comes back **without dumping the whole original**, so an agent
 can drill into a huge offloaded array cheaply:
 
 ```python
 from furl_ctx import retrieve
 
-# Full original, byte-exact (unchanged behavior):
+# Full stored original: byte-exact for text, re-serialized for JSON arrays
 original = retrieve(hash)
 
 # ROW-SELECT — keep only the rows of a JSON array of objects (or a JSON object
@@ -130,9 +143,41 @@ Rules (they mirror the `furl_retrieve` MCP tool and share one validated spec):
 `resolve_markers(messages)` expands **every** resolvable marker in a message list
 back to its original inline (bulk recovery), leaving unresolvable markers in place.
 
+## CCR marker grammar
+
+`<<ccr:HASH>>` is the representative marker, but the engine emits several shapes
+across two hash widths. `furl_ctx/ccr/marker_grammar.py` is the single owner of
+the wire format and pins it against the Rust producers. Whatever the shape, you
+recover the content the same way: pass its `HASH` to `retrieve()` or the
+`furl_retrieve` MCP tool.
+
+Two hash widths:
+
+- **12-hex** keys the SmartCrusher row offloads. The key is the first 12 hex
+  characters of `sha256(payload)`.
+- **24-hex** keys the diff, log, and search compressors, the cross-message
+  deduper, the read-lifecycle cache, and the store default. The key is 24 hex
+  characters of `md5(payload)` or `sha256(payload)`, depending on the producer.
+
+Two families:
+
+- **Double-angle `<<ccr:...>>`.** The bare `<<ccr:HASH>>`, plus annotated forms
+  that carry a count or kind after the hash: `<<ccr:HASH N_rows_offloaded>>`,
+  `<<ccr:HASH#rows N_chunks>>`, `<<ccr:HASH,KIND,SIZE>>`,
+  `<<ccr:HASH N_bytes_duplicate>>`, and `<<ccr:HASH N_bytes_near_duplicate>>`.
+- **Bracket forms.** Readable sentences that end in a hash:
+  `[N items compressed to M. Retrieve more: hash=H]`,
+  `[N lines compressed to M. Retrieve full diff: hash=H]`, and
+  `[Read content stale: ... Retrieve original: hash=H]`. The read-stale form is
+  recovered by a direct store lookup on its hash, not by the marker scanner.
+
+The text after the hash is metadata for the reader. The hash alone is what you
+retrieve.
+
 ## Redact & purge — security
 
-Offloaded content is stored **byte-exact** for later `retrieve()`, so by default a
+Offloaded content is stored for later `retrieve()`, byte-exact for raw text and as a
+semantically-complete re-serialization for structured JSON arrays, so by default a
 secret inside a tool output is stored and stays recoverable — unencrypted, in a
 local per-project SQLite file under `~/.furl` (`0600` perms). See
 [SECURITY.md](SECURITY.md) → "Stored originals: at-rest posture" for the full
@@ -238,7 +283,7 @@ host's built-in read for repeat-read token savings.
                       │
             ┌─────────┴─────────┐
             ▼                   ▼
-     compressed context    CCR store (byte-exact originals)
+     compressed context    CCR store (retrievable originals)
             │                    ▲
             ▼                    │
           LLM  ──► needs detail? ┘
@@ -416,6 +461,11 @@ that project's PER-PROJECT store, not the global one — set
 ## Configuration (environment variables)
 
 Every live `FURL_*` knob. All are optional — the defaults are the shipped behavior.
+
+Store configuration is read once, when the CCR store is first built in a process.
+`FURL_CCR_TTL_SECONDS`, `FURL_CCR_BACKEND`, `FURL_CCR_SPILL`, and the other store
+knobs are snapshotted at that first use. Changing them later in the same process
+has no effect. Set them before the first `compress()` or `retrieve()`.
 
 | Variable | Default | What it does |
 |----------|---------|--------------|

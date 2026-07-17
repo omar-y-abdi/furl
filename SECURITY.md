@@ -77,18 +77,30 @@ means:
   directory `0700`, and the WAL/SHM sidecars inherit the database file's
   permissions — but that is filesystem access control, **not** encryption at rest.
   Anyone who can read your user account's files can read the stored originals.
-- **Whatever is in a tool output lands there byte-exact — unless you configure
-  redaction.** If a `Bash` command prints an API key, or a log line carries a
-  bearer token, that value is stored verbatim and stays retrievable for the
+- **Known credential shapes are redacted from the stored original by default;
+  anything else lands byte-exact.** As of the built-in redaction default (audit
+  Crit-4), a set of high-confidence credential patterns — private keys, AWS access
+  keys (`AKIA`/`ASIA`), GCP/OpenAI/GitHub/Slack tokens, and JWTs — is scrubbed from
+  the stored original **before** it is compressed or written to disk, on every store
+  path (the PostToolUse hook and every MCP store). Opt out with
+  `FURL_REDACT_BUILTINS=0`. But the built-ins are deliberately narrow, so a secret
+  with no recognizable prefix or key name (a bare high-entropy token, a
+  custom-format credential) still lands verbatim and stays retrievable for the
   retention window (`FURL_CCR_TTL_SECONDS` — 30 min for the library, 24h under the
-  Claude Code plugin). The credential redaction described above scrubs
-  *retrieval-event log lines* only, **not** the stored original — to scrub the
-  stored original itself, set `FURL_REDACT_PATTERNS` (below), which redacts
-  matches **before** anything is compressed or written to disk.
+  Claude Code plugin). The best-effort *retrieval-event log* redaction described
+  above is a separate, narrower surface; to widen what is scrubbed from the stored
+  original beyond the built-ins, set `FURL_REDACT_PATTERNS` (below), which redacts
+  your own matches **before** anything is compressed or written to disk.
 
 Mitigations that exist **today** (there is no encryption-at-rest feature — do not
 assume one):
 
+- **Built-in credential redaction (ON by default; audit Crit-4).** High-confidence
+  credential shapes (private keys, AWS `AKIA`/`ASIA` keys, GCP/OpenAI/GitHub/Slack
+  tokens, JWTs) are scrubbed from the stored original before it is compressed or
+  written, on every store path. No configuration required. Opt out with
+  `FURL_REDACT_BUILTINS=0`; extend coverage to your own formats with
+  `FURL_REDACT_PATTERNS` (both compose — built-ins run first, then your patterns).
 - **Preventive redaction via `FURL_REDACT_PATTERNS` (works from the plugin).** List
   one regex per line — or point at a file with `@/path/to/patterns` — in this
   environment variable, set in the Claude Code plugin's `hooks/hooks.json` /
@@ -139,5 +151,27 @@ assume one):
   `furl_retrieve`. Setting `FURL_CCR_PROJECT_DIR=""` disables that scoping and
   shares one global store across all projects — convenient, but it widens who can
   retrieve a given original, so leave it scoped when handling sensitive content.
+
+## Supply chain: how the plugin fetches the engine
+
+The Claude Code plugin does not vendor the Python engine. Its hooks resolve it at
+first use with `uv run --no-project --with "furl-ctx[mcp]==1.2.0"`. Be explicit
+about that posture (audit High-6):
+
+- **Version-pinned, not hash-pinned.** The engine version is exact
+  (`==1.2.0`), so you always get that release, but the download is not verified
+  against a recorded artifact hash. `uv`'s inline `--with` has no per-package hash
+  channel, so pinning digests would mean shipping and maintaining a full hashed
+  requirements lockfile for the engine and every transitive dependency — a change
+  large enough to be its own release rather than a bundled fix.
+- **`--no-project` bypasses any lockfile**, and the engine's own dependencies
+  (`tiktoken`, the `mcp` SDK) resolve to the newest compatible versions at install
+  time, so transitive versions can float between installs.
+- **Hardening path for high-assurance environments.** Pre-install a hash-verified
+  engine into a controlled environment — e.g. `pip install --require-hashes -r`
+  a lockfile you generated and reviewed, or a private index/mirror you trust —
+  and run the `furl` CLI from it. The plugin honors a `furl` already on `PATH`,
+  so a vetted install takes over the fetch. Track hash-pinning progress in the
+  repository issues.
 
 Thank you for helping keep Furl and its users safe!

@@ -5,7 +5,7 @@ build-backend = "maturin"
 [project]
 name = "furl-ctx"
 version = "1.2.0"
-description = "The context compression layer for AI agents - typically 0-54% fewer tokens on real high-entropy content, up to 95% on repetitive logs/fixtures (best-case ceiling), reversible via CCR"
+description = "Prompt and context compression for AI agents to reduce LLM token costs - typically 0-54% fewer tokens on real high-entropy content, up to 95% on repetitive logs/fixtures (best-case ceiling), reversible via CCR. Note: furl-ctx is not furl, the unrelated URL-manipulation library."
 readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.10"
@@ -36,6 +36,10 @@ keywords = [
     "ai-agents",
     "token-optimization",
     "context-window",
+    "prompt-compression",
+    "llm-token-costs",
+    "context-pruning",
+    "llm-context-memory",
 ]
 classifiers = [
     "Development Status :: 4 - Beta",

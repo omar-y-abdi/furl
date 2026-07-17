@@ -19,7 +19,9 @@ from __future__ import annotations
 
 import logging
 
-from furl_ctx.cache.compression_store import CompressionStore
+import pytest
+
+from furl_ctx.cache.compression_store import CompressionStore, DurableWriteError
 
 H = "abcdef123456"
 STORE_LOGGER = "furl_ctx.cache.compression_store"
@@ -74,6 +76,33 @@ def test_duplicate_same_content_still_updates(caplog) -> None:
     assert entry is not None
     assert entry.original_content == "same content"
     assert entry.created_at >= first_created
+
+
+def test_collision_with_require_durable_vetoes_bug6() -> None:
+    # Bug-6: the collision-drop path used to `return hash_key` BEFORE the
+    # require_durable check, so a durable caller was handed a hash for content
+    # that was actually dropped (a marker that loud-misses, contract broken).
+    # Now the drop honors the veto: require_durable raises DurableWriteError so
+    # the caller reverts to the original uncompressed content.
+    store = CompressionStore(max_entries=10)
+    store.store(original="first content", compressed=f"<<ccr:{H}>>", explicit_hash=H)
+    with pytest.raises(DurableWriteError, match="collision"):
+        store.store(
+            original="SECOND content",
+            compressed=f"<<ccr:{H}>>",
+            explicit_hash=H,
+            require_durable=True,
+        )
+    # Still dropped (no foreign content served) — a loud miss, as before.
+    assert store.retrieve(H) is None
+
+
+def test_non_durable_collision_keeps_returning_hash_bug6() -> None:
+    # The non-durable path is unchanged: it returns the key (which now loud-misses)
+    # rather than raising — only require_durable callers get the veto.
+    store = CompressionStore(max_entries=10)
+    assert _collide(store) == H
+    assert store.retrieve(H) is None
 
 
 def test_expired_first_binding_does_not_wedge_the_key() -> None:

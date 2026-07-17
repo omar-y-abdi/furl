@@ -52,7 +52,9 @@ from typing import Any, TypeGuard
 from furl_ctx.ccr.compress_modes import (
     _MAX_PATTERN_CHARS,
     _MAX_REGEX_LINE_CHARS,
+    _MAX_VARIABLE_QUANTIFIERS,
     _NESTED_QUANTIFIER_RE,
+    count_variable_quantifiers,
 )
 
 # Bound the regex context window so a caller cannot request an unboundedly
@@ -208,12 +210,16 @@ class RetrieveFilters:
 def _reject_pathological_pattern(pattern: str) -> FilterError | None:
     """Reject a ReDoS-pathological pattern at parse time; ``None`` if fine.
 
-    Two cheap, dependency-free screens (SEC-2): an over-long pattern and the
-    nested-unbounded-quantifier shape driving exponential backtracking. Heuristic
-    — it does not catch every catastrophic construction — but it turns the
-    obvious wedges into a ``FilterError`` (the caller's to fix, never a hang),
-    and the per-line input cap bounds whatever slips through. Normal patterns
-    have neither shape and pass untouched.
+    Three cheap, dependency-free screens (SEC-2, A12): an over-long pattern, the
+    nested-unbounded-quantifier shape, and a long optional-chain (many
+    variable-length quantifiers). Heuristic — it does not catch every
+    catastrophic construction — but it turns the obvious wedges into a
+    ``FilterError`` (the caller's to fix, never a hang). The optional-chain screen
+    closes the short-line gap the long-line literal-only path (F3) does not cover:
+    an ``.?`` repeated dozens of times is under the length cap and carries no
+    nested quantifier, yet backtracks exponentially on a line WITHIN
+    ``_MAX_REGEX_LINE_CHARS`` (the input cap bounds length, not backtracking
+    width). Normal patterns have none of these shapes and pass untouched.
     """
     if len(pattern) > _MAX_PATTERN_CHARS:
         return FilterError(
@@ -224,6 +230,12 @@ def _reject_pathological_pattern(pattern: str) -> FilterError | None:
         return FilterError(
             "pattern rejected: nested unbounded quantifier "
             "(catastrophic-backtracking risk); rewrite without a nested +/*"
+        )
+    if count_variable_quantifiers(pattern) > _MAX_VARIABLE_QUANTIFIERS:
+        return FilterError(
+            f"pattern rejected: too many variable-length quantifiers "
+            f"(>{_MAX_VARIABLE_QUANTIFIERS}); an optional-chain like '.?' repeated "
+            "many times backtracks exponentially — narrow or anchor the pattern"
         )
     return None
 
@@ -473,7 +485,11 @@ def _pattern_literal_text(pattern: re.Pattern[str]) -> str | None:
 def _line_matches(pattern: re.Pattern[str], literal: str | None, text: str) -> bool:
     """Whether ``text`` matches, honoring the RF1 long-line bound.
 
-    Within the cap the full regex runs (bounded input → bounded backtracking).
+    Within the cap the full regex runs. The input cap bounds the line LENGTH but
+    not backtracking WIDTH (A12): a bounded line can still backtrack
+    exponentially against a pathological pattern, so bounded backtracking here
+    rests on ``_reject_pathological_pattern`` having rejected the nested- and
+    optional-chain shapes at parse time — the cap alone does not guarantee it.
     Beyond the cap a pure literal is matched by plain substring containment
     (``literal is not None``); any other pattern does NOT search the over-long
     line (the regex engine is never handed an unbounded input), so it reports no

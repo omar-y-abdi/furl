@@ -75,6 +75,67 @@ _MAX_PATTERN_CHARS = 200
 # obvious cases loudly at parse time instead of at match time.
 _NESTED_QUANTIFIER_RE = re.compile(r"\([^)]*[+*][^)]*\)[+*]")
 
+# Bound on the number of variable-length (optional/range) quantifiers a single
+# pattern may apply (review A12). An "optional chain" such as ``.?`` repeated
+# dozens of times carries NO nested quantifier and stays under
+# ``_MAX_PATTERN_CHARS``, yet backtracks exponentially on any line WITHIN the
+# input cap — the cap bounds input length, not backtracking width, so a short
+# adversarial line (``.?`` x22 measured ~7 s, worse beyond) still wedges the
+# match. The nested-quantifier screen above misses this shape entirely. Real
+# retrieve/compress filters carry at most a handful of quantifiers (the shipped
+# test corpus tops out at 4), so a bound of 12 rejects the exponential chains
+# with wide margin while passing every realistic pattern untouched.
+_MAX_VARIABLE_QUANTIFIERS = 12
+
+
+def count_variable_quantifiers(pattern: str) -> int:
+    """Count the zero-width-capable / range quantifiers a pattern applies.
+
+    Counts ``?`` and ``*`` and any braced range (``{0,3}``, ``{1,}``, ``{,5}`` —
+    a ``{`` body containing a comma), skipping escaped metacharacters, character
+    classes, and the ``?`` that opens a group extension (``(?:``, ``(?=``,
+    ``(?<name>``). A high count is the optional-chain exponential-backtracking
+    shape the nested-quantifier screen misses (A12); a fixed ``{3}`` repeat is
+    NOT ambiguous and is not counted. Pure, linear in the pattern length.
+    """
+    count = 0
+    i = 0
+    n = len(pattern)
+    in_class = False
+    while i < n:
+        ch = pattern[i]
+        if ch == "\\":
+            i += 2  # an escaped char is a literal, never a quantifier
+            continue
+        if in_class:
+            if ch == "]":
+                in_class = False
+            i += 1
+            continue
+        if ch == "[":
+            in_class = True
+            i += 1
+            continue
+        if ch in "?*":
+            # A ``?`` right after ``(`` opens a group extension ((?:, (?=,
+            # (?<name>…) — group syntax, not a quantifier over an atom.
+            if ch == "?" and i > 0 and pattern[i - 1] == "(":
+                i += 1
+                continue
+            count += 1
+            i += 1
+            continue
+        if ch == "{":
+            close = pattern.find("}", i)
+            if close != -1 and "," in pattern[i + 1 : close]:
+                # A braced RANGE ({m,n}/{m,}/{,n}) is variable-length and can
+                # backtrack; a fixed {m} count cannot, so only ranges count.
+                count += 1
+                i = close + 1
+                continue
+        i += 1
+    return count
+
 
 class CompressionMode(Enum):
     """Aggressiveness selector for ``furl_compress``.
@@ -261,12 +322,13 @@ def _parse_pattern_list(raw: Any, name: str) -> tuple[tuple[str, ...], str | Non
 def _validate_pattern(pattern: str, name: str) -> str | None:
     """Reject a pathological pattern at parse time; ``None`` when acceptable.
 
-    Two cheap, dependency-free screens (SEC-1): an over-long pattern and the
-    nested-unbounded-quantifier shape that drives exponential backtracking. This
+    Three cheap, dependency-free screens (SEC-1, A12): an over-long pattern, the
+    nested-unbounded-quantifier shape, and a long optional-chain (many
+    variable-length quantifiers) — all three drive exponential backtracking. This
     is a heuristic — it does not catch every catastrophic construction — but it
     turns the obvious wedges into a clear typed error, and the per-line input cap
     bounds whatever slips through. Normal filters (``ERROR.*``, ``*.py``,
-    ``^\\d+$``) have neither shape and pass untouched.
+    ``^\\d+$``) have none of these shapes and pass untouched.
     """
     if len(pattern) > _MAX_PATTERN_CHARS:
         return f"{name} pattern too long (>{_MAX_PATTERN_CHARS} chars): {pattern[:40]!r}…"
@@ -274,6 +336,12 @@ def _validate_pattern(pattern: str, name: str) -> str | None:
         return (
             f"{name} pattern rejected: nested unbounded quantifier "
             f"(catastrophic-backtracking risk): {pattern!r}"
+        )
+    if count_variable_quantifiers(pattern) > _MAX_VARIABLE_QUANTIFIERS:
+        return (
+            f"{name} pattern rejected: too many variable-length quantifiers "
+            f"(>{_MAX_VARIABLE_QUANTIFIERS}); an optional-chain like '.?' repeated "
+            f"many times backtracks exponentially: {pattern!r}"
         )
     return None
 

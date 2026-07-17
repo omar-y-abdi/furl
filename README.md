@@ -1,10 +1,10 @@
 <div align="center"><pre>
-  ███████╗ ██╗   ██╗ ██████╗  ██╗
-  ██╔════╝ ██║   ██║ ██╔══██╗ ██║
-  █████╗   ██║   ██║ ██████╔╝ ██║
-  ██╔══╝   ██║   ██║ ██╔══██╗ ██║
-       ██║      ╚██████╔╝ ██║  ██║ ███████╗
-       ╚═╝       ╚═════╝  ╚═╝  ╚═╝ ╚══════╝
+███████╗██╗   ██╗██████╗ ██╗
+██╔════╝██║   ██║██╔══██╗██║
+█████╗  ██║   ██║██████╔╝██║
+██╔══╝  ██║   ██║██╔══██╗██║
+██║     ╚██████╔╝██║  ██║███████╗
+╚═╝      ╚═════╝ ╚═╝  ╚═╝╚══════╝
  The context compression layer for AI agents
   <img src="typing.svg" width="42" />
 </pre></div>
@@ -27,6 +27,8 @@
 
 ---
 
+> **What works today:** the manual MCP tools furl_compress, furl_retrieve, and furl_search deliver real token savings right now, and install is two commands. Automatic hands-off compression is pending an upstream Claude Code fix, issue [#68951](https://github.com/anthropics/claude-code/issues/68951), so it stores and accounts savings while the model may still receive the original text until that fix lands. The opt-out PreToolUse pipe adds automatic Bash savings only when you have no Bash permission rules configured. Furl never touches your Read, Grep, or Glob file reads by design. In short, Furl is prompt compression for AI agents that reduces LLM token costs while every original byte stays retrievable.
+
 **Keep finding yourself waiting on the next usage limit reset?** 
 
 **Answer:** Stop making your AI agent read everything.
@@ -48,6 +50,8 @@ That's it — this installs the compression hook, the MCP tools, and the skill. 
 
 ## Furl also works as a Python library
 
+The PyPI package is `furl-ctx`. Do not run `pip install furl`, which installs an unrelated URL-manipulation library.
+
 The same engine drops into any Python app or MCP host:
 
 ```python
@@ -61,9 +65,9 @@ result = compress(messages, model="claude-sonnet-4")
 Install, usage, pipeline internals, prompt-caching contract, and the full `FURL_*` config reference live in [LIBRARY.md](LIBRARY.md).
 
 # How it works
-**Furl filters out all unwanted noise** while agent is searching for the desired sections. Resulting in decreased input token usage while the answer always staying the same. 
+**Furl filters out all unwanted noise** while the agent is searching for the desired sections. Resulting in decreased input token usage while the answer always staying the same. 
 
-**What works today** is a on-demand toolkit for Furl:
+**What works today** is an on-demand toolkit for Furl:
 Your agent calls the MCP tools directly
 - `furl_compress` — compress large payloads into an agent-readable summary
 - `furl_retrieve` — recover exact original content by pattern, field, or line range

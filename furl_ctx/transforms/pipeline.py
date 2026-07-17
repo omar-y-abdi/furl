@@ -373,18 +373,26 @@ class TransformPipeline:
         model: str,
         **kwargs: Any,
     ) -> TransformResult:
-        """
-        Simulate transforms without modifying messages.
+        """Run the pipeline WITHOUT mutating the caller's ``messages`` list.
 
-        Same as apply() but returns what WOULD happen.
+        This is NOT a dry run (Bug-9): it is exactly ``apply(record_metrics=False)``
+        over a deep copy of ``messages``, so it runs the real transforms and
+        therefore has the SAME side effects as :meth:`apply` — it durably persists
+        CCR store entries for any offloaded content and updates the router's
+        result cache. The two guarantees it does make are (1) the caller's
+        ``messages`` objects are never mutated (apply deep-copies), and (2)
+        ``record_metrics=False`` so no metrics are recorded. Its output is
+        byte-identical to the equivalent ``apply`` call. If you need a genuinely
+        effect-free preview, do not use this method — it will write to the store.
 
         Args:
-            messages: List of messages.
+            messages: List of messages (never mutated).
             model: Model name.
-            **kwargs: Additional arguments.
+            **kwargs: Additional arguments forwarded to :meth:`apply`.
 
         Returns:
-            TransformResult with simulated changes.
+            TransformResult identical to the equivalent ``apply`` call.
         """
-        # apply() already works on a copy, so this is safe
+        # apply() deep-copies the messages, so the caller's list is never mutated;
+        # the CCR store writes and cache updates are REAL, not simulated (Bug-9).
         return self.apply(messages, model, record_metrics=False, **kwargs)

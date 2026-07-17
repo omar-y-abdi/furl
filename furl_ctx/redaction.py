@@ -62,7 +62,40 @@ from collections.abc import Callable, Mapping
 
 FURL_REDACT_PATTERNS_ENV = "FURL_REDACT_PATTERNS"
 
+# Opt OUT of the built-in credential patterns (audit Crit-4 / B3). They are ON by
+# default; only an explicit falsey value turns them off.
+FURL_REDACT_BUILTINS_ENV = "FURL_REDACT_BUILTINS"
+
 _MARKER_PREFIX = "[REDACTED:"
+
+# High-precision built-in credential patterns, applied BY DEFAULT before any
+# content is compressed or stored (audit Crit-4 / B3). Tool output routinely
+# contains secrets and the store keeps originals for the TTL, so the safe default
+# is to scrub the unambiguous credential shapes preventively rather than rely on
+# the operator to configure ``FURL_REDACT_PATTERNS`` after the fact. Each pattern
+# is deliberately SPECIFIC — a fixed vendor prefix plus a length/charset tail — so
+# it does not fire on ordinary logs, code, or prose: byte-exactness for
+# non-secret content is unchanged, and only a genuine credential is masked. The
+# ``(name, regex)`` pairs render as ``[REDACTED:<name>]`` (fixed length per type,
+# so the span never leaks the secret's length). Disable with
+# ``FURL_REDACT_BUILTINS=0``; add site-specific shapes with
+# ``FURL_REDACT_PATTERNS`` (both compose).
+_DEFAULT_CREDENTIAL_PATTERNS: tuple[tuple[str, str], ...] = (
+    # PEM/OpenSSH private-key block headers (the key material follows the header).
+    ("private-key", r"-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP )?PRIVATE KEY-----"),
+    # AWS access-key id (AKIA/ASIA + 16 upper-alnum).
+    ("aws-access-key", r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"),
+    # Google API key (AIza + 35 url-safe chars).
+    ("gcp-api-key", r"\bAIza[0-9A-Za-z_\-]{35}\b"),
+    # OpenAI-style secret key (sk- + >=20 url-safe chars).
+    ("openai-key", r"\bsk-[A-Za-z0-9_\-]{20,}"),
+    # GitHub tokens (ghp_/gho_/ghu_/ghs_/ghr_ + >=20 alnum).
+    ("github-token", r"\bgh[posru]_[A-Za-z0-9]{20,}"),
+    # Slack tokens (xoxb-/xoxa-/xoxp-/xoxr-/xoxs- + a long tail).
+    ("slack-token", r"\bxox[baprs]-[0-9A-Za-z\-]{10,}"),
+    # Compact JWT (three base64url segments) — bearer session tokens.
+    ("jwt", r"\beyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}"),
+)
 
 # Warn-once dedupe (per process): an invalid pattern must not spam stderr on
 # every compress() call, but the operator must be told at least once.
@@ -169,6 +202,51 @@ def build_env_redactor(
     return _redact
 
 
+def _builtins_enabled(source: Mapping[str, str]) -> bool:
+    """Whether the built-in credential patterns are active. Default ON — only an
+    explicit falsey ``FURL_REDACT_BUILTINS`` (``0``/``false``/``no``/``off``)
+    disables them, so a fresh install redacts credentials without any config."""
+    raw = source.get(FURL_REDACT_BUILTINS_ENV, "")
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def build_default_redactor(
+    env: Mapping[str, str] | None = None,
+) -> Callable[[str], str] | None:
+    """Build the ON-by-default built-in credential redactor, or ``None`` when
+    disabled via ``FURL_REDACT_BUILTINS`` (audit Crit-4 / B3).
+
+    Applies each :data:`_DEFAULT_CREDENTIAL_PATTERNS` regex in order, replacing a
+    match with ``[REDACTED:<name>]``. Pure and total: it never raises (the
+    patterns are constants compiled here). Returns ``None`` only when opted out,
+    so the default install scrubs credentials with zero configuration.
+    """
+    source = os.environ if env is None else env
+    if not _builtins_enabled(source):
+        return None
+    compiled = [
+        (f"{_MARKER_PREFIX}{name}]", re.compile(pattern))
+        for name, pattern in _DEFAULT_CREDENTIAL_PATTERNS
+    ]
+
+    def _redact(text: str) -> str:
+        for marker, pattern in compiled:
+            text = pattern.sub(marker, text)
+        return text
+
+    return _redact
+
+
+def build_store_redactor(
+    env: Mapping[str, str] | None = None,
+) -> Callable[[str], str] | None:
+    """The full pre-store redactor: built-in credentials THEN the operator's
+    ``FURL_REDACT_PATTERNS`` (both apply, defense in depth), or ``None`` when
+    neither is active. This is the single entry point the compress path, the
+    PostToolUse hook, and the MCP server share so all three redact identically."""
+    return compose_redactors(build_default_redactor(env), build_env_redactor(env))
+
+
 def compose_redactors(
     first: Callable[[str], str] | None,
     second: Callable[[str], str] | None,
@@ -191,8 +269,11 @@ def compose_redactors(
 
 
 __all__ = [
+    "FURL_REDACT_BUILTINS_ENV",
     "FURL_REDACT_PATTERNS_ENV",
+    "build_default_redactor",
     "build_env_redactor",
+    "build_store_redactor",
     "compose_redactors",
     "redaction_marker",
 ]

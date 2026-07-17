@@ -28,6 +28,19 @@ import pytest
 from furl_ctx import CompressConfig, compress
 from tests.matrix import _matrix as m
 
+
+@pytest.fixture(autouse=True)
+def _builtins_off(monkeypatch):
+    """This rail pins the CONFIGURED-redactor contract and the byte-exact OPT-OUT
+    path across content families. Several secret shapes here (``sk-``, ``ghp_``,
+    ``AKIA``, PEM) would ALSO be caught by the ON-by-default built-in credential
+    redactor (audit Crit-4), scrubbing them to a different marker before the
+    configured redactor runs. Opt the built-ins out so each family exercises
+    exactly the configured redactor / byte-exact-default it was written for; the
+    default-on built-ins are pinned in test_redaction_env.py."""
+    monkeypatch.setenv("FURL_REDACT_BUILTINS", "0")
+
+
 # (family_id, generator, secret_builder) — rotate the secret SHAPE across families
 # so the rail is exercised for API keys, tokens, AWS ids, PEM blocks, passwords.
 _FAMILY_SECRETS = [
@@ -92,14 +105,13 @@ def test_raising_redactor_fails_closed_on_non_json_family(salt) -> None:
     assert not m.store_contains(secret), "fail-closed: nothing may reach the store on a raise"
 
 
-def test_default_no_redactor_lets_secret_survive_byte_exact(salt) -> None:
-    """Pin the DOCUMENTED default (compress.py:562: no redactor => byte-identical).
-
-    Without a redactor there is NO automatic secret scrubbing — the secret is
-    preserved byte-exact through compression and offload, and ``retrieve`` returns
-    it verbatim. This is the correct default (and the precondition the opt-in
-    redactor overrides); it also documents that redaction is NOT fail-closed by
-    default, contrary to a common misreading of the rail.
+def test_optout_no_redactor_lets_secret_survive_byte_exact(salt) -> None:
+    """Pin the byte-exact OPT-OUT path: with the built-in credential redactor
+    disabled (``FURL_REDACT_BUILTINS=0``, set by the autouse fixture) and no
+    configured redactor, there is NO scrubbing — the secret is preserved
+    byte-exact through compression and offload, and ``retrieve`` returns it
+    verbatim. This is the escape hatch for callers who need the raw bytes; the
+    ON-by-default built-in redaction is pinned in test_redaction_env.py.
     """
     secret = m.fake_openai_key()
     content = m.salted(m.yaml_document(secret=secret), salt)
