@@ -1044,6 +1044,39 @@ class FurlMCPServer:
             # 0.0 but "No token savings" would be false for it.
             note += f" No token savings on this content — engine transforms: {strategy}."
 
+        # A structured compression can embed granular ``<<ccr:…>>`` markers in
+        # the compressed view (one per offloaded fragment / row-select), each
+        # carrying its OWN hash distinct from this whole-content ``hash``.
+        # Surfacing two different-looking hashes for one compression with no
+        # explanation reads as a bug; name the relationship so the caller knows
+        # both resolve and how they differ (review F6).
+        from furl_ctx.ccr.marker_grammar import hashes_in_text
+
+        preview_text = (
+            compressed_content
+            if isinstance(compressed_content, str)
+            else json.dumps(compressed_content)
+        )
+        embedded_hashes = [h for h in hashes_in_text(preview_text) if h != hash_key]
+        if embedded_hashes:
+            count = len(embedded_hashes)
+            shown = ", ".join(embedded_hashes[:3])
+            more = "…" if count > 3 else ""
+            marker_word = "marker" if count == 1 else "markers"
+            hash_word = "hash" if count == 1 else "hashes"
+            # Plain user-facing copy (review F6): no em-dashes, en-dashes, or
+            # parentheses; and fragment markers stored under their own keys
+            # resolve against the same underlying source document, not one shared
+            # stored original.
+            note += (
+                f" The compressed view also embeds {count} granular <<ccr:…>> "
+                f"{marker_word}, each with its own {hash_word}: {shown}{more}. Each "
+                f"one retrieves just one offloaded fragment or supports a row-select, "
+                f"separate from this whole-content hash={hash_key}. All resolve "
+                f"against the same underlying source document; retrieve any of them "
+                f"the same way."
+            )
+
         return {
             "compressed": compressed_content,
             "hash": hash_key,

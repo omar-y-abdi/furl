@@ -89,6 +89,8 @@ Dropped content does not automatically reappear. The compressed representation i
 
 A unique anomaly hidden inside repetitive data will not appear in the compressed summary unless the agent already knows to search for it. Furl preserves data availability, not automatic anomaly discovery.
 
+**Furl compresses what is already in context, not files on disk.** It shrinks a payload your agent has already read into its context window. It cannot reach into a large file on disk to pull out the part that matters, and it cannot take a file path and return compressed output. For a genuinely large file, the first and biggest reduction comes from pre-filtering with tools like grep, awk, sed, or jq to extract the relevant slice; Furl then compresses that slice further and keeps every dropped byte retrievable. Treat the two as layers: pre-filter megabytes down to a focused excerpt, then let Furl compress the excerpt. Furl is a strong second layer on top of pre-filtering, not a replacement for it.
+
 **Why "Furl"?**
 
 To furl a sail is to roll it up and keep it out of the way until needed.

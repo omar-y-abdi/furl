@@ -438,6 +438,53 @@ def _filter_lines(original_content: str, filters: RetrieveFilters) -> FilteredCo
     )
 
 
+# The regex metacharacters. A pattern containing NONE of them is a pure
+# LITERAL: it matches by plain substring containment — linear in the input
+# length, with no backtracking — so it is safe to search a line of any length.
+# Every other pattern hands control to the regex engine, whose backtracking CAN
+# be superlinear, so it is confined to lines within the per-line cap. A
+# syntactic quantifier scan is NOT a sound substitute for this literal test
+# (review RF1): a ``?``-chain such as ``a?a?…a?aaa…b`` carries no ``* + {`` yet
+# backtracks exponentially, and a ``(?<!\\)`` look-behind misparses backslash
+# parity so ``\*`` (a real quantifier) reads as "bounded".
+_REGEX_METACHARACTERS = frozenset(".*+?{}[]()|^$\\")
+
+
+def _pattern_literal_text(pattern: re.Pattern[str]) -> str | None:
+    """The pattern's source string when it is a pure LITERAL (contains no regex
+    metacharacter), else ``None``.
+
+    A pure literal is matched by plain substring search — linear in the line
+    length, no regex engine, no backtracking — so it is the ONLY pattern shape
+    allowed to search a line longer than :data:`_MAX_REGEX_LINE_CHARS`. That is
+    what lets a literal needle be found inside a single giant single-line blob (a
+    minified JSON crash report stored as one line) instead of the caller being
+    told ``matched_count=0`` for a substring that is unambiguously present
+    (review F3). ANY metacharacter — a lone ``?``, an escaped ``\\*``, a class
+    ``[…]`` — makes the pattern a regex that keeps the conservative per-line cap,
+    so no adversarial construction can backtrack over an unbounded line (review
+    RF1)."""
+    source = pattern.pattern
+    if any(ch in _REGEX_METACHARACTERS for ch in source):
+        return None
+    return source
+
+
+def _line_matches(pattern: re.Pattern[str], literal: str | None, text: str) -> bool:
+    """Whether ``text`` matches, honoring the RF1 long-line bound.
+
+    Within the cap the full regex runs (bounded input → bounded backtracking).
+    Beyond the cap a pure literal is matched by plain substring containment
+    (``literal is not None``); any other pattern does NOT search the over-long
+    line (the regex engine is never handed an unbounded input), so it reports no
+    match there — the conservative pre-F3 per-line cap."""
+    if len(text) <= _MAX_REGEX_LINE_CHARS:
+        return pattern.search(text) is not None
+    if literal is not None:
+        return literal in text
+    return False
+
+
 def _select_matching_with_context(
     windowed: list[tuple[int, str]],
     pattern: re.Pattern[str],
@@ -450,13 +497,20 @@ def _select_matching_with_context(
     range filter is a hard boundary the context cannot leak past — the two
     filters compose without one silently overriding the other.
     """
-    # SEC-2 input bound: a line longer than the cap is skipped from matching
-    # (conservative "no match") so an adversarial pattern cannot backtrack over
-    # an unbounded line. Realistic content lines are far shorter than the cap.
+    # SEC-2 / RF1 input bound. A line within the cap is matched by the regex
+    # engine (bounded input → bounded backtracking). A line LONGER than the cap
+    # is searched ONLY when the pattern is a pure literal, and then by plain
+    # substring containment — linear in the line length, no regex engine, so no
+    # backtracking is possible however long the line is. A non-literal (regex)
+    # pattern keeps the conservative per-line cap on a long line, so an
+    # adversarial pattern can never backtrack over an unbounded line. This still
+    # finds a literal needle inside a single giant single-line blob — a
+    # minified-JSON crash report stored as ONE line — which is the case review F3
+    # fixed. Realistic multi-line content is unaffected: its lines are far
+    # shorter than the cap and always searched.
+    literal = _pattern_literal_text(pattern)
     match_indices = [
-        idx
-        for idx, (_num, text) in enumerate(windowed)
-        if len(text) <= _MAX_REGEX_LINE_CHARS and pattern.search(text)
+        idx for idx, (_num, text) in enumerate(windowed) if _line_matches(pattern, literal, text)
     ]
     if not match_indices:
         return []

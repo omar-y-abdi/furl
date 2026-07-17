@@ -119,9 +119,10 @@ def test_dominant_array_summary_answers_aggregate_and_anomaly():
     assert result.strategy_used == CompressionStrategy.CCR_OFFLOAD
     summary = _summary_of(result.compressed)
 
-    # Names the dominant array + the object's OTHER keys.
+    # Names the dominant array + keeps the object's OTHER fields WITH values
+    # (review F2), not just their names.
     assert summary["array"] == "events"
-    assert summary["other_keys"] == ["metadata"]
+    assert summary["other_fields"] == {"metadata": {"source": "synthetic", "version": 3}}
     assert summary["count"] == 907
 
     # AGGREGATE: the per-name histogram is inline and directly answers the
@@ -148,6 +149,95 @@ def test_dominant_array_summary_answers_aggregate_and_anomaly():
 
     # Bounded output regardless of row count.
     assert len(result.compressed) < 8192
+
+
+def test_dominant_array_sibling_scalar_values_survive_review_f2():
+    """Review F2: a crash-report-shaped object — one dominant array (the stack
+    ``frames``) plus small scalar/nested sibling fields (``exception``,
+    ``termination``, ``faultingThread``) — keeps the sibling VALUES in the
+    preview, not just the key names. The exception type/signal is the single
+    most important fact in a crash report; pre-fix it was reduced to a bare key
+    name under ``other_keys`` and was invisible in the compressed view."""
+    crash = {
+        "exception": {
+            "type": "EXC_BAD_ACCESS",
+            "signal": "SIGSEGV",
+            "codes": "KERN_INVALID_ADDRESS at 0x18",
+        },
+        "termination": {"namespace": "SIGNAL", "indicator": "Segmentation fault: 11"},
+        "faultingThread": 9,
+        "frames": [
+            {"imageIndex": i % 5, "symbol": f"frame_{i}", "imageOffset": 4096 + i}
+            for i in range(300)
+        ],
+    }
+    result = _offload_router().compress(json.dumps(crash, ensure_ascii=False))
+
+    assert result.strategy_used == CompressionStrategy.CCR_OFFLOAD
+    summary = _summary_of(result.compressed)
+    assert summary["array"] == "frames"
+
+    other = summary["other_fields"]
+    assert other["exception"] == {
+        "type": "EXC_BAD_ACCESS",
+        "signal": "SIGSEGV",
+        "codes": "KERN_INVALID_ADDRESS at 0x18",
+    }
+    assert other["termination"]["indicator"] == "Segmentation fault: 11"
+    assert other["faultingThread"] == 9
+    # The crash reason is literally present in the compressed bytes now.
+    assert "EXC_BAD_ACCESS" in result.compressed
+    assert "SIGSEGV" in result.compressed
+
+
+def test_large_sibling_array_is_elided_not_inlined_review_f2():
+    """Review F2 bound: a LARGE sibling value (a 500-element array) is exactly
+    the kind of structure that SHOULD stay offloaded — it is elided to a bounded
+    ``[… in CCR]`` note while the tiny scalar sibling is kept, so the preview
+    never re-inlines a big structure and stays a few KB."""
+    payload = {
+        "run": "run-42",  # scalar sibling: kept verbatim
+        "big_side_array": list(range(500)),  # large sibling (non-dict list): elided
+        "events": [{"kind": "tick", "n": i} for i in range(400)],  # dominant array
+    }
+    result = _offload_router().compress(json.dumps(payload, ensure_ascii=False))
+    summary = _summary_of(result.compressed)
+
+    assert summary["array"] == "events"
+    other = summary["other_fields"]
+    assert other["run"] == "run-42"
+    assert isinstance(other["big_side_array"], str)
+    assert "in CCR" in other["big_side_array"]
+    assert len(result.compressed) < 8192
+
+
+def test_sibling_fields_preview_bounded_by_construction_review_rf4():
+    """Review RF4: the sibling preview is hard-bounded, not soft-checked. 200
+    sizeable scalar siblings serialized to ~22 KB under the old scalar-only
+    fallback (scalars passed through verbatim), and the top-level key count was
+    never capped. Both are now bounded by construction — the serialized blob
+    stays within _SIBLING_FIELDS_MAX_CHARS and the kept-key count within
+    _SIBLING_MAX_KEYS — with an explicit _more_keys note for the elided rest."""
+    from furl_ctx.transforms.router_engine import (
+        _SIBLING_FIELDS_MAX_CHARS,
+        _SIBLING_MAX_KEYS,
+        ContentCompressionEngine,
+    )
+
+    # Sizeable scalars: the accumulated-length budget bounds the blob.
+    big = {f"k{i}": ("x" * 100) for i in range(200)}
+    out_big = ContentCompressionEngine._compact_sibling_fields(big)
+    assert len(json.dumps(out_big, ensure_ascii=False, default=str)) <= _SIBLING_FIELDS_MAX_CHARS, (
+        "sibling preview exceeded the char cap"
+    )
+    assert "_more_keys" in out_big
+
+    # Many tiny scalars: the top-level key cap bounds the key count even when the
+    # bytes alone would have fit.
+    tiny = {f"k{i}": f"v{i}" for i in range(200)}
+    out_tiny = ContentCompressionEngine._compact_sibling_fields(tiny)
+    assert len([k for k in out_tiny if k != "_more_keys"]) <= _SIBLING_MAX_KEYS
+    assert "_more_keys" in out_tiny
 
 
 def test_examples_surface_notable_values_and_cap_at_top_values():
@@ -251,14 +341,14 @@ def test_summarize_rows_never_raises_on_direct_pathological_input():
         mixed_hashability,  # scalar values + unhashable value in one field
     ]
     for rows in pathological:
-        out, n = engine._summarize_rows(rows, key=None, other_keys=[])
+        out, n = engine._summarize_rows(rows, key=None, other_fields={})
         assert isinstance(out, list) and len(out) == 1
         assert "_ccr_summary" in out[0]
         assert n == len(rows)
 
     # For the mixed-hashability case, the scalar values are surfaced as examples
     # and no unhashable-valued row leaks in.
-    summary = engine._summarize_rows(mixed_hashability, key=None, other_keys=[])[0][0][
+    summary = engine._summarize_rows(mixed_hashability, key=None, other_fields={})[0][0][
         "_ccr_summary"
     ]
     example_kinds = [r.get("kind") for r in summary["examples"]["by_value"].values()]
@@ -278,9 +368,9 @@ def test_top_level_array_is_summarized():
     assert result.strategy_used == CompressionStrategy.CCR_OFFLOAD
     summary = _summary_of(result.compressed)
 
-    # Top-level array => no wrapping key, no other keys.
+    # Top-level array => no wrapping key, no sibling fields.
     assert summary["array"] is None
-    assert summary["other_keys"] == []
+    assert summary["other_fields"] == {}
     assert summary["count"] == 906
 
     # Aggregate + anomaly answerable inline.
