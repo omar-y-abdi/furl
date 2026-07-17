@@ -216,17 +216,53 @@ def test_apply_pattern_matches_substring_in_single_giant_line_review_f3() -> Non
         assert out.total_count == 1
 
 
-def test_apply_pattern_with_quantifier_over_long_line_stays_capped_review_f3() -> None:
-    # Review F3 bound: ONLY a backtracking-bounded pattern (no unbounded
-    # quantifier) bypasses the per-line cap. A pattern carrying '+' / '*' / '{'
-    # keeps the conservative cap on an over-long line — even when its target is
-    # present — so there is no new ReDoS surface, and it returns immediately.
-    long_line = "b" * 20_000 + "END"
-    spec = RetrieveFilters.parse({"pattern": "b+END"})
+def test_apply_regex_metachar_pattern_over_long_line_stays_capped_review_rf1() -> None:
+    # Review RF1: ONLY a pure LITERAL bypasses the per-line cap. A pattern
+    # carrying any regex metacharacter (here '.') is a regex, so on a line longer
+    # than the cap it is NOT searched and reports zero matches even though its
+    # target is present. The same regex on a SHORT line DOES match, proving the
+    # zero is the long-line cap at work, not a malformed pattern. Pre-fix the
+    # quantifier heuristic cleared '.' (it carries no '* + {') and ran it on the
+    # giant line, returning a match — the behavior RF1 removes; this asserts 0.
+    needle = "EXC_BAD_ACCESS"
+    blob = '{"exception":{"type":"' + needle + '"},"frames":['
+    blob += ",".join(f'{{"sym":"frame_{i}","off":{i}}}' for i in range(2000))
+    blob += "]}"
+    assert "\n" not in blob and len(blob) > 10_000
+    regex = "EXC.BAD.ACCESS"  # the '.' metacharacters match the underscores
+
+    spec = RetrieveFilters.parse({"pattern": regex})
     assert isinstance(spec, RetrieveFilters)
+    out = apply_filters(blob, spec)
+    assert isinstance(out, FilteredContent)
+    assert out.matched_count == 0, "a regex must not search a line beyond the cap"
+
+    # Control: the very same regex matches on a short line, so the zero above is
+    # purely the long-line cap, not the pattern failing to match.
+    short = RetrieveFilters.parse({"pattern": regex})
+    assert isinstance(short, RetrieveFilters)
+    out_short = apply_filters(needle, short)
+    assert isinstance(out_short, FilteredContent)
+    assert out_short.matched_count == 1
+
+
+def test_apply_optional_heavy_pattern_over_long_line_returns_fast_review_rf1() -> None:
+    # Review RF1: a '?'-heavy pattern backtracks exponentially yet carries no
+    # '* + {', so the retired quantifier heuristic cleared it and ran it on the
+    # giant line, hanging for tens of seconds. As a regex ('.' and '?' are
+    # metacharacters) it is now confined to the per-line cap: the over-long line
+    # is skipped and the call returns immediately with no match.
+    long_line = "a" * 10_050  # > _MAX_REGEX_LINE_CHARS (10_000); no "END" present
+    assert len(long_line) > 10_000
+    pattern = ".?" * 21 + "." * 21 + "END"
+    spec = RetrieveFilters.parse({"pattern": pattern})
+    assert isinstance(spec, RetrieveFilters)
+
     start = time.monotonic()
     out = apply_filters(long_line, spec)
-    assert time.monotonic() - start < _REDOS_DEADLINE_S
+    elapsed = time.monotonic() - start
+
+    assert elapsed < 2.0, f"pattern hung on the over-long line ({elapsed:.1f}s)"
     assert isinstance(out, FilteredContent)
     assert out.matched_count == 0
 

@@ -144,6 +144,11 @@ _SIBLING_MAX_DEPTH = 4
 _SIBLING_MAX_KEYS = 40
 _SIBLING_MAX_LIST = 10
 _SIBLING_FIELDS_MAX_CHARS = 4000
+# Bytes held back from the char budget while accumulating (review RF4) so the
+# trailing ``_more_keys`` note fits under _SIBLING_FIELDS_MAX_CHARS even in the
+# worst case (a large omitted-count integer). Comfortably above the note's
+# longest serialized form.
+_SIBLING_MORE_KEYS_RESERVE = 64
 
 # Slice guidance carried inside the ``_ccr_summary`` preview: tells the agent how
 # to fetch a NARROW slice of the offloaded rows instead of the whole array back
@@ -754,18 +759,39 @@ class ContentCompressionEngine:
     @classmethod
     def _compact_sibling_fields(cls, fields: dict[str, Any]) -> dict[str, Any]:
         """Bounded ``{key: value}`` preview of a dominant-array object's sibling
-        fields (review F2). Keeps scalar values verbatim — they are tiny and
-        usually the most important fact — and small nested objects to a bounded
-        depth so their scalar leaves survive; large arrays / deep objects are
-        elided. Falls back to scalar-only (every non-scalar sibling elided) when
-        the compacted blob would still exceed _SIBLING_FIELDS_MAX_CHARS, so the
-        preview is always a few KB. Recovery is the byte-exact stored original."""
+        fields (review F2 / RF4). Keeps scalar values verbatim — they are tiny
+        and usually the most important fact — and small nested objects to a
+        bounded depth so their scalar leaves survive; large arrays / deep objects
+        are elided.
+
+        Bounded BY CONSTRUCTION, not by a soft after-check: the top-level key
+        count is capped at _SIBLING_MAX_KEYS (the per-dict cap never applied to
+        the sibling keys themselves) AND the running serialized length is
+        accumulated as each key is added, eliding the remainder under a
+        ``_more_keys`` note the moment another key would exceed
+        _SIBLING_FIELDS_MAX_CHARS. The serialized result therefore never exceeds
+        that cap however many or however large the siblings are — the previous
+        scalar-only fallback still returned every scalar verbatim and could run
+        to tens of KB. Recovery is the byte-exact stored original."""
         import json
 
-        compact = {k: cls._compact_sibling(v, _SIBLING_MAX_DEPTH) for k, v in fields.items()}
-        if len(json.dumps(compact, ensure_ascii=False, default=str)) > _SIBLING_FIELDS_MAX_CHARS:
-            return {k: cls._compact_sibling(v, 0) for k, v in fields.items()}
-        return compact
+        out: dict[str, Any] = {}
+        kept = 0
+        total = len(fields)
+        for key, value in fields.items():
+            if kept >= _SIBLING_MAX_KEYS:
+                break
+            candidate = {**out, str(key): cls._compact_sibling(value, _SIBLING_MAX_DEPTH)}
+            serialized = json.dumps(candidate, ensure_ascii=False, default=str)
+            # Stop before the blob would exceed the cap; the reserve leaves room
+            # for the trailing _more_keys note so the FINAL result stays under it.
+            if len(serialized) > _SIBLING_FIELDS_MAX_CHARS - _SIBLING_MORE_KEYS_RESERVE:
+                break
+            out = candidate
+            kept += 1
+        if kept < total:
+            out["_more_keys"] = f"[{total - kept} more, in CCR]"
+        return out
 
     @staticmethod
     def _dominant_array(parsed: Any) -> tuple[str, list[dict[str, Any]], dict[str, Any]] | None:

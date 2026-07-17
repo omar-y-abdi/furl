@@ -211,6 +211,35 @@ def test_large_sibling_array_is_elided_not_inlined_review_f2():
     assert len(result.compressed) < 8192
 
 
+def test_sibling_fields_preview_bounded_by_construction_review_rf4():
+    """Review RF4: the sibling preview is hard-bounded, not soft-checked. 200
+    sizeable scalar siblings serialized to ~22 KB under the old scalar-only
+    fallback (scalars passed through verbatim), and the top-level key count was
+    never capped. Both are now bounded by construction — the serialized blob
+    stays within _SIBLING_FIELDS_MAX_CHARS and the kept-key count within
+    _SIBLING_MAX_KEYS — with an explicit _more_keys note for the elided rest."""
+    from furl_ctx.transforms.router_engine import (
+        _SIBLING_FIELDS_MAX_CHARS,
+        _SIBLING_MAX_KEYS,
+        ContentCompressionEngine,
+    )
+
+    # Sizeable scalars: the accumulated-length budget bounds the blob.
+    big = {f"k{i}": ("x" * 100) for i in range(200)}
+    out_big = ContentCompressionEngine._compact_sibling_fields(big)
+    assert len(json.dumps(out_big, ensure_ascii=False, default=str)) <= _SIBLING_FIELDS_MAX_CHARS, (
+        "sibling preview exceeded the char cap"
+    )
+    assert "_more_keys" in out_big
+
+    # Many tiny scalars: the top-level key cap bounds the key count even when the
+    # bytes alone would have fit.
+    tiny = {f"k{i}": f"v{i}" for i in range(200)}
+    out_tiny = ContentCompressionEngine._compact_sibling_fields(tiny)
+    assert len([k for k in out_tiny if k != "_more_keys"]) <= _SIBLING_MAX_KEYS
+    assert "_more_keys" in out_tiny
+
+
 def test_examples_surface_notable_values_and_cap_at_top_values():
     """The improvement over rarest-first selection: an infrequent-but-notable
     value (a mid-frequency event type) is surfaced by name, NOT crowded out by a

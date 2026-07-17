@@ -199,5 +199,15 @@ def test_note_explains_distinct_embedded_marker_hash_review_f6() -> None:
         assert "<<ccr:" in note
         assert "whole-content hash=" in note
         assert embedded[0] in note  # the actual differing hash is named
+
+        # review F6 (round 2): the granular-marker note is plain user-facing
+        # copy. Fragment markers stored under their own keys resolve against the
+        # same underlying source document (not one shared "stored original"), and
+        # the copy carries no em-dashes, en-dashes, or parentheses.
+        assert "underlying source document" in note
+        assert "same stored original" not in note
+        granular = note[note.index("The compressed view also embeds") :]
+        assert "—" not in granular and "–" not in granular, "no em/en dashes in the note"
+        assert "(" not in granular and ")" not in granular, "no parentheses in the note"
     finally:
         reset_compression_store()
