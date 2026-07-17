@@ -258,6 +258,63 @@ class TestReinjectUnit:
 
 
 # ==========================================================================
+# UNIT — Finding 1 gate predicate (_redaction_changed_visible_output)
+# The non-compressing paths (below-min-chars / no-savings) must emit a scrubbed
+# mirror when redaction changed ANY model-visible field — not only the extracted
+# one — or a secret in a preserved Bash stderr leaks through on passthrough.
+# ==========================================================================
+
+
+class TestRedactionChangedVisibleOutput:
+    def test_stderr_only_secret_detected_when_stdout_is_clean(self, monkeypatch) -> None:
+        """The leak: a clean stdout is the extracted field, so `redacted == text`,
+        yet a secret sits in the preserved stderr. The predicate must still report a
+        change so the gate emits the scrubbed mirror."""
+        monkeypatch.setenv("FURL_REDACT_BUILTINS", "0")
+        monkeypatch.setenv("FURL_REDACT_PATTERNS", r"SECRET-\d+")
+        resp = bash_response("all fine here", "auth token SECRET-99999 leaked")
+        text = hook._extract_text(resp)
+        assert text == "all fine here"  # stdout is the extracted field
+        redacted = hook._apply_env_redaction(text)
+        assert redacted == text  # the extracted field itself is clean
+        assert hook._redaction_changed_visible_output(resp, text, redacted) is True
+
+    def test_all_clean_is_no_change_even_with_patterns_set(self, monkeypatch) -> None:
+        """Nothing matches -> no change -> caller keeps a byte-identical passthrough."""
+        monkeypatch.setenv("FURL_REDACT_BUILTINS", "0")
+        monkeypatch.setenv("FURL_REDACT_PATTERNS", r"SECRET-\d+")
+        resp = bash_response("all fine here", "nothing to see")
+        text = hook._extract_text(resp)
+        redacted = hook._apply_env_redaction(text)
+        assert hook._redaction_changed_visible_output(resp, text, redacted) is False
+
+    def test_secret_in_extracted_stdout_detected(self, monkeypatch) -> None:
+        monkeypatch.setenv("FURL_REDACT_BUILTINS", "0")
+        monkeypatch.setenv("FURL_REDACT_PATTERNS", r"SECRET-\d+")
+        resp = bash_response("token SECRET-1 here", "clean stderr")
+        text = hook._extract_text(resp)
+        redacted = hook._apply_env_redaction(text)
+        assert redacted != text
+        assert hook._redaction_changed_visible_output(resp, text, redacted) is True
+
+    def test_list_canonicalization_is_not_reported_as_a_change(self, monkeypatch) -> None:
+        """Why the predicate is field-aware and not a plain
+        ``_reinject(...) != tool_response``: with NO redaction configured,
+        ``_reinject`` still canonicalizes a multi-block list to a single block, so a
+        mirror-compare gate would FALSELY emit and collapse the blocks. The
+        field-aware predicate reports "nothing redacted" and the caller keeps a true
+        passthrough — the binding 'zero change when nothing was redacted' contract."""
+        monkeypatch.setenv("FURL_REDACT_BUILTINS", "0")
+        monkeypatch.delenv("FURL_REDACT_PATTERNS", raising=False)
+        resp = [{"type": "text", "text": "a"}, {"type": "text", "text": "b"}]
+        text = hook._extract_text(resp)
+        redacted = hook._apply_env_redaction(text)
+        assert redacted == text
+        assert hook._reinject(resp, redacted) != resp  # mirror DOES differ (canonicalized)
+        assert hook._redaction_changed_visible_output(resp, text, redacted) is False
+
+
+# ==========================================================================
 # PROPERTY — extract/reinject duality + schema preservation
 # ==========================================================================
 
@@ -449,6 +506,31 @@ class TestHookProcessIntegration:
         assert_passes_bash_zod_replica(out)
         assert "SECRET-123" not in out["stderr"]
         assert "leaked" in out["stderr"], "non-secret stderr text must survive redaction"
+
+    def test_stderr_only_secret_scrubbed_on_below_min_chars_passthrough(self) -> None:
+        """Finding 1, side 1 — the leak the emit-path scrub did NOT cover: a clean
+        small stdout is below the compression threshold, so the output was passed
+        through untouched while a secret sat in the preserved stderr. The gate now
+        emits the fully scrubbed mirror instead of passing the raw secret through."""
+        result, _ = run_hook(
+            payload("Bash", bash_response("all fine here", "auth token SECRET-99999 leaked")),
+            env_extra={"FURL_REDACT_BUILTINS": "0", "FURL_REDACT_PATTERNS": r"SECRET-\d+"},
+        )
+        out = updated_output(result)  # an emission, not a passthrough
+        assert_passes_bash_zod_replica(out)
+        assert out["stdout"] == "all fine here"  # the clean extracted field rides through
+        assert "SECRET-99999" not in json.dumps(out), "no raw secret anywhere in the emission"
+        assert "[REDACTED:" in out["stderr"], "the preserved stderr is scrubbed in place"
+
+    def test_clean_small_output_stays_true_passthrough_with_patterns_set(self) -> None:
+        """Finding 1, side 2 — zero behavior change in the common clean case: with
+        redaction patterns configured but nothing matching, the hook must still emit
+        NOTHING (updatedToolOutput absent), a byte-identical passthrough."""
+        result, _ = run_hook(
+            payload("Bash", bash_response("all fine here", "nothing secret here")),
+            env_extra={"FURL_REDACT_BUILTINS": "0", "FURL_REDACT_PATTERNS": r"SECRET-\d+"},
+        )
+        assert result is None
 
 
 # ==========================================================================

@@ -431,6 +431,37 @@ def _apply_env_redaction(text: str) -> str:
         return text
 
 
+def _redaction_changed_visible_output(tool_response: Any, text: str, redacted: str) -> bool:
+    """True iff redaction changed a field the model would see on a NON-compressing
+    passthrough (below-min-chars / no-savings), so the gate must emit the scrubbed
+    mirror instead of passing the original through.
+
+    ``redacted != text`` covers the EXTRACTED field. The Bash preserved field
+    (``stderr``) needs its own check: ``_extract_text`` reads only ``stdout`` when
+    ``stdout`` is non-empty, so a clean small ``stdout`` hid a secret in ``stderr``
+    that the old extracted-field-only gate passed straight through — the emit path
+    scrubs that ``stderr`` (``_reinject``) but the passthrough paths never did
+    (review Finding 1).
+
+    Field-aware on purpose: a plain ``_reinject(...) != tool_response`` gate would
+    also fire when ``_reinject`` merely CANONICALIZES a multi-block list / content
+    wrapper with NO redaction at all, breaking "zero change when nothing was
+    redacted". Non-Bash shapes carry no second independent text field, so the
+    extracted-field check governs them alone. Total and fail-open:
+    ``_apply_env_redaction`` never raises, so neither does this."""
+    if redacted != text:
+        return True
+    if isinstance(tool_response, dict):
+        stdout = tool_response.get("stdout")
+        stderr = tool_response.get("stderr")
+        # Only when stdout is the extracted field (non-empty) is stderr the
+        # *preserved* one; an stderr-only output extracts stderr itself and is
+        # already covered by ``redacted != text`` above.
+        if isinstance(stdout, str) and stdout and isinstance(stderr, str) and stderr:
+            return _apply_env_redaction(stderr) != stderr
+    return False
+
+
 def _emit(tool_response: Any, output_text: str, *, compressed: bool) -> NoReturn:
     """Replace the model-visible tool output with *output_text* and exit 0.
 
@@ -543,9 +574,11 @@ def main() -> None:
 
     # --- size gate ---
     if len(redacted) < _min_chars():
-        # Below the compression threshold. If redaction changed the bytes, still
-        # emit the scrubbed form so the secret never reaches the model.
-        if redacted != text:
+        # Below the compression threshold. If redaction changed ANY model-visible
+        # field — the extracted one OR a preserved Bash stderr — emit the fully
+        # scrubbed mirror so no secret reaches the model (review Finding 1);
+        # otherwise keep a byte-identical passthrough.
+        if _redaction_changed_visible_output(tool_response, text, redacted):
             _emit(tool_response, redacted, compressed=False)
         _passthrough("below-min-chars")
 
@@ -556,9 +589,11 @@ def main() -> None:
     tool_label = tool_name if isinstance(tool_name, str) and tool_name else None
     compressed, compress_fail_reason = _compress_text(redacted, tool_label)
     if compressed is None:
-        # Compression did not help. Emit the redacted text if it changed;
-        # otherwise leave the original untouched (byte-identical passthrough).
-        if redacted != text:
+        # Compression did not help. Emit the fully scrubbed mirror if redaction
+        # changed any model-visible field (extracted OR a preserved Bash stderr —
+        # review Finding 1); otherwise leave the original untouched (byte-identical
+        # passthrough).
+        if _redaction_changed_visible_output(tool_response, text, redacted):
             _emit(tool_response, redacted, compressed=False)
         _passthrough(compress_fail_reason or "no-savings")
 

@@ -4,11 +4,15 @@ Both the PostToolUse compression hook and the on-by-default PreToolUse pipe comp
 tally their activity into the SAME durable per-project CCR store the MCP server
 reads, so ``furl_stats`` surfaces cross-process hook activity even though each
 hook is a short-lived subprocess. Counters are cumulative and monotonic (they
-survive entry eviction/expiry), so the key diagnostic stays legible:
+survive entry eviction/expiry), so the key diagnostic stays legible. The
+PostToolUse hook now MIRRORS each tool's output shape (the #68951 fix), so
+current hosts honor the replacement — these counters exist to catch any FUTURE
+regression:
 
-    invocations rising while your context still shows raw tool output
-    → Claude Code is dropping the hook's replacement output
-      (anthropics/claude-code#68951)
+    invocations climbing while compressions stay flat AND your context still
+    shows raw tool output
+    → a mirrored replacement is being dropped again (an output-shape
+      regression of the anthropics/claude-code#68951 class)
 
 Everything here is BEST-EFFORT and FAIL-OPEN: a counter problem (furl_ctx
 unavailable, store degraded, sqlite lock lost) is a silent no-op and never
@@ -36,9 +40,10 @@ PIPE_NOOP_PREFIX = "pipe_noop:"
 # the FIRST durably-recorded PostToolUse invocation per project store. Gated so
 # it fires once, not on every tool call — see ``emit_first_run_note_if_first``.
 FIRST_RUN_NOTE = (
-    "furl: note — Claude Code >=2.1.163 may ignore replacement output "
-    "(anthropics/claude-code#68951); the PreToolUse pipe is active by default for "
-    "real savings (FURL_PRETOOL_PIPE=0 to disable); see furl_stats counters"
+    "furl: note — PostToolUse output compression is active and now mirrors each "
+    "tool's output shape, so Claude Code >=2.1.163 honors the replacement "
+    "(anthropics/claude-code#68951 fix); the PreToolUse pipe also runs by default "
+    "(FURL_PRETOOL_PIPE=0 to disable); see furl_stats counters"
 )
 
 
