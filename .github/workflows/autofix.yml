@@ -44,14 +44,17 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           # Check out the branch (not the detached merge ref) so a commit lands
-          # on it and can be pushed back. fetch-depth 2 gives HEAD plus its
-          # parent. persist-credentials (default true) stores the token below in
-          # git config so the push authenticates with it.
+          # on it and can be pushed back. fetch-depth 2 gives HEAD plus its parent.
           ref: ${{ github.event.pull_request.head.ref }}
           fetch-depth: 2
-          # Use the PAT when present so a pushed fix RE-TRIGGERS CI (a push with
-          # the default GITHUB_TOKEN does not start new workflow runs, which
-          # would strand the PR on never-concluding checks). Falls back to the
+          # Do NOT leave the token in .git/config: the formatters run on PR content
+          # right after checkout, and a persisted PAT would sit in the config that
+          # whole time. The push step below re-adds auth via an explicit remote URL
+          # only at the moment it pushes.
+          persist-credentials: false
+          # The PAT (when present) still authenticates the initial fetch here, and
+          # a later PAT push RE-TRIGGERS CI (a default-GITHUB_TOKEN push does not,
+          # which would strand the PR on never-concluding checks). Falls back to the
           # default token when the secret is absent (degraded patch-only mode).
           token: ${{ secrets.AUTOFIX_TOKEN || github.token }}
 
@@ -136,12 +139,24 @@ jobs:
           steps.token.outputs.present == 'true'
         env:
           # head.ref is untrusted PR data; pass it via env, never interpolate it
-          # into the script body.
+          # into the script body. AUTOFIX_TOKEN is mapped so the push can build an
+          # authenticated remote URL without the token being persisted at checkout.
           HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          AUTOFIX_TOKEN: ${{ secrets.AUTOFIX_TOKEN }}
         run: |
+          # Backstop: never build a remote URL with an empty token. The step `if:`
+          # already requires the token be present; this guards against any regression.
+          if [ -z "$AUTOFIX_TOKEN" ]; then
+            echo "AUTOFIX_TOKEN is empty in the push step; refusing to push." >&2
+            exit 1
+          fi
           git config user.name "furl-autofix"
           git config user.email "furl-autofix@users.noreply.github.com"
           git commit --all --message "ci: autofix formatting and lint"
+          # Scope the PAT to this push only: credentials were not persisted at
+          # checkout, so set the authenticated remote right before pushing. The
+          # token is never echoed, and git does not print the remote URL on push.
+          git remote set-url origin "https://x-access-token:${AUTOFIX_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
           git push origin "HEAD:${HEAD_REF}"
 
       - name: Build patch
