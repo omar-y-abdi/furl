@@ -157,6 +157,17 @@ def test_changes_job_declares_code_output() -> None:
         f"seconds on docs/config-only PRs. Present jobs: {sorted(jobs)}."
     )
     changes = _required_job(jobs, _CHANGES_JOB)
+    # The gate itself must ALWAYS run: a job-level `if:` on `changes` that skips
+    # (on a non-PR event, or under any condition false on a PR) cascade-skips every
+    # required job that lists `needs: changes` without `if: always()`, so the required
+    # contexts never conclude — the same #15/#32/#56 deadlock, one level up. Condition
+    # at the step level, never on this job.
+    assert "if" not in changes, (
+        f"the {_CHANGES_JOB!r} gate job has a job-level `if:` key. If it skips, every "
+        f"required job that depends on it cascade-skips and its required status check "
+        "never concludes — re-opening the #15/#32/#56 deadlock from the gate. The gate "
+        "must always run; keep any conditioning at the step level."
+    )
     outputs = changes.get("outputs")
     declared = sorted(outputs) if isinstance(outputs, dict) else outputs
     assert isinstance(outputs, dict) and _CHANGES_OUTPUT in outputs, (
