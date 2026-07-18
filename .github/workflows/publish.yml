@@ -42,7 +42,7 @@ jobs:
 
       - name: Install build tools
         run: |
-          python -m pip install --upgrade pip 'maturin>=1.5,<2.0' cyclonedx-bom
+          python -m pip install --upgrade pip 'maturin>=1.9,<2.0' cyclonedx-bom
 
       - name: Build wheel + sdist
         run: |
