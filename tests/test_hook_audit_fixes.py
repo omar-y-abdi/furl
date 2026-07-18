@@ -30,6 +30,8 @@ import tempfile
 import time
 from pathlib import Path
 
+import pytest
+
 _ROOT = Path(__file__).resolve().parents[1]
 _HOOKS = _ROOT / "plugins" / "furl" / "hooks"
 _HOOKS_JSON = _HOOKS / "hooks.json"
@@ -161,9 +163,44 @@ def test_faA1_strip_rescues_nonjson_prefix_within_capture() -> None:
 # --- F-A2: partial output survives a kill -----------------------------------------
 
 
+def _wait_for_descendant_sleep(pgid: int, argv_tail: str = "30", timeout: float = 5.0) -> None:
+    """Block until a ``sleep <argv_tail>`` process is running in *pgid*.
+
+    The rewritten script executes ``trap ...; trap ...; ( printf ...; sleep 30 )``
+    strictly in that order, so once ``sleep`` is observably running, both traps
+    are already installed. Polling for this beats a fixed pre-kill sleep: a
+    hardcoded delay has to outguess process fork/exec latency, and under heavy
+    parallel load (many concurrent pytest/cargo workers) that latency can eat
+    the whole margin, delivering the signal before the trap exists and losing
+    the very output the test is pinning (flaky, load-dependent failures with no
+    change in the code under test). Polling instead observes the actual
+    precondition, so the kill fires at the same logical point every time.
+    """
+    if not os.path.isdir("/proc"):
+        pytest.skip("readiness polling needs /proc (Linux-only)")
+    deadline = time.monotonic() + timeout
+    needle = f" {argv_tail}".encode()
+    while time.monotonic() < deadline:
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+            pid = int(entry)
+            try:
+                if os.getpgid(pid) != pgid:
+                    continue
+                argv = Path(f"/proc/{pid}/cmdline").read_bytes()
+            except (ProcessLookupError, FileNotFoundError, PermissionError):
+                continue
+            if argv.startswith(b"sleep\x00") and needle in argv.replace(b"\x00", b" "):
+                return
+        time.sleep(0.005)
+    raise TimeoutError(f"no 'sleep {argv_tail}' descendant appeared in pgid {pgid}")
+
+
 def _kill_midrun_stdout(script: str, sig: int = signal.SIGTERM) -> str:
-    """Run *script*, let it print + enter its sleep, signal the whole group, and
-    return whatever stdout was delivered."""
+    """Run *script*, wait until it has actually entered its sleep (so any trap
+    the script installs beforehand is guaranteed active), signal the whole
+    group, and return whatever stdout was delivered."""
     proc = subprocess.Popen(
         ["/bin/sh", "-c", script],
         stdout=subprocess.PIPE,
@@ -171,9 +208,10 @@ def _kill_midrun_stdout(script: str, sig: int = signal.SIGTERM) -> str:
         text=True,
         start_new_session=True,
     )
-    time.sleep(1.5)
+    pgid = os.getpgid(proc.pid)
+    _wait_for_descendant_sleep(pgid)
     try:
-        os.killpg(os.getpgid(proc.pid), sig)
+        os.killpg(pgid, sig)
     except ProcessLookupError:
         pass
     out, _ = proc.communicate(timeout=20)
