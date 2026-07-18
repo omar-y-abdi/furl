@@ -583,11 +583,33 @@ class TestUniqueLogRegressionGuards:
         """
         reset_compression_store()
         try:
-            # 40 identical heartbeats + 15 distinct rare long INFO lines.
+            # 40 identical heartbeats + 15 rare long INFO lines with DISTINCT
+            # word stems. Distinct stems (not a varying digit) matter: they do
+            # NOT collapse under template normalization, so they are kept as
+            # unique lines and INFLATE the compressed body past ratio 0.5.
+            # That is the exact bug region — pre-fix, ratio >= 0.5 suppressed
+            # the recovery marker even though lines were still dropped.
+            stems = [
+                "quokka",
+                "narwhal",
+                "axolotl",
+                "pangolin",
+                "capybara",
+                "meerkat",
+                "ocelot",
+                "tapir",
+                "wombat",
+                "lemur",
+                "gecko",
+                "ibis",
+                "manta",
+                "heron",
+                "civet",
+            ]
             lines = ["INFO: hb ping"] * 40
-            for i in range(15):
+            for s in stems:
                 lines.append(
-                    f"INFO: rare distinct diagnostic {i} with a long unique payload body here"
+                    f"INFO: subsystem {s} emitted an unexpected and fairly long diagnostic payload line"
                 )
             content = "\n".join(lines)
 
@@ -596,28 +618,46 @@ class TestUniqueLogRegressionGuards:
             )
             result = compressor.compress(content)
 
-            # Lines were dropped (repetitive collapse + unique cap 10 < 15).
+            # Body was inflated by kept unique lines, landing ABOVE the 0.5
+            # CCR threshold, yet lines were still dropped — the bug region.
+            assert result.unique_logs_kept > 0, "rare lines must be kept as unique"
+            assert result.compression_ratio > 0.5, (
+                "ratio must exceed the 0.5 CCR threshold so this exercises the "
+                "region where pre-fix code suppressed the recovery marker"
+            )
             assert result.compressed_line_count < result.original_line_count
-            # Fix 1: a recovery key exists and round-trips the FULL original,
-            # so every dropped line is recoverable (zero silent loss).
-            assert result.cache_key is not None, "dropped lines require a recovery key"
+            # Fix 1: despite ratio > 0.5, a recovery key is emitted because
+            # lines were dropped, and it round-trips the FULL original — zero
+            # silent loss. Pre-fix this returned None (silent loss).
+            assert result.cache_key is not None, (
+                "dropped lines require a recovery key even when ratio > 0.5"
+            )
             entry = get_compression_store().retrieve(result.cache_key)
             assert entry is not None, "cache_key must resolve in the store"
             assert entry.original_content == content
-            # Every rare line — including any dropped by the unique cap — is
-            # present in the recoverable original: nothing silently lost.
-            for i in range(15):
-                assert f"rare distinct diagnostic {i} " in entry.original_content
+            # Some rare lines are dropped from the visible output by the unique
+            # cap (10 < 15) yet remain recoverable: nothing silently lost.
+            dropped = [s for s in stems if s not in result.compressed]
+            assert dropped, "unique cap (10 < 15) must drop some rare lines"
+            for s in dropped:
+                assert s in entry.original_content
         finally:
             reset_compression_store()
 
     def test_colon_less_warnings_stay_distinct(self):
-        """Fix 2: distinct colon-less warnings differing only by a hex
-        address must NOT be collapsed by the shared dedupe normalizer."""
+        """Fix 2: distinct colon-less warnings differing only by variable
+        DIGITS must NOT be collapsed by the shared dedupe normalizer.
+
+        Digit-differing (not hex) inputs are the discriminating case: under
+        whole-line normalization (the reverted bug) `\\d+` templates 5/6/7 to
+        N and the three collapse to one, so only the first survives dedupe.
+        The correct normalizer keeps colon-less lines verbatim, so all three
+        survive.
+        """
         lines = [f"INFO connection tick {i % 4}" for i in range(60)]
-        lines[10] = "WARN heap corruption near 0xdeadbeef"
-        lines[20] = "WARN heap corruption near 0xcafef00d"
-        lines[30] = "WARN heap corruption near 0xba5eba11"
+        lines[10] = "WARN queue depth exceeded 5 items"
+        lines[20] = "WARN queue depth exceeded 6 items"
+        lines[30] = "WARN queue depth exceeded 7 items"
         content = "\n".join(lines)
 
         compressor = LogCompressor(
@@ -630,10 +670,10 @@ class TestUniqueLogRegressionGuards:
         )
         result = compressor.compress(content)
 
-        # All three distinct addresses survive (not collapsed to one).
-        assert "0xdeadbeef" in result.compressed
-        assert "0xcafef00d" in result.compressed
-        assert "0xba5eba11" in result.compressed
+        # All three distinct warnings survive (not collapsed to one template).
+        assert "exceeded 5 items" in result.compressed
+        assert "exceeded 6 items" in result.compressed
+        assert "exceeded 7 items" in result.compressed
 
     def test_python_unique_logs_kept_is_surfaced(self):
         """Fix 3: the Rust `unique_logs_kept` stat must reach the Python

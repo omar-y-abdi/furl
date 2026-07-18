@@ -1955,16 +1955,18 @@ mod tests {
     // ─── Fix 2: shared dedupe normalizer must stay unmutated ─────────────
 
     #[test]
-    fn colon_less_warnings_differing_only_by_address_stay_distinct() {
+    fn colon_less_warnings_differing_only_by_digits_stay_distinct() {
         // Re-applying the unique-log feature must NOT mutate the shared
         // `normalize_for_dedupe`: it keeps its `.unwrap_or(content.len())`
-        // split so colon-less warnings that differ only by variable data (a
-        // hex address) are NOT collapsed into one (fixed_in_3e5).
+        // split so colon-less warnings that differ only by variable DIGITS
+        // are NOT collapsed into one (fixed_in_3e5). Digit-differing inputs
+        // are the discriminating case: under whole-line normalization (the
+        // reverted bug) `\d+` templates 5/6/7 to N and all three collapse.
         let c = cmp();
         let warnings = vec![
-            LogLine::new(0, "WARN heap corruption near 0xdeadbeef"),
-            LogLine::new(1, "WARN heap corruption near 0xcafef00d"),
-            LogLine::new(2, "WARN heap corruption near 0xba5eba11"),
+            LogLine::new(0, "WARN queue depth exceeded 5 items"),
+            LogLine::new(1, "WARN queue depth exceeded 6 items"),
+            LogLine::new(2, "WARN queue depth exceeded 7 items"),
         ];
         let deduped = c.dedupe_similar(warnings);
         assert_eq!(
