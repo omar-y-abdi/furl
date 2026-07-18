@@ -8,9 +8,15 @@ name: Publish to PyPI (manual fallback)
 on:
   workflow_dispatch:
 
+# Least-privilege default floor; the publish job below overrides this with the
+# id-token + contents write it needs (a job-level block fully replaces this).
+permissions:
+  contents: read
+
 jobs:
   publish:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     environment: pypi
     permissions:
       id-token: write  # For trusted publishing
@@ -36,7 +42,7 @@ jobs:
 
       - name: Install build tools
         run: |
-          python -m pip install --upgrade pip 'maturin>=1.5,<2.0' cyclonedx-bom
+          python -m pip install --upgrade pip 'maturin>=1.9,<2.0' cyclonedx-bom
 
       - name: Build wheel + sdist
         run: |
