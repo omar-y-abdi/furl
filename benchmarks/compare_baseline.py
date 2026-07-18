@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -164,12 +165,20 @@ class ComparisonReport:
 
 
 def _as_number(value: object, source: str, field: str) -> float:
-    """Coerce a JSON number to float, rejecting bools and non-numbers."""
+    """Coerce a JSON number to float, rejecting bools, non-numbers, and non-finite values.
+
+    NaN and the infinities must be rejected at the boundary: every metric
+    comparison uses ``<`` / ``>``, and every ordering against NaN is False, so a
+    NaN retention or recall would slip through as OK and hide a real regression.
+    """
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise CompareInputError(
             f"{source}: field {field!r} must be a number, got {type(value).__name__}"
         )
-    return float(value)
+    number = float(value)
+    if not math.isfinite(number):
+        raise CompareInputError(f"{source}: field {field!r} must be a finite number, got {value!r}")
+    return number
 
 
 def _as_int(value: object, source: str, field: str) -> int:

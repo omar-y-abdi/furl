@@ -257,3 +257,31 @@ def test_cli_baseline_updated_note(tmp_path: Path, baseline_raw: dict[str, Any])
     )
     assert code == 0
     assert "Baseline was updated in this PR" in summary.read_text(encoding="utf-8")
+
+
+def test_cli_nan_retention_exit_two(
+    tmp_path: Path, baseline_raw: dict[str, Any], capsys: pytest.CaptureFixture[str]
+) -> None:
+    candidate_raw = _candidate(baseline_raw)
+    _dataset(candidate_raw, _TARGET)["information_retention"] = float("nan")
+    baseline_file = tmp_path / "base.json"
+    baseline_file.write_text(json.dumps(baseline_raw), encoding="utf-8")
+    candidate_file = tmp_path / "cand.json"
+    candidate_file.write_text(json.dumps(candidate_raw), encoding="utf-8")
+    code = main(["--baseline", str(baseline_file), "--candidate", str(candidate_file)])
+    assert code == 2
+    assert "finite" in capsys.readouterr().err
+
+
+def test_cli_infinity_recall_exit_two(
+    tmp_path: Path, baseline_raw: dict[str, Any], capsys: pytest.CaptureFixture[str]
+) -> None:
+    candidate_raw = _candidate(baseline_raw)
+    candidate_raw["needle_recall"]["overall_output_or_ccr"] = float("inf")
+    baseline_file = tmp_path / "base.json"
+    baseline_file.write_text(json.dumps(baseline_raw), encoding="utf-8")
+    candidate_file = tmp_path / "cand.json"
+    candidate_file.write_text(json.dumps(candidate_raw), encoding="utf-8")
+    code = main(["--baseline", str(baseline_file), "--candidate", str(candidate_file)])
+    assert code == 2
+    assert "finite" in capsys.readouterr().err
