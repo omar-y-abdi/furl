@@ -74,14 +74,15 @@ jobs:
           - os: macos-14
             target: aarch64-apple-darwin
             maturin-target: aarch64-apple-darwin
-        # macOS x86_64 (Intel) is NOT in this matrix.
-        # `fastembed` → `ort` → `ort-sys` does not publish prebuilt ONNX
-        # Runtime binaries for `x86_64-apple-darwin`; building from source
-        # in CI is a multi-hour cmake job. Apple Silicon has been the
-        # default macOS target since 2020 and is sufficient for the wheels
-        # we ship. If a customer needs Intel macOS, build from source
-        # locally (the toolchain works; only prebuilt distribution skips
-        # this target).
+        # macOS x86_64 (Intel) is intentionally NOT in this matrix — but the
+        # historical blocker is gone: the ML-backend excision removed
+        # `fastembed` → `ort` → `ort-sys` (and its missing prebuilt ONNX
+        # Runtime for `x86_64-apple-darwin`) from the dependency graph, so
+        # Intel macOS wheels are now built AND smoke-tested in release.yml's
+        # release/dispatch matrix. This weekly drift job deliberately covers
+        # only the two primary targets (Linux x86_64 + Apple Silicon) to
+        # bound recurring cron cost; the full cross-platform wheel gate lives
+        # in release.yml.
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6

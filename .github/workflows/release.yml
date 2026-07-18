@@ -65,9 +65,15 @@ concurrency:
   group: release-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.ref_name }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+# Default-deny floor: any future-added job that omits its own permissions
+# block inherits nothing, not the repo-default token scope. Existing jobs
+# are unaffected — each declares its own least-privilege permissions below.
+permissions: {}
+
 jobs:
   detect-version:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     permissions:
       contents: read
     outputs:
@@ -126,7 +132,7 @@ jobs:
       - name: Compute semantic version from canonical + release history
         id: ver
         run: |
-          python scripts/release_version.py
+          python3 scripts/release_version.py
         env:
           MANUAL_VER: ${{ steps.manualver.outputs.value }}
 
@@ -163,6 +169,7 @@ jobs:
         # the Intel blocker is gone (Q15).
         include: ${{ github.event_name == 'pull_request' && fromJSON('[{"os":"ubuntu-24.04","target":"x86_64-unknown-linux-gnu","manylinux":"2_28"}]') || fromJSON('[{"os":"ubuntu-24.04","target":"x86_64-unknown-linux-gnu","manylinux":"2_28"},{"os":"ubuntu-24.04-arm","target":"aarch64-unknown-linux-gnu","manylinux":"2_28"},{"os":"macos-14","target":"aarch64-apple-darwin","manylinux":""},{"os":"macos-15-intel","target":"x86_64-apple-darwin","manylinux":""}]') }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
@@ -276,7 +283,8 @@ jobs:
   # `dist/` directory for downstream publishing jobs.
   collect-dist:
     needs: [detect-version, build-wheels]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     permissions:
       contents: read
     steps:
@@ -358,6 +366,7 @@ jobs:
     needs: [build-wheels]
     if: github.event.inputs.dry_run != 'true'
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
     permissions:
       contents: read
     strategy:
@@ -655,7 +664,8 @@ jobs:
     # dry_run, vars-level skip).
     if: github.event_name != 'pull_request' && github.event.inputs.dry_run != 'true' && vars.PYPI_SKIP != 'true'
     environment: pypi  # NOTE: environment name must be a literal; update here if the GitHub environment name changes
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     permissions:
       id-token: write  # Required for OIDC trusted publishing
     steps:
@@ -691,7 +701,8 @@ jobs:
         needs.smoke-import-wheels.result == 'success' &&
         (vars.PYPI_SKIP == 'true' || needs.publish-pypi.result == 'success')
       }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     permissions:
       contents: write
     steps:
