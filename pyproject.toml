@@ -205,13 +205,6 @@ warn_unused_configs = true
 disallow_untyped_defs = true
 ignore_missing_imports = true
 
-# Per-module overrides for modules with dynamic typing patterns
-[[tool.mypy.overrides]]
-module = [
-    "furl_ctx.ccr.mcp_server",
-]
-disallow_untyped_defs = false
-
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
