@@ -199,10 +199,19 @@ def _wait_for_descendant_sleep(pgid: int, argv_tail: str = "30", timeout: float 
     raise TimeoutError(f"no 'sleep {argv_tail}' descendant appeared in pgid {pgid}")
 
 
-def _kill_midrun_stdout(script: str, sig: int = signal.SIGTERM) -> str:
+def _kill_midrun_stdout(script: str, sig: int = signal.SIGTERM) -> tuple[str, int]:
     """Run *script*, wait until it has actually entered its sleep (so any trap
     the script installs beforehand is guaranteed active), signal the whole
-    group, and return whatever stdout was delivered."""
+    group, and return whatever stdout was delivered together with the
+    wrapper's exit status.
+
+    The exit status matters, not just stdout: a wrapper that re-raises the
+    signal after its trap runs is killed BY that signal (Python reports a
+    negative returncode, e.g. -2 for SIGINT), while a wrapper that never
+    installed a trap and merely fell through to its normal completion line
+    exits NORMALLY with a positive status (e.g. 130). Stdout content alone
+    cannot always tell those two paths apart; the returncode can.
+    """
     proc = subprocess.Popen(
         ["/bin/sh", "-c", script],
         stdout=subprocess.PIPE,
@@ -217,7 +226,7 @@ def _kill_midrun_stdout(script: str, sig: int = signal.SIGTERM) -> str:
     except ProcessLookupError:
         pass
     out, _ = proc.communicate(timeout=20)
-    return out
+    return out, proc.returncode
 
 
 def test_faA2_killed_pipe_delivers_partial_stdout() -> None:
@@ -228,21 +237,36 @@ def test_faA2_killed_pipe_delivers_partial_stdout() -> None:
     assert "trap " in rewritten, "the F-A2 signal trap must be present"
 
     # pass-after: the trap flushes the captured partial stdout.
-    assert "PARTIAL_SURVIVES" in _kill_midrun_stdout(rewritten)
+    out, _ = _kill_midrun_stdout(rewritten)
+    assert "PARTIAL_SURVIVES" in out
 
     # fail-before: strip every trap line -> the pre-fix wrapper loses the output.
     pre_fix = "\n".join(
         line for line in rewritten.splitlines() if not line.lstrip().startswith("trap")
     )
-    assert "PARTIAL_SURVIVES" not in _kill_midrun_stdout(pre_fix), (
+    pre_fix_out, _ = _kill_midrun_stdout(pre_fix)
+    assert "PARTIAL_SURVIVES" not in pre_fix_out, (
         "pre-fix wrapper should have lost the partial output"
     )
 
 
 def test_faA2_killed_pipe_delivers_partial_stdout_on_sigint() -> None:
-    """The trap covers SIGINT too (interactive Ctrl-C / kill -INT)."""
+    """PIN: the trap covers SIGINT too. Stdout content alone is not enough to
+    prove this: a non-interactive shell survives a SIGINT delivered to its
+    own process group (only its foreground subshell dies) and falls through
+    to its normal completion line regardless of any trap, so the buffered
+    partial output resurfaces either way. A red-proof (strip the trap lines
+    from the real rewrite and re-run) confirmed stdout alone stays green with
+    no trap present. The returncode does not: with the trap the wrapper
+    re-raises and is killed BY the signal (a negative returncode); without
+    it, the wrapper exits NORMALLY with the subshell's 128+signal status.
+    Assert both, so this pin genuinely depends on the trap."""
     rewritten = _rewrite("printf 'INT_PARTIAL\\n'; sleep 30")
-    assert "INT_PARTIAL" in _kill_midrun_stdout(rewritten, sig=signal.SIGINT)
+    out, returncode = _kill_midrun_stdout(rewritten, sig=signal.SIGINT)
+    assert "INT_PARTIAL" in out
+    assert returncode == -signal.SIGINT, (
+        f"expected the wrapper to be killed BY SIGINT (trap re-raise), got {returncode}"
+    )
 
 
 # --- F-A3: tempfile is mktemp-only (0600, no predictable name) ---------------------
