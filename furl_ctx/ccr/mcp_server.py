@@ -34,7 +34,7 @@ import stat
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from furl_ctx import paths as _paths
 from furl_ctx._version import get_version
@@ -51,6 +51,10 @@ from furl_ctx.ccr.retrieve_filters import (
     RetrieveFilters,
     apply_filters,
 )
+
+if TYPE_CHECKING:
+    from furl_ctx.cache.backends import CompressionStoreBackend
+    from furl_ctx.cache.compression_store import CompressionEntry, CompressionStore
 
 # fcntl is Unix-only; on Windows we skip file locking (stats are best-effort).
 # Keep the module typed as Any so Windows mypy runs don't try to resolve Unix-only attrs.
@@ -135,7 +139,7 @@ def _describe_arguments_for_log(arguments: dict[str, Any]) -> str:
     return "{" + ", ".join(parts) + "}"
 
 
-def _result_chars_for_log(result: list[Any]) -> int:
+def _result_chars_for_log(result: list[TextContent]) -> int:
     """Total character count of a handler's TextContent result, for logging.
 
     A byte/char count is operationally useful (outcome size) without exposing
@@ -368,7 +372,7 @@ def _mcp_session_ttl() -> int:
     return ttl_seconds
 
 
-def _default_store_backend_factory() -> Any:
+def _default_store_backend_factory() -> CompressionStoreBackend:
     """Build the durable SQLite CCR backend (separate seam so tests can
     inject a construction failure without touching the sqlite module)."""
     from furl_ctx.cache.backends.sqlite import SqliteBackend
@@ -376,7 +380,7 @@ def _default_store_backend_factory() -> Any:
     return SqliteBackend()
 
 
-def _default_store_backend() -> Any:
+def _default_store_backend() -> CompressionStoreBackend | None:
     """Resolve the MCP server's default store backend (Engine P1-7).
 
     The MCP deployment defaults to the durable SQLite backend: the MCP server
@@ -802,7 +806,7 @@ class FurlMCPServer:
 
     def __init__(self) -> None:
         self._stats = SessionStats()
-        self._local_store: Any = None  # Lazy-initialized CompressionStore
+        self._local_store: CompressionStore | None = None  # Lazy-initialized
         self._compressor_initialized = False
         # File read cache: path → (content_hash, ccr_hash, line_count, token_count)
         self._file_cache: dict[str, tuple[str, str, int, int]] = {}
@@ -842,7 +846,7 @@ class FurlMCPServer:
                 "'furl-ctx[mcp]'."
             )
 
-    def _get_local_store(self) -> Any:
+    def _get_local_store(self) -> CompressionStore:
         """Get the shared compression store singleton (lazy init).
 
         Returns the same instance the compress path uses so retrieval can
@@ -1402,7 +1406,7 @@ class FurlMCPServer:
     def _apply_retrieve_filters(
         self,
         hash_key: str,
-        entry: Any,
+        entry: CompressionEntry,
         filters: RetrieveFilters,
     ) -> dict[str, Any]:
         """Project a retrieved entry through validated filters (NR2-2 b).
@@ -2135,7 +2139,7 @@ class FurlMCPServer:
         return block
 
     @staticmethod
-    def _hook_activity_block(store: Any) -> dict[str, Any]:
+    def _hook_activity_block(store: CompressionStore) -> dict[str, Any]:
         """Cross-process hook/pipe counters from the shared store (observability).
 
         Cumulative and monotonic — they survive entry eviction/expiry (unlike the
