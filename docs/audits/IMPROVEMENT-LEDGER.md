@@ -65,6 +65,16 @@ last 30 days, nor a module a merged PR touched in the last 14 days.
   active wheel-size pressure (hit PyPI's 10GB/project ceiling at v0.21.36),
   so converging these transitive versions (a `dashmap` bump may pull its
   hashbrown pin to 0.15.x) is worth a dedicated bump-and-recheck pass.
+- Residual COR-14 dotted-key ambiguity on a pathological uniform-nested shape
+  such as `[{"a.b": {"c": i}, "a": {"b.c": i}}]`, surfaced by the PR #132
+  adversarial review. Both branches flatten toward the same `a.b.c` dotted
+  name; the T12 collision guard means no duplicate columns ship and both
+  values are retained in dotted form, so the T12 goal holds and it is no worse
+  than main (which drops one value). But the reconstruction is not value-exact
+  under `verify/independent_recheck._unflatten_dotted` because the dotted names
+  are ambiguous about the original nesting. A grammar-level record of the
+  flatten, or a decline for the collision-shaped input, would make it exact.
+  Deferred: its own session, not folded into the fidelity fix.
 
 Removed (already satisfied): "Property-based tests for the tabling grammar
 round-trip, encode then decode equals identity" — verified 2026-07-19 that
