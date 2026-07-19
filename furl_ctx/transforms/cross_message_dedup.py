@@ -56,7 +56,9 @@ Two tiers, both pointer-backed:
   kept verbatim — the per-message router may still compress the
   reference message afterwards, so the sentinel's message pointer is
   best-effort context; recoverability rests on the CCR hash backing,
-  not on the elided rows remaining visible there.
+  not on the elided rows remaining visible there. Only the most recent
+  ``NEAR_DUP_MAX_ARRAY_SOURCES`` kept-verbatim arrays stay eligible as
+  matches, bounding this tier's cost to the conversation's length.
 """
 
 from __future__ import annotations
@@ -64,6 +66,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -94,6 +97,18 @@ NEAR_DUP_MIN_SHARED_BYTES = 256
 NEAR_DUP_MIN_SHARED_FRACTION = 0.3
 NEAR_DUP_MIN_SAVED_BYTES = 128
 NEAR_DUP_MAX_RENDERING_FRACTION = 0.45
+
+# Cap on how many kept-verbatim arrays stay eligible as near-dup reference
+# sources. Every array-shaped unit is matched against every live source
+# (PERF-2): without a bound, a long conversation with many array tool
+# outputs makes this transform's cost grow with the SQUARE of the array
+# count (each new array rescans every earlier one) and holds every row
+# signature seen for the conversation's lifetime in memory. Bounding to the
+# most recent N sources caps both to O(N) per array and turns the whole
+# scan linear in conversation length, at the cost of near-dup matches
+# against sources older than N array-shaped units back — a source that
+# stale is unlikely to still be the best match anyway.
+NEAR_DUP_MAX_ARRAY_SOURCES = 64
 
 # Roles whose string content is a tool output (OpenAI-style).
 _TOOL_ROLES = frozenset({"tool", "function"})
@@ -134,7 +149,9 @@ class _DedupState:
 
     query_context: str
     seen: dict[str, _FirstOccurrence] = field(default_factory=dict)
-    array_sources: list[_ArraySource] = field(default_factory=list)
+    array_sources: deque[_ArraySource] = field(
+        default_factory=lambda: deque(maxlen=NEAR_DUP_MAX_ARRAY_SOURCES)
+    )
     exact_replaced: int = 0
     near_replaced: int = 0
 

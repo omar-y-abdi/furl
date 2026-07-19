@@ -32,6 +32,7 @@ from furl_ctx.tokenizer import Tokenizer
 from furl_ctx.tokenizers import get_tokenizer
 from furl_ctx.transforms.cross_message_dedup import (
     MIN_DEDUP_CHARS,
+    NEAR_DUP_MAX_ARRAY_SOURCES,
     CrossMessageDeduper,
 )
 
@@ -409,6 +410,66 @@ def test_near_duplicate_source_must_be_kept_verbatim() -> None:
     ]
     near_sentinel = json.loads(result.messages[3]["content"])[-1]
     assert "message 1" in near_sentinel["_ccr_dropped"]
+
+
+def _filler_array_content(idx: int, n: int = 20) -> str:
+    # Distinct rows per `idx` (own service names) so fillers never match
+    # each other or `_status_rows` — each becomes its own reference source.
+    rows = [
+        {
+            "service": f"filler-{idx:03d}-{i:02d}",
+            "state": "running",
+            "restarts": i % 3,
+            "uptime_s": 86_400 + i * 17,
+        }
+        for i in range(n)
+    ]
+    return json.dumps(rows, ensure_ascii=False)
+
+
+def test_near_duplicate_array_sources_bounded_to_recent_window() -> None:
+    # PERF-2: `array_sources` is capped at `NEAR_DUP_MAX_ARRAY_SOURCES` so a
+    # long conversation cannot grow near-dup matching cost (or memory) with
+    # the square of the number of array-shaped tool outputs seen. Pushing
+    # exactly `NEAR_DUP_MAX_ARRAY_SOURCES` distinct filler arrays after an
+    # earlier source evicts that source from the matching window — a later
+    # near-duplicate of it must therefore NOT be matched — while a
+    # near-duplicate of the most recent (in-window) source still is.
+    rows_old = _status_rows(20, generation=0)
+    content_old = json.dumps(rows_old, ensure_ascii=False)
+    near_dup_of_old = json.dumps(_status_rows(20, generation=1), ensure_ascii=False)
+
+    fillers = [_filler_array_content(i) for i in range(NEAR_DUP_MAX_ARRAY_SOURCES)]
+    near_dup_of_last_filler = _filler_array_content(NEAR_DUP_MAX_ARRAY_SOURCES - 1)
+    # Perturb two rows so it is a near- (not exact-) duplicate, mirroring
+    # the generation drift `_status_rows` uses above.
+    last_rows = json.loads(near_dup_of_last_filler)
+    last_rows[0]["uptime_s"] += 1
+    last_rows[10]["uptime_s"] += 1
+    near_dup_of_last_filler = json.dumps(last_rows, ensure_ascii=False)
+
+    messages = [{"role": "user", "content": "Check service status."}]
+    messages.append({"role": "tool", "content": content_old, "tool_call_id": "old"})
+    for i, filler in enumerate(fillers):
+        messages.append({"role": "tool", "content": filler, "tool_call_id": f"f{i}"})
+    messages.append({"role": "tool", "content": near_dup_of_old, "tool_call_id": "stale-probe"})
+    messages.append(
+        {"role": "tool", "content": near_dup_of_last_filler, "tool_call_id": "recent-probe"}
+    )
+
+    result = _apply(messages)
+
+    # The stale probe (source evicted `NEAR_DUP_MAX_ARRAY_SOURCES` arrays
+    # ago) must ship untouched — no match found in the bounded window.
+    stale_index = 2 + len(fillers)
+    assert result.messages[stale_index]["content"] == near_dup_of_old
+
+    # The recent probe (source still inside the window) must still fire.
+    recent_index = stale_index + 1
+    recent_rendered = json.loads(result.messages[recent_index]["content"])
+    assert recent_rendered[-1]["_ccr_dropped"], "in-window near-dup source must still match"
+
+    assert result.transforms_applied == ["cross_message_dedup:near:1"]
 
 
 # --------------------------------------------------------------------------- #
