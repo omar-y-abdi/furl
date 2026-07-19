@@ -314,8 +314,38 @@ impl Compaction {
                 .iter()
                 .any(|c| matches!(c, CellValue::Nested(_) | CellValue::DeclinedJson(_)))
         }
+        // True if any `json`-tagged column holds a `Scalar(String)` whose
+        // bytes parse as a JSON container (object/array). Such a cell cannot
+        // ship on the lossless tier: the reference decoder reads a quoted
+        // container-looking cell in a `json` column back as the CONTAINER
+        // (via `json.loads`), not the original string — indistinguishable
+        // from a genuine container cell. The table is declined (fail-closed,
+        // T1/T2) and routed to the recoverable tier where the exact original
+        // bytes are preserved. Scalar-looking strings (`"200"`, `"true"`)
+        // are NOT declined — the formatter CSV-quotes them so they decode
+        // back verbatim (they never start a JSON container).
+        fn table_has_unquotable_json_string(schema: &Schema, rows: &[Row]) -> bool {
+            for (col, field) in schema.fields.iter().enumerate() {
+                if field.type_tag != "json" {
+                    continue;
+                }
+                for row in rows {
+                    if let Some(CellValue::Scalar(Value::String(s))) = row.0.get(col) {
+                        if matches!(
+                            serde_json::from_str::<Value>(s),
+                            Ok(Value::Object(_)) | Ok(Value::Array(_))
+                        ) {
+                            return true;
+                        }
+                    }
+                }
+            }
+            false
+        }
         match self {
-            Compaction::Table { rows, .. } => !rows.iter().any(row_has_nested),
+            Compaction::Table { schema, rows, .. } => {
+                !rows.iter().any(row_has_nested) && !table_has_unquotable_json_string(schema, rows)
+            }
             Compaction::Buckets { .. } | Compaction::OpaqueRef { .. } | Compaction::Untouched => {
                 false
             }

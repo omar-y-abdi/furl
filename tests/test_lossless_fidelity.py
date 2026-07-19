@@ -67,6 +67,51 @@ def _compress_to_text(items: list) -> str:
     return rendered
 
 
+# ────────────────────────────── T1 ────────────────────────────────────────────
+
+
+def test_mixed_type_column_preserves_string_types() -> None:
+    """T1: a column mixing bare scalar-looking strings with real scalars must
+    round-trip every cell with its EXACT type and bytes.
+
+    Before the fix the ``json``-tagged column rendered ``"200"`` / ``"true"``
+    / ``"null"`` bare, so the decoder coerced them to ``200`` / ``True`` /
+    ``None`` — silent, markerless type corruption on the lossless path.
+    """
+    items: list[dict] = []
+    for i in range(60):
+        r = i % 5
+        if r == 0:
+            code: object = "200"  # STRING that looks like an int
+        elif r == 1:
+            code = 500  # real int
+        elif r == 2:
+            code = "true"  # STRING that looks like a bool
+        elif r == 3:
+            code = "null"  # STRING that looks like a JSON null
+        else:
+            code = "1.5"  # STRING that looks like a float
+        items.append({"id": i, "service": _SERVICE, "code": code})
+
+    text = _compress_to_text(items)
+    rows = decode_csv_schema_rows(text)
+    assert rows is not None, (
+        f"expected a lossless CSV-schema table; got non-table output:\n{text[:200]}"
+    )
+
+    assert rows == items, (
+        "mixed-type column not reconstructed with exact types/bytes.\n"
+        f"First 5 decoded 'code': {[r.get('code') for r in rows[:5]]!r}\n"
+        f"Rendered (first 200):\n{text[:200]}"
+    )
+    # Belt-and-suspenders on the exact type boundary the bug crossed.
+    assert rows[0]["code"] == "200" and isinstance(rows[0]["code"], str), rows[0]["code"]
+    assert rows[1]["code"] == 500 and isinstance(rows[1]["code"], int), rows[1]["code"]
+    assert rows[2]["code"] == "true" and isinstance(rows[2]["code"], str), rows[2]["code"]
+    assert rows[3]["code"] == "null" and isinstance(rows[3]["code"], str), rows[3]["code"]
+    assert rows[4]["code"] == "1.5" and isinstance(rows[4]["code"], str), rows[4]["code"]
+
+
 # ────────────────────────────── T2 ────────────────────────────────────────────
 
 
