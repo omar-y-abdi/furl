@@ -42,12 +42,15 @@ last 30 days, nor a module a merged PR touched in the last 14 days.
 
 ## Notes for the maintainer
 
-- PR #127's `github-advanced-security` check failed on every push
-  (73ddb4a, 7be8d4b, c3f6895) with the same cause, unrelated to the diff:
-  GitHub's own Copilot-based PR review backend threw
+- `github-advanced-security` fails on essentially every PR with the same
+  platform-level cause, unrelated to any diff: GitHub's own Copilot-based
+  PR review backend throws
   `SessionModelError: ... "model_not_supported" ... model: claude-opus-4.6`
-  before it read any code. This is not one of the three required checks
-  (`lint`, `build-wheel`, `test`, per ruleset 18484290 and
-  `tests/test_ci_required_checks_guard.py`) — it's a GitHub Advanced
-  Security / Copilot platform feature outside `ci.yml` entirely. Left as
-  red; nothing in this repo can fix a 400 from GitHub's model routing.
+  before it reads any code. Seen on PR #127 (73ddb4a, 7be8d4b, c3f6895) and
+  again on PR #129 (9f3edf0, job 88168484648), both with the identical
+  400 from `api.individual.githubcopilot.com`. This is not one of the
+  three required checks (`lint`, `build-wheel`, `test`, per ruleset
+  18484290 and `tests/test_ci_required_checks_guard.py`) — it's a GitHub
+  Advanced Security / Copilot platform feature outside `ci.yml` entirely.
+  Confirmed persistent across two separate PRs; left as red each time —
+  nothing in this repo can fix a 400 from GitHub's own model routing.
