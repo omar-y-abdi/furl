@@ -9,7 +9,9 @@ change to either variable's SHAPE fails loud instead of silently drifting.
 
 from __future__ import annotations
 
+import importlib.util
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -20,6 +22,9 @@ from furl_ctx.host_version import (
     meets_compression_floor,
     parse_version,
 )
+
+_ROOT = Path(__file__).resolve().parents[1]
+_SESSION_START_SCRIPT = _ROOT / "plugins" / "furl" / "hooks" / "session_start_banner.py"
 
 # --- parse_version -----------------------------------------------------------
 
@@ -73,6 +78,47 @@ def test_floor_constant_is_2_1_163() -> None:
     """Pin: T7's investigated floor. If this ever needs to change, it must be a
     deliberate, evidenced edit, not drift."""
     assert MIN_VERSION_FOR_POST_TOOL_USE_REPLACEMENT == (2, 1, 163)
+
+
+@pytest.mark.parametrize(
+    ("version", "expected"),
+    [
+        # PATCH below the floor's PATCH, MAJOR.MINOR tied: below floor. Verified
+        # trap direction: lexically "2.1.9" > "2.1.163" (the digit '9' outranks
+        # '1' at the first differing character), so a naive string compare would
+        # wrongly call this capable.
+        ((2, 1, 9), False),
+        # PATCH far above the floor's PATCH, MAJOR.MINOR tied: capable. Verified
+        # trap direction, the opposite of the case above: lexically "2.1.1000" <
+        # "2.1.163" ('0' is the first differing character, from "1000", against
+        # '6' from "163"), so a naive string compare would wrongly call this
+        # below floor.
+        ((2, 1, 1000), True),
+        # MINOR one above the floor's MINOR: capable regardless of PATCH,
+        # pinning that MINOR dominates PATCH in the ordering.
+        ((2, 10, 0), True),
+        ((2, 2, 0), True),
+    ],
+)
+def test_meets_compression_floor_semver_lexical_traps(
+    version: tuple[int, int, int], expected: bool
+) -> None:
+    """Correct by construction today, since meets_compression_floor compares
+    parsed integer tuples. Pins these boundary-adjacent values so a future
+    refactor to formatted-string comparison, e.g. sorting ``format_version()``
+    output instead of the tuple, fails loud instead of silently inverting the
+    PATCH-magnitude or MINOR-rollover cases above."""
+    assert meets_compression_floor(version) is expected
+
+
+def test_meets_compression_floor_suffixed_version_string_resolves_capable() -> None:
+    """parse_version strips a trailing prerelease/build suffix (see the
+    parse_version cases above), so a suffixed string like "2.1.163-beta" still
+    parses to exactly the floor and reads as capable, not unknown and not
+    below -- the floor comparison is inclusive (>=)."""
+    version = parse_version("2.1.163-beta")
+    assert version == (2, 1, 163)
+    assert meets_compression_floor(version) is True
 
 
 # --- format_version ------------------------------------------------------------
@@ -220,3 +266,32 @@ def test_empirical_execpath_and_ai_agent_agree_on_this_machine() -> None:
         f"had signal(s) {execpath=} {ai_agent=} but failed to parse a version"
     )
     assert detected[0] >= 2, f"sanity: Claude Code major version {detected} looks implausible"
+
+
+# --- drift guard: session_start_banner.py's hand-duplicated floor --------------
+
+
+def _load_session_start_banner_module() -> object:
+    """Load session_start_banner.py from its file path without polluting
+    sys.path -- it is a standalone script, not part of the furl_ctx package,
+    and deliberately cannot import furl_ctx (see its own module docstring)."""
+    spec = importlib.util.spec_from_file_location(
+        "session_start_banner_under_test", _SESSION_START_SCRIPT
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_session_start_banner_min_version_matches_host_version_floor() -> None:
+    """Drift guard: session_start_banner.py cannot import furl_ctx.host_version,
+    SessionStart must stay dependency-free, see
+    test_plugin_hooks_manifest.py::test_session_start_is_cheap_user_visible_and_fail_open,
+    so it hand-duplicates the floor as its own module-level _MIN_VERSION
+    constant. Nothing else ties the two together -- bump
+    MIN_VERSION_FOR_POST_TOOL_USE_REPLACEMENT without touching the banner and
+    it goes stale silently, claiming "armed" past a floor that moved. Pin them
+    equal here so that drift fails loud instead."""
+    banner = _load_session_start_banner_module()
+    assert banner._MIN_VERSION == MIN_VERSION_FOR_POST_TOOL_USE_REPLACEMENT  # type: ignore[attr-defined]
