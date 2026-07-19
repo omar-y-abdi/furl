@@ -255,7 +255,11 @@ class BaseTokenizer(ABC):
                 from PIL import Image
 
                 img = Image.open(io.BytesIO(img_bytes))
+                # PIL ships no type stubs here (ignore_missing_imports), so
+                # img.size is inferred as Any; pin it to the documented
+                # tuple[int, int] shape explicitly.
                 w, h = img.size
+                w, h = int(w), int(h)
                 # Anthropic resizes to fit 1568x1568 max
                 max_dim = 1568
                 if w > max_dim or h > max_dim:

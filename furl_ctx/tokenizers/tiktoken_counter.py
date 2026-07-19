@@ -12,9 +12,12 @@ from __future__ import annotations
 
 import threading
 from functools import lru_cache
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .base import BaseTokenizer
+
+if TYPE_CHECKING:
+    import tiktoken
 
 # Model to encoding mapping
 MODEL_TO_ENCODING = {
@@ -86,14 +89,14 @@ ENCODING_LOAD_TIMEOUT_SECONDS = 10.0
 
 
 @lru_cache(maxsize=8)
-def _get_encoding(encoding_name: str):
+def _get_encoding(encoding_name: str) -> tiktoken.Encoding:
     """Get tiktoken encoding, cached for performance."""
     import tiktoken
 
     return tiktoken.get_encoding(encoding_name)
 
 
-def _load_encoding_bounded(encoding_name: str, timeout: float | None = None):
+def _load_encoding_bounded(encoding_name: str, timeout: float | None = None) -> tiktoken.Encoding:
     """Load a tiktoken encoding with a hard deadline (thread + join).
 
     Thread-based rather than signal-based because compress() may run off
@@ -117,13 +120,15 @@ def _load_encoding_bounded(encoding_name: str, timeout: float | None = None):
             from a tiktoken build older than the encoding).
     """
     deadline = ENCODING_LOAD_TIMEOUT_SECONDS if timeout is None else timeout
-    outcome: dict[str, Any] = {}
+    encoding: tiktoken.Encoding | None = None
+    error: Exception | None = None
 
     def _worker() -> None:
+        nonlocal encoding, error
         try:
-            outcome["encoding"] = _get_encoding(encoding_name)
+            encoding = _get_encoding(encoding_name)
         except Exception as exc:  # re-raised on the calling thread below
-            outcome["error"] = exc
+            error = exc
 
     thread = threading.Thread(
         target=_worker,
@@ -139,9 +144,8 @@ def _load_encoding_bounded(encoding_name: str, timeout: float | None = None):
             f"tiktoken encoding {encoding_name!r} did not load within {deadline}s "
             "(stalled BPE vocab download?)"
         )
-    if "error" in outcome:
-        raise outcome["error"]
-    encoding = outcome.get("encoding")
+    if error is not None:
+        raise error
     if encoding is None:  # totality net: worker died without a result
         raise RuntimeError(f"tiktoken encoding {encoding_name!r} load produced no result")
     return encoding
@@ -291,7 +295,7 @@ class TiktokenCounter(BaseTokenizer):
         # Lowercase once: encoding lookup is case-sensitive, and callers pass
         # names like "GPT-4o" which must not fall through to the default.
         self.encoding_name = get_encoding_for_model(model.lower())
-        self._encoding = _load_encoding_bounded(self.encoding_name)
+        self._encoding: tiktoken.Encoding | None = _load_encoding_bounded(self.encoding_name)
         # Bounded memo, capped by total cached BYTES (oldest evicted first). A
         # plain clear-on-overflow thrashed at scale — the hottest string (a
         # 33 MB doc re-counted many times) got evicted and re-encoded. Bounding
@@ -300,7 +304,7 @@ class TiktokenCounter(BaseTokenizer):
         self._count_cache_bytes = 0
 
     @property
-    def encoding(self):
+    def encoding(self) -> tiktoken.Encoding:
         """The tiktoken encoding (loaded at construction).
 
         The bounded reload below only serves legacy paths that bypass
