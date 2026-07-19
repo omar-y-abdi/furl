@@ -22,6 +22,7 @@ last 30 days, nor a module a merged PR touched in the last 14 days.
 | 2026-07-19 | type strength, mypy override, ccr/mcp_server | pyproject.toml, furl_ctx/ccr/mcp_server.py | removed the last remaining disallow_untyped_defs override, proven dead (`mypy furl_ctx` passes with 0 errors without it); fixed the 7 real Any-leaks it was hiding (store/backend/entry/result signatures) with the concrete domain types (CompressionStore, CompressionStoreBackend, CompressionEntry, TextContent) already defined elsewhere in the codebase | #129 |
 | 2026-07-19 | performance, cross-message dedup | furl_ctx/transforms/cross_message_dedup.py, tests/test_cross_message_dedup.py | bounded the near-dup reference window (`array_sources`) to the most recent 64 kept-verbatim arrays, eliminating O(n^2) scan cost and unbounded memory growth on long conversations; 3200-message repro went 5444ms -> 1002ms with per-message cost flat instead of climbing | #128 |
 | 2026-07-19 | test rigor, faA2 hardening follow-up | tests/test_hook_audit_fixes.py | portable anchored pgrep poll restored macOS coverage and a returncode assert replaced the vacuous SIGINT pin | #130 |
+| 2026-07-19 | security, retention honesty, hook version gating | plugins/furl/hooks/{pipe_compress,compress_tool_output,_furl_ccr_counters,session_start_banner}.py, furl_ctx/host_version.py (new), furl_ctx/ccr/mcp_server.py | pipe path now redacts built-in credential patterns (was env-only, a true no-op with nothing configured); plugin retention docs corrected to name the 1000-entry cap instead of a plain 24h claim, the audit's FURL_CCR_SPILL=1 flip withheld after proving it is a no-op for the namespaced store the plugin actually uses; PostToolUse compression claims now check the running Claude Code version via a new detector and stop overclaiming below 2.1.163 | #134 |
 
 ## Open candidates, fair game for future sessions
 
@@ -64,6 +65,17 @@ last 30 days, nor a module a merged PR touched in the last 14 days.
   active wheel-size pressure (hit PyPI's 10GB/project ceiling at v0.21.36),
   so converging these transitive versions (a `dashmap` bump may pull its
   hashbrown pin to 0.15.x) is worth a dedicated bump-and-recheck pass.
+- T6 real fix, PR #134: `FURL_CCR_SPILL=1` only wires a spill tier into
+  `get_compression_store`'s global singleton. The plugin never reaches that
+  path since every hook and the MCP server set `FURL_CCR_PROJECT_DIR`, which
+  routes through `resolve_ccr_namespace_store` -> `_build_namespace_store`
+  instead, and that function never wires a spill backend regardless of the
+  env var, on purpose, to avoid demoting every tenant into one shared file.
+  Proven with `tests/test_ccr_spill_plugin_namespace_gap.py`. Real fix needs
+  a per-namespace spill backend added to `_build_namespace_store` in
+  `furl_ctx/cache/compression_store.py`. Out of PR #134's file scope and
+  explicitly excluded from that batch's mandate, which forbade redesigning
+  cap accounting; needs its own design pass on the cap and spill interaction.
 
 Removed (already satisfied): "Property-based tests for the tabling grammar
 round-trip, encode then decode equals identity" — verified 2026-07-19 that
