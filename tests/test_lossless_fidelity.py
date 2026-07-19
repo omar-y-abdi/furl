@@ -165,3 +165,34 @@ def test_array_string_preserves_exact_bytes() -> None:
         f"Rendered (first 200):\n{text[:200]}"
     )
     assert rows[0]["arr"] == "[1, 2, 0]" and isinstance(rows[0]["arr"], str), rows[0].get("arr")
+
+
+# ────────────────────────────── T12 ───────────────────────────────────────────
+
+
+def test_dotted_key_collision_does_not_lose_values() -> None:
+    """T12: a literal top-level ``"m.k"`` and a nested ``{"m": {"k": ...}}`` must
+    both survive — the flatten must not synthesize a colliding ``m.k`` column.
+
+    Before the fix ``flatten_uniform_nested`` promoted the nested ``m`` object
+    to a second ``m.k`` column; the decoder assigned both to the same dict key
+    and one value was silently overwritten.
+    """
+    items = [
+        {"id": i, "service": _SERVICE, "m.k": f"lit-{i}", "m": {"k": 1000 + i}} for i in range(60)
+    ]
+
+    text = _compress_to_text(items)
+    rows = decode_csv_schema_rows(text)
+    assert rows is not None, (
+        f"expected a lossless CSV-schema table; got non-table output:\n{text[:200]}"
+    )
+
+    assert rows == items, (
+        "dotted-key collision lost a value (literal 'm.k' vs nested m.k).\n"
+        f"decoded[0]: {rows[0]!r}\n"
+        f"Rendered (first 200):\n{text[:200]}"
+    )
+    # Both distinct values must be present and unclobbered.
+    assert rows[0]["m.k"] == "lit-0", rows[0].get("m.k")
+    assert rows[0]["m"] == {"k": 1000}, rows[0].get("m")

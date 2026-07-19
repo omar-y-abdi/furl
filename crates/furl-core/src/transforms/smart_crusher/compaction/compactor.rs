@@ -375,6 +375,27 @@ fn flatten_uniform_nested(specs: &mut Vec<FieldSpec>, rows: &mut [Row], cfg: &Co
         };
 
         let parent_name = specs[i].name.clone();
+
+        // T12 fail-closed: synthesized `parent.key` columns ship as RAW names
+        // in the declaration with no free-name check. If any collides with an
+        // existing column — a literal top-level `parent.key`, or a sibling
+        // already flattened to the same dotted name — flattening would emit
+        // two identically named columns and the reference decoder would
+        // silently OVERWRITE one value (last write wins). Skip the flatten for
+        // this column; it stays a nested-object cell (CSV-quoted JSON, decoded
+        // back to the object) so both distinct values survive.
+        let collides = inner_keys.iter().any(|k| {
+            let synthesized = format!("{parent_name}.{k}");
+            specs
+                .iter()
+                .enumerate()
+                .any(|(idx, s)| idx != i && s.name == synthesized)
+        });
+        if collides {
+            i += 1;
+            continue;
+        }
+
         let new_specs: Vec<FieldSpec> = inner_keys
             .iter()
             .map(|k| FieldSpec {
@@ -1287,6 +1308,139 @@ mod tests {
             }
             other => panic!("expected Table, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn stringified_json_object_stays_string_scalar_not_flattened() {
+        // T2: a value that ORIGINATED as a JSON-object string is kept verbatim
+        // as a Scalar(String), never parsed + flattened into dotted columns
+        // (which dropped the original `payload` field entirely).
+        let items: Vec<Value> = (0..4)
+            .map(|i| json!({"id": i, "payload": format!("{{\"a\": {i}}}")}))
+            .collect();
+        match compact(&items, &cfg()) {
+            Compaction::Table { schema, rows, .. } => {
+                let names = schema.field_names();
+                assert!(
+                    names.contains(&"payload"),
+                    "payload column vanished: {names:?}"
+                );
+                assert!(
+                    !names.iter().any(|n| n.starts_with("payload.")),
+                    "object-string was flattened into dotted columns: {names:?}"
+                );
+                let col = schema
+                    .fields
+                    .iter()
+                    .position(|f| f.name == "payload")
+                    .unwrap();
+                match &rows[0].0[col] {
+                    CellValue::Scalar(Value::String(s)) => assert_eq!(s, "{\"a\": 0}"),
+                    other => panic!("expected verbatim Scalar(String), got {other:?}"),
+                }
+            }
+            other => panic!("expected Table, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stringified_json_array_keeps_exact_bytes() {
+        // T2: an array-string keeps its interior whitespace (no parse +
+        // compact re-serialization that dropped the spaces).
+        let items: Vec<Value> = (0..4)
+            .map(|i| json!({"id": i, "arr": format!("[1, 2, {i}]")}))
+            .collect();
+        match compact(&items, &cfg()) {
+            Compaction::Table { schema, rows, .. } => {
+                let col = schema.fields.iter().position(|f| f.name == "arr").unwrap();
+                match &rows[0].0[col] {
+                    CellValue::Scalar(Value::String(s)) => assert_eq!(s, "[1, 2, 0]"),
+                    other => panic!("expected verbatim Scalar(String), got {other:?}"),
+                }
+            }
+            other => panic!("expected Table, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn literal_dotted_key_collision_skips_flatten() {
+        // T12: a literal top-level `m.k` beside a nested `{"m": {"k": ..}}`
+        // must NOT synthesize a colliding `m.k` column. The nested `m` stays
+        // an object column; the literal `m.k` stays its own column, so both
+        // distinct values survive instead of one silently overwriting the
+        // other on decode.
+        let items: Vec<Value> = (0..4)
+            .map(|i| json!({"id": i, "m.k": format!("lit-{i}"), "m": {"k": 1000 + i}}))
+            .collect();
+        match compact(&items, &cfg()) {
+            Compaction::Table { schema, .. } => {
+                let names = schema.field_names();
+                let dotted = names.iter().filter(|n| **n == "m.k").count();
+                assert_eq!(dotted, 1, "duplicate m.k columns synthesized: {names:?}");
+                assert!(
+                    names.contains(&"m"),
+                    "nested `m` object column dropped: {names:?}"
+                );
+            }
+            other => panic!("expected Table, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn json_column_container_string_declines_lossless() {
+        // T1/T2: a `json`-tagged (type-mixed) column holding a container-
+        // looking STRING cannot ship losslessly — a quoted container-string
+        // is indistinguishable from a real container to the reference
+        // decoder, so the table declines (`is_decoder_verifiable` == false).
+        let items: Vec<Value> = (0..6)
+            .map(|i| {
+                if i % 2 == 0 {
+                    json!({"id": i, "cfg": "{\"a\": 1}"}) // container STRING
+                } else {
+                    json!({"id": i, "cfg": i}) // real int -> mixes to `json`
+                }
+            })
+            .collect();
+        let c = compact(&items, &cfg());
+        match &c {
+            Compaction::Table { schema, .. } => {
+                let spec = schema.fields.iter().find(|f| f.name == "cfg").unwrap();
+                assert_eq!(spec.type_tag, "json", "expected a json-tagged mixed column");
+            }
+            other => panic!("expected Table, got {other:?}"),
+        }
+        assert!(
+            !c.is_decoder_verifiable(),
+            "a json column with a container-string must decline the lossless tier"
+        );
+    }
+
+    #[test]
+    fn json_column_scalar_string_stays_verifiable() {
+        // Contrast: scalar-looking strings ("200") in a json column ARE
+        // quoted by the formatter and round-trip, so the table stays
+        // decoder-verifiable — only container-strings decline.
+        let items: Vec<Value> = (0..6)
+            .map(|i| {
+                if i % 2 == 0 {
+                    json!({"id": i, "code": "200"}) // scalar-looking STRING
+                } else {
+                    json!({"id": i, "code": 500}) // real int
+                }
+            })
+            .collect();
+        let c = compact(&items, &cfg());
+        match &c {
+            Compaction::Table { schema, .. } => {
+                let spec = schema.fields.iter().find(|f| f.name == "code").unwrap();
+                assert_eq!(spec.type_tag, "json");
+            }
+            other => panic!("expected Table, got {other:?}"),
+        }
+        assert!(
+            c.is_decoder_verifiable(),
+            "a json column with only scalar-looking strings must stay verifiable"
+        );
     }
 
     #[test]
