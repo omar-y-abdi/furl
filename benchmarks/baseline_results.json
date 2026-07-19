@@ -1,7 +1,7 @@
 {
   "schema": "furl_ctx.imp3.baseline.v1",
-  "captured_at_utc": "2026-07-19T21:35:33.320954+00:00",
-  "git_commit": "5974c0777f629e9187d6f6face0f6294d14cae88",
+  "captured_at_utc": "2026-07-19T22:08:35.942263+00:00",
+  "git_commit": "57148d7b64150395742b9923d4cd8afb2e4375dc",
   "engine_model": "gpt-4o",
   "python": "3.13.14",
   "platform": "macOS-15.7.8-x86_64-i386-64bit-Mach-O",

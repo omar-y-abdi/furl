@@ -1,7 +1,7 @@
 # BASELINE — Imp3 Honest Benchmark (Phase-2 current engine)
 
-- Captured: `2026-07-19T21:35:33.320954+00:00`
-- Commit: `5974c0777f629e9187d6f6face0f6294d14cae88`
+- Captured: `2026-07-19T22:08:35.942263+00:00`
+- Commit: `57148d7b64150395742b9923d4cd8afb2e4375dc`
 - Token model: `gpt-4o` (real tiktoken BPE via the engine's tokenizer registry)
 - Python: `3.13.14`  Platform: `macOS-15.7.8-x86_64-i386-64bit-Mach-O`
 
