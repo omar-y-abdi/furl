@@ -46,6 +46,15 @@ last 30 days, nor a module a merged PR touched in the last 14 days.
   time in the Rust producer that `Other`'s string never carries a `">"`).
   Not fixed in #131: no producer emits one today, so there was nothing to
   reproduce, and the PR's scope was the resolve_markers span/ReDoS bug.
+- Audit `classify_field` / `compute_exclude_set` in
+  `crates/furl-core/src/transforms/smart_crusher/field_role.rs` for
+  over-exclusion: some high-cardinality or hex CONTENT columns are ruled
+  `VaryingIdentity` and dropped from the stable-projection hash, the
+  pre-existing cause of the audit's `_dup_count:390` on a unique HTTP row.
+  The T5 display fix in PR #136 now paints such columns `<varies>`, which can
+  make an inflated count read a little more plausible, though the data stays
+  CCR-recoverable. The audit tiered this non-critical; worth a dedicated look
+  at the classifier thresholds and shape tests in a future session.
 - Capture the committed benchmark baseline on Linux CI instead of macOS so the
   perf gate compares same-OS numbers. Review finding F3 on PR 120: recall has
   a knife-edge regime at 0.2222 where a single cross-OS trial flip would false

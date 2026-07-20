@@ -130,7 +130,10 @@ in a high-cardinality identity column â€” a per-row id, timestamp, or counter â€
 column shows the `<varies>` sentinel instead of a concrete value, because the N rows
 each had a *different* one. Read `<varies>` as "N distinct values here", never as one
 id or timestamp that recurred N times; the concrete per-row values are behind the
-marker, so `furl_retrieve` the rows when you need them.
+marker, so `furl_retrieve` the rows when you need them. `<varies>` is a **reserved**
+sentinel: if a row's real identity value ever is literally the string `<varies>` and
+is constant across its family it is kept as-is and reads the same, and either way the
+exact per-row originals stay recoverable with `furl_retrieve`.
 
 For the array and summary cases you usually want a **slice, not the whole thing**.
 The summary carries a `retrieve` hint telling you which fields to filter on. Pass a
