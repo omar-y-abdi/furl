@@ -471,6 +471,101 @@ class TestTokenizerRegistry:
                 sys.modules["furl_ctx.tokenizers.tiktoken_counter"] = tc_module
             TokenizerRegistry.clear_cache()
 
+    def test_claude_proxy_is_labeled_with_documented_error_band(self):
+        """claude-* o200k_base counts are labeled a PROXY, not real Anthropic
+        billing tokens (T10 pre-mortem finding).
+
+        Pins the CURRENT, honest behavior: claude-* still resolves to
+        tiktoken's o200k_base encoding (byte-identical to gpt-4o) because
+        Anthropic's own tokenizer is not publicly available, but the
+        returned counter now says so about itself (``proxy_for``) instead
+        of only in a docstring nobody calling ``compress()`` would read.
+
+        Calibration limit (honest, not fabricated): the ``anthropic``
+        package is not installed in this environment (verified via ``pip
+        show anthropic`` while writing this fix), so there is no real
+        Anthropic tokenizer here to calibrate the o200k proxy against, and
+        even with the package installed, real calibration needs a live
+        ``POST /v1/messages/count_tokens`` API call (network + an API key)
+        that this hermetic suite should not depend on. The error band
+        asserted below is Anthropic's own published developer guidance on
+        tiktoken vs. Claude token counts ("undercounts Claude tokens by
+        ~15-20% on typical text, and by much more on code or non-English
+        input"), not a live measurement taken here.
+
+        If a future contributor wires in a real Anthropic tokenizer,
+        ``_create_anthropic`` must stop returning a
+        ``proxy_for="anthropic"`` TiktokenCounter, which breaks this test —
+        a deliberate forcing function, not a bug: the label must be
+        consciously removed, not silently left stale.
+        """
+        from furl_ctx.tokenizers.registry import ANTHROPIC_O200K_PROXY_NOTE
+
+        TokenizerRegistry.clear_cache()
+        tokenizer = get_tokenizer("claude-3-sonnet")
+
+        assert isinstance(tokenizer, TiktokenCounter)
+        assert tokenizer.encoding_name == "o200k_base"
+        assert tokenizer.proxy_for == "anthropic"
+
+        # The documented error band is present and approximate, not a
+        # fabricated precise conversion factor.
+        assert "o200k_base" in ANTHROPIC_O200K_PROXY_NOTE
+        assert "Anthropic" in ANTHROPIC_O200K_PROXY_NOTE
+        assert "15-20%" in ANTHROPIC_O200K_PROXY_NOTE
+
+    def test_claude_proxy_warns_at_construction(self, caplog):
+        """Selecting a claude-* model logs a WARNING naming the o200k proxy.
+
+        A caller who never inspects ``proxy_for`` still sees this in logs —
+        the "surface clearly to a caller" half of T10, kept inside the
+        tokenizers module since furl_ctx/compress.py is out of scope for
+        this fix.
+        """
+        import logging
+
+        TokenizerRegistry.clear_cache()
+        with caplog.at_level(logging.WARNING, logger="furl_ctx.tokenizers.registry"):
+            get_tokenizer("claude-3-opus")
+
+        assert any("o200k_base" in record.getMessage() for record in caplog.records)
+
+    def test_gemini_cohere_fixed_ratio_is_labeled_with_documented_error_band(self):
+        """Gemini/Cohere's fixed 4.0 chars-per-token estimate is labeled and
+        warns, so a caller is not silently shown a number that can be
+        roughly 2x off (T10 pre-mortem finding).
+
+        The 2x figure is reproduced directly against this project's own
+        o200k_base tokenizer while writing this fix (not literature, not
+        the audit's memory of an earlier run): a fixed 4.0 cpt estimate on
+        repeated CJK text comes out ~3x under the real o200k_base count,
+        and ~1.6x under on structured JSON, while plain English prose/code
+        stays within roughly 12%. "Roughly 2x" is the honest middle of
+        that spread, not a universal constant — worse for CJK/non-Latin or
+        densely structured content, closer for plain English/code.
+        """
+        from furl_ctx.tokenizers.registry import FIXED_RATIO_ESTIMATOR_NOTE
+
+        for model in ("gemini-1.5-pro", "command-r-plus"):
+            TokenizerRegistry.clear_cache()
+            tokenizer = get_tokenizer(model)
+
+            assert isinstance(tokenizer, EstimatingTokenCounter)
+            assert tokenizer.proxy_for == "fixed_ratio_estimate"
+
+        assert "4.0 chars-per-token" in FIXED_RATIO_ESTIMATOR_NOTE
+        assert "2x" in FIXED_RATIO_ESTIMATOR_NOTE
+
+    def test_gemini_cohere_fixed_ratio_warns_at_construction(self, caplog):
+        """Selecting a Gemini/Cohere model logs a WARNING naming the ~2x band."""
+        import logging
+
+        TokenizerRegistry.clear_cache()
+        with caplog.at_level(logging.WARNING, logger="furl_ctx.tokenizers.registry"):
+            get_tokenizer("gemini-1.5-pro")
+
+        assert any("2x" in record.getMessage() for record in caplog.records)
+
     def test_get_unknown_model_fallback(self):
         """Test fallback for unknown model."""
         tokenizer = get_tokenizer("unknown-model-xyz")

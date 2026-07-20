@@ -68,6 +68,48 @@ MODEL_PATTERNS: list[tuple[str, str]] = [
 ]
 
 
+# ── Documented tokenizer-accuracy caveats (T10) ─────────────────────────────
+#
+# Two backends below stand in for a vendor tokenizer this project has no
+# access to. Neither error band is fabricated:
+#
+# - ANTHROPIC_O200K_PROXY_NOTE cites Anthropic's own published developer
+#   guidance on tiktoken vs. Claude token counts, not a live measurement —
+#   the `anthropic` package is not a project dependency, and even installed,
+#   real calibration needs a live `POST /v1/messages/count_tokens` API call
+#   (network + an API key) this project does not make from a tokenizer
+#   constructor. See tests/test_tokenizers.py for the calibration-limit note.
+# - FIXED_RATIO_ESTIMATOR_NOTE's "~2x" was reproduced directly against this
+#   project's own o200k_base tokenizer (see tests/test_tokenizers.py), not
+#   measured against a real Gemini/Cohere tokenizer, which this project has
+#   no access to either.
+#
+# If a real tokenizer for either vendor is ever wired in, `_create_anthropic`
+# / `_create_fixed_estimation` must stop tagging their result `proxy_for=...`
+# — the pinning tests in tests/test_tokenizers.py force that to be a
+# conscious change, not a silently stale label.
+
+ANTHROPIC_O200K_PROXY_NOTE: str = (
+    "claude-* token counts are computed with tiktoken's o200k_base encoding "
+    "(byte-identical to gpt-4o) as a PROXY for Anthropic's own tokenizer, "
+    "which is not publicly available. Per Anthropic's published developer "
+    "guidance, this undercounts real Claude billing tokens by roughly "
+    "15-20% on typical text, and by more on code or non-English text. "
+    "Reported counts and savings percentages for claude-* models are an "
+    "approximation, not an exact Anthropic token count."
+)
+
+FIXED_RATIO_ESTIMATOR_NOTE: str = (
+    "this model's token counts use a fixed 4.0 chars-per-token estimate "
+    "(neither Gemini's SentencePiece nor Cohere's tokenizer is accessible "
+    "here) instead of a real BPE tokenizer. This fixed ratio can be roughly "
+    "2x off — closer for plain English prose/code, worse for CJK, other "
+    "non-Latin scripts, or densely structured content such as JSON. "
+    "Reported counts and savings percentages for this model are a rough "
+    "approximation."
+)
+
+
 # ── Backend factories ───────────────────────────────────────────────────────
 
 
@@ -83,11 +125,16 @@ def _create_tiktoken(model: str) -> TokenCounter:
 
 
 def _create_anthropic(model: str) -> TokenCounter:
-    """Create Anthropic tokenizer using tiktoken o200k_base (Q1).
+    """Create Anthropic tokenizer using tiktoken o200k_base as a PROXY (T10).
 
-    Anthropic's tokenizer is not publicly available. o200k_base (the GPT-4o
-    encoding) is the closest public BPE and far more accurate than the old
-    3.5-chars/token flat estimate, especially for CJK and emoji content.
+    Anthropic's own tokenizer is not publicly available. o200k_base (the
+    GPT-4o encoding) is the closest public BPE and far more accurate than
+    the old 3.5-chars/token flat estimate, especially for CJK and emoji
+    content — but it is still a PROXY, not the real Anthropic tokenizer.
+    See ``ANTHROPIC_O200K_PROXY_NOTE`` for the documented error band; the
+    returned counter's ``proxy_for`` attribute and the warning below are
+    the runtime-visible signal that a caller is not seeing exact Anthropic
+    billing tokens.
 
     Falls back to EstimatingTokenCounter(3.5) only when tiktoken is absent
     (ImportError), preserving cold-path safety on minimal installs.
@@ -95,22 +142,28 @@ def _create_anthropic(model: str) -> TokenCounter:
     try:
         from .tiktoken_counter import TiktokenCounter
 
-        return TiktokenCounter(model)
+        counter = TiktokenCounter(model, proxy_for="anthropic")
+        logger.warning("%s: %s", model, ANTHROPIC_O200K_PROXY_NOTE)
+        return counter
     except ImportError:
         logger.warning(
             "tiktoken not installed — claude-* falling back to 3.5-cpt estimation. "
             "Install with: pip install tiktoken"
         )
-        return EstimatingTokenCounter(chars_per_token=3.5)
+        return EstimatingTokenCounter(chars_per_token=3.5, proxy_for="anthropic")
 
 
 def _create_fixed_estimation(model: str) -> TokenCounter:
-    """Create fixed-ratio estimation tokenizer (Google/Cohere).
+    """Create fixed-ratio estimation tokenizer (Google/Cohere) as a PROXY (T10).
 
     Gemini uses SentencePiece and Cohere has its own tokenizer, neither
-    easily accessible. Both estimate at ~4 chars per token.
+    easily accessible. Both estimate at ~4 chars per token — a much cruder
+    approximation than a real BPE tokenizer. See
+    ``FIXED_RATIO_ESTIMATOR_NOTE`` for the documented error band (reproduced
+    against this project's own tokenizer, not literature-only).
     """
-    return EstimatingTokenCounter(chars_per_token=4.0)
+    logger.warning("%s: %s", model, FIXED_RATIO_ESTIMATOR_NOTE)
+    return EstimatingTokenCounter(chars_per_token=4.0, proxy_for="fixed_ratio_estimate")
 
 
 def _create_estimation(model: str) -> TokenCounter:
