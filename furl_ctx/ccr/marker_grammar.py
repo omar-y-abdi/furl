@@ -35,9 +35,9 @@ Two DISTINCT width contracts — also kept separate
 
 Marker shapes A..I and which producer emits each
 ================================================
-  A  ``<<ccr:HASH N_rows_offloaded>>``        12-hex  markers.rs marker_for_rows_offloaded
-  B  ``<<ccr:HASH#rows N_chunks>>``           12-hex  markers.rs marker_for_row_index
-  C  ``<<ccr:HASH,KIND,SIZE>>``               12-hex  markers.rs marker_for_opaque
+  A  ``<<ccr:HASH N_rows_offloaded>>``        24-hex  markers.rs marker_for_rows_offloaded
+  B  ``<<ccr:HASH#rows N_chunks>>``           24-hex  markers.rs marker_for_row_index
+  C  ``<<ccr:HASH,KIND,SIZE>>``               24-hex  markers.rs marker_for_opaque
   D  ``<<ccr:HASH>>`` bare                    24-hex  smart_crusher.py (bare CCR helper)
   E  ``<<ccr:HASH N_bytes_duplicate>>``       24-hex  transforms/cross_message_dedup.py
   F  ``<<ccr:HASH N_bytes_near_duplicate>>``  24-hex  transforms/cross_message_dedup.py
@@ -64,12 +64,15 @@ from typing import Any, Final
 # --------------------------------------------------------------------------- #
 
 # Accepted CCR hash widths (number of hex characters) — the STRICT consumer set:
-# - 12: SmartCrusher path — sha256(payload)[:6] → 12 hex chars
-#        (crusher.rs `hash_canonical`, byte-pinned by its parity tests)
-# - 24: diff/log/search compressors — md5(payload)[:24] (md5_hex_24);
-#        cross_message_dedup, read_lifecycle, and the store
-#        default key — sha256(payload)[:24]. (No central key helper; each
-#        producer owns its algorithm and threads the hash via explicit_hash.)
+# - 24: the CURRENT width for EVERY producer. SmartCrusher row/opaque keys
+#        (sha256(payload)[:24] via `sha256_recovery_key`, byte-pinned by its
+#        parity tests); diff/log/search (md5_hex_24); cross_message_dedup,
+#        read_lifecycle, and the store default key (sha256(payload)[:24]).
+# - 12: LEGACY SmartCrusher keys (sha256(payload)[:12], 48 bits) emitted before
+#        the recovery key was widened to 96 bits (T3): a 48-bit key collided by
+#        the birthday bound and let one dropped row silently recover as
+#        another's content. Retained ONLY so `<<ccr:HASH>>` markers already in
+#        live transcripts still resolve — no producer emits 12-hex anymore.
 # Do NOT add arbitrary lengths — the exact-width check is the spoofing guard.
 HASH_WIDTHS: frozenset[int] = frozenset({12, 24})
 
