@@ -30,6 +30,7 @@ last 30 days, nor a module a merged PR touched in the last 14 days.
 | 2026-07-20 | correctness, dup-count display honesty, audit T5 | crates/furl-core smart_crusher/route.rs, plugins/furl skills/furl/SKILL.md, tests/test_dup_count_varies_sentinel.py | annotate_dup_counts stamped _dup_count:N on a kept representative that still showed row-0's concrete identity values, so a collapsed audit trail, heartbeat, or retry log read as one id or timestamp recurring N times when N distinct ids each occurred once; the representative now renders each excluded identity column that varies across the collapsed family as a `<varies>` sentinel while a column constant within the family keeps its real value, and _dup_count plus what gets dropped or recovered stay unchanged because persist_dropped hashes the original items not the annotated survivors; documented _dup_count and the `<varies>` sentinel in the model-facing SKILL.md where they appeared in no legend; verify.run silent_loss and hash_failures stayed 0 and the benchmark baseline was unchanged | #136 |
 | 2026-07-20 | retention, per-namespace CCR spill, audit T6 | furl_ctx/cache/compression_store.py, plugins/furl/.mcp.json, plugins/furl/hooks/{compress_tool_output,pipe_compress,pretool_pipe}.py, plugins/furl/{README.md,skills/furl/SKILL.md}, tests/test_ccr_spill_plugin_namespace_gap.py | `_build_namespace_store` now wires a per-namespace durable spill gated by `FURL_CCR_SPILL`, so a capacity-evicted entry is demoted to the namespace's own `ccr-ns-<digest>-spill.sqlite3` instead of dropped at the 1000-entry cap and stays retrievable past eviction; per-namespace and `-spill` suffixed so no tenant reads another's rows, deliberately skipping the global sqlite-primary guard that would otherwise leave the sqlite-backed plugin with no spill at all; the plugin now sets `FURL_CCR_SPILL` in `.mcp.json` and the hooks so retention is real, and the #134 gap pin flips to a spill HIT alongside an isolation test proving two namespaces spill to different 0600 files under a 0700 dir | #138 |
 | 2026-07-20 | security, MCP regex-filter ReDoS (T11 pre-mortem audit) | furl_ctx/ccr/mcp_server.py, furl_ctx/ccr/regex_budget.py, tests/test_mcp_server_handlers.py, tests/test_regex_budget.py | furl_retrieve's `pattern` and furl_compress's `include_patterns`/`exclude_patterns` are matched off the event loop (run_in_executor/asyncio.to_thread), where no SIGALRM watchdog can ever arm; without RE2 they fell back to unbounded stdlib `re`, so a crafted pattern could freeze every session on the process, with only a stderr startup warning (F-alpha2) as defense, a line a stdio host's operator may never see; both handlers now refuse the call with a caller-visible structured error before ever dispatching to a worker thread when RE2 is unimportable, closing the residual regex_budget.py already documented for this exact path; the mcp extra's existing `furl-ctx[re2]` hard dependency is now pinned by a regression test so it cannot silently regress back to the vulnerable default; the real RED/GREEN discriminator is the refusal envelope, not the small fast payload used in the repro and RED proofs, `(a|b|ab)+Z` measured 0.036s/0.126s/0.498s/2.006s/8.257s at 32/36/40/44/48 chars (roughly 3.5x-4.1x per 4 extra chars), so within the module's 10,000-char cap the unbounded cost is not minutes, it is longer than any operator would wait, a de facto permanent GIL-holding freeze | #139 |
+| 2026-07-20 | test rigor, relevance/bm25 | tests/test_bm25_scorer.py | added 15 direct unit tests (tokenization boundaries, IDF known-values, hand-derived exact-score pins, the long-match bonus threshold/order-of-operations, normalization clamp, matched_terms cap) for `BM25Scorer`, previously covered only by one loose integration assertion despite sitting on `CompressionStore`'s search/search_all hot path; red-proofed by mutating the bonus threshold 8->3 chars, which left the full 2481-test suite green and 3 of the new tests red, restored with no production diff | #135 |
 
 ## Open candidates, fair game for future sessions
 
@@ -71,12 +72,25 @@ last 30 days, nor a module a merged PR touched in the last 14 days.
   survey turned up concrete targets: `furl_ctx/transforms/router_blocks.py`
   (589 lines, owns the content-block walk extracted from content_router's
   god-object) and `furl_ctx/transforms/compressor_registry.py` (151 lines)
-  have zero references anywhere under `tests/`; `furl_ctx/relevance/bm25.py`
-  (243 lines, on the retrieval hot path) has exactly one shallow integration
-  test (`tests/test_ccr.py::test_search_with_bm25`) and no direct unit tests
-  for empty query/corpus or the `avgdl == 0` division edge case;
-  `router_dispatch.py` and `router_message_policy.py` sit at 1-2 test-file
-  references versus 6-7 for comparably-sized siblings.
+  have zero references anywhere under `tests/`; `router_dispatch.py` and
+  `router_message_policy.py` sit at 1-2 test-file references versus 6-7 for
+  comparably-sized siblings. (`furl_ctx/relevance/bm25.py` was the same kind
+  of gap and is now covered as of #135; the three remaining router modules
+  above are still open.)
+- 2026-07-20 finding while writing `BM25Scorer` tests (#135), not fixed
+  there because both are dead code, not a testable behavior: the
+  `avgdl = avg_doc_len or doc_len or 1` fallback in `_bm25_score` can never
+  reach its trailing `or 1` — by the time that line executes, `doc_tokens`
+  has already passed the `if not doc_tokens: return` guard above it, so
+  `doc_len` is always >= 1. Likewise `_compute_idf`'s `doc_freq <= 0: return
+  0.0` guard is unreachable from `score_batch`, the only caller, because its
+  `idf_map` comprehension only includes terms already confirmed present in
+  `doc_freq_across`. Both are honest defensive guards for direct callers of
+  these "private" methods, not proven-dead in the non-negotiable-4 sense (no
+  repo-wide reference grep run, no removal proposed) — flagging for a future
+  simplification pass to either delete them with that proof or make the
+  intent (defends direct API use, not reachable via `score_batch`) explicit
+  in a comment.
 - Benchmark corpus growth: add a new real-world dataset family to
   benchmarks/datasets.py with provenance notes.
 - `furl_ctx/transforms/cross_message_dedup.py`'s `_DedupState.seen` (the
