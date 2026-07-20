@@ -164,6 +164,35 @@ def _err(message: str) -> list[TextContent]:
     return [TextContent(type="text", text=json.dumps({"error": message}))]
 
 
+def _refuse_regex_filters() -> list[TextContent]:
+    """Structured refusal for an agent-supplied regex filter when RE2 is absent (T11).
+
+    ``furl_retrieve``'s ``pattern`` and ``furl_compress``'s ``include_patterns``/
+    ``exclude_patterns`` are matched off the event loop (``asyncio.to_thread`` /
+    ``run_in_executor``), where no SIGALRM watchdog can ever arm (Python signal
+    handlers only run on the main thread — see
+    ``regex_budget._can_use_sigalrm``). Without RE2's linear-time engine, a
+    crafted pattern falls back to unbounded ``re`` there: CPython's ``sre``
+    holds the GIL for the whole match, so a wedged worker thread starves the
+    entire event loop and freezes every session on this process, not just the
+    caller's own request. The F-alpha2 startup warning covers this same
+    install gap, but only once at server start on stderr, a line a stdio
+    host's operator may never see; refusing the call itself is caller-visible
+    in the tool result on every affected call, regardless of who is watching
+    stderr, and — critically — never reaches the unbounded engine at all.
+    """
+    return _err(
+        "regex filters are unavailable: RE2 is not importable on this server, "
+        "so an agent-supplied pattern/include_patterns/exclude_patterns cannot "
+        "be matched safely — this handler runs filter matching off the event "
+        "loop, where no timeout watchdog can interrupt a crafted pattern, and "
+        "an unbounded match there can freeze the process for every session. "
+        "Install the re2 or mcp extra to restore filtering, for example: "
+        "pip install 'furl-ctx[mcp]'. Retry without pattern/include_patterns/"
+        "exclude_patterns to skip filtering."
+    )
+
+
 def _workspace_root() -> Path:
     """Return the resolved root that furl_read file access is confined to.
 
@@ -836,19 +865,22 @@ class FurlMCPServer:
         )
         self._setup_handlers()
 
-        # F-alpha2: the shipped MCP config runs agent-supplied regex filters (the
-        # furl_retrieve pattern and the furl_compress include/exclude patterns) on
-        # the RE2 linear-time engine. Without RE2 they fall to the ReDoS-degraded
-        # fallback, where a crafted pattern can freeze the event loop for every
-        # session on this process. Warn ONCE at server init so the degraded state
-        # is visible; a per-request log would spam.
+        # F-alpha2 (superseded by T11): the shipped MCP config runs agent-supplied
+        # regex filters (the furl_retrieve pattern and the furl_compress
+        # include/exclude patterns) on the RE2 linear-time engine when RE2 is
+        # importable. Without RE2, the T11 guard (_refuse_regex_filters, below in
+        # _handle_compress/_handle_retrieve) refuses those filters outright with a
+        # caller-visible error instead of ever matching them, so the state is
+        # UNAVAILABLE, not degraded-but-working -- no match runs, so there is no
+        # freeze risk on this path. Warn ONCE at server init so the unavailable
+        # state is visible up front instead of only discovered on the first
+        # filtered call; a per-request log would spam.
         if not re2_available():
             logger.warning(
                 "RE2 is not importable, so agent-supplied regex filters in "
-                "furl_retrieve and furl_compress run on the ReDoS-degraded "
-                "fallback path where a crafted pattern can freeze the event loop "
-                "for every session on this process. Install the re2 or mcp extra "
-                "to restore linear-time matching, for example pip install "
+                "furl_retrieve and furl_compress are refused with a "
+                "caller-visible error instead of being matched, until the re2 "
+                "or mcp extra is installed, for example pip install "
                 "'furl-ctx[mcp]'."
             )
 
@@ -1907,6 +1939,13 @@ class FurlMCPServer:
         if isinstance(patterns, str):
             return _err(patterns)
 
+        # T11: an include/exclude pattern is matched inside run_in_executor
+        # below, off the event loop, where RE2 is the only engine that can
+        # bound a crafted pattern (see _refuse_regex_filters). Refuse before
+        # dispatch instead of letting it reach the unbounded fallback.
+        if not patterns.is_empty and not re2_available():
+            return _refuse_regex_filters()
+
         # Run compression in thread pool (it's CPU-bound)
         loop = asyncio.get_running_loop()
         result = await loop.run_in_executor(None, self._compress_content, content, mode, patterns)
@@ -1982,6 +2021,11 @@ class FurlMCPServer:
         filters = RetrieveFilters.parse(arguments)
         if isinstance(filters, FilterError):
             return _err(filters.reason)
+        # T11: same worker-thread hazard as furl_compress above -- a `pattern`
+        # here is matched inside asyncio.to_thread (_retrieve_content), off
+        # the event loop. Refuse before it ever reaches that path.
+        if filters.pattern is not None and not re2_available():
+            return _refuse_regex_filters()
         if query is not None and not filters.is_empty:
             return _err(
                 "filters (pattern/fields/line_range) cannot be combined "
