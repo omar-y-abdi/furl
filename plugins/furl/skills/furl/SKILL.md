@@ -123,6 +123,15 @@ columnar table is not the universal case:
   middle so a buried error stays visible in the compressed view, with the full text
   behind the marker.
 
+**Dedup markers in a table (`_dup_count`, `<varies>`).** A kept row in the columnar
+table can carry a `_dup_count: N` field: N original rows shared this row's content and
+collapsed into it, so the row stands for N originals, not one. When those rows differed
+in a high-cardinality identity column — a per-row id, timestamp, or counter — that
+column shows the `<varies>` sentinel instead of a concrete value, because the N rows
+each had a *different* one. Read `<varies>` as "N distinct values here", never as one
+id or timestamp that recurred N times; the concrete per-row values are behind the
+marker, so `furl_retrieve` the rows when you need them.
+
 For the array and summary cases you usually want a **slice, not the whole thing**.
 The summary carries a `retrieve` hint telling you which fields to filter on. Pass a
 row-select to `furl_retrieve`:
