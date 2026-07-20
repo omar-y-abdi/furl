@@ -88,6 +88,23 @@ MODEL_PATTERNS: list[tuple[str, str]] = [
 # / `_create_fixed_estimation` must stop tagging their result `proxy_for=...`
 # — the pinning tests in tests/test_tokenizers.py force that to be a
 # conscious change, not a silently stale label.
+#
+# Neither factory logs at construction time. `get_tokenizer` is a plain
+# library call, cached per process at module scope (`_cache`) — but Furl's
+# own plugin hooks (plugins/furl/hooks/pipe_compress.py,
+# compress_tool_output.py) invoke it from a FRESH subprocess per tool call,
+# so that cache starts empty on every single invocation. A construction-time
+# `logger.warning` here fired on every tool call, not once per session — an
+# earlier revision of this fix did exactly that, and an adversarial review
+# caught it: with no logging handler configured, Python's `lastResort`
+# handler prints straight to stderr, roughly 100 writes over a 50-call
+# default-config session. See tests/test_tokenizers.py's
+# `test_claude_proxy_construction_note_never_leaks_across_real_subprocesses`
+# for the reproduction. Surfacing this note at a sane cadence is a
+# caller-side concern: a caller that wants it shown reads `proxy_for` off
+# the returned counter and formats the NOTE constant itself, at whatever
+# cadence its own layer can dedupe correctly across process boundaries —
+# this module has no visibility into "session" once a process exits.
 
 ANTHROPIC_O200K_PROXY_NOTE: str = (
     "claude-* token counts are computed with tiktoken's o200k_base encoding "
@@ -132,9 +149,10 @@ def _create_anthropic(model: str) -> TokenCounter:
     the old 3.5-chars/token flat estimate, especially for CJK and emoji
     content — but it is still a PROXY, not the real Anthropic tokenizer.
     See ``ANTHROPIC_O200K_PROXY_NOTE`` for the documented error band; the
-    returned counter's ``proxy_for`` attribute and the warning below are
-    the runtime-visible signal that a caller is not seeing exact Anthropic
-    billing tokens.
+    returned counter's ``proxy_for`` attribute and ``repr`` are the
+    caller-visible signal that this is not an exact Anthropic billing
+    count. Deliberately does NOT log at construction time (T10
+    remediation) — see the module comment above ``ANTHROPIC_O200K_PROXY_NOTE``.
 
     Falls back to EstimatingTokenCounter(3.5) only when tiktoken is absent
     (ImportError), preserving cold-path safety on minimal installs.
@@ -142,9 +160,7 @@ def _create_anthropic(model: str) -> TokenCounter:
     try:
         from .tiktoken_counter import TiktokenCounter
 
-        counter = TiktokenCounter(model, proxy_for="anthropic")
-        logger.warning("%s: %s", model, ANTHROPIC_O200K_PROXY_NOTE)
-        return counter
+        return TiktokenCounter(model, proxy_for="anthropic")
     except ImportError:
         logger.warning(
             "tiktoken not installed — claude-* falling back to 3.5-cpt estimation. "
@@ -161,8 +177,9 @@ def _create_fixed_estimation(model: str) -> TokenCounter:
     approximation than a real BPE tokenizer. See
     ``FIXED_RATIO_ESTIMATOR_NOTE`` for the documented error band (reproduced
     against this project's own tokenizer, not literature-only).
+    Deliberately does NOT log at construction time (T10 remediation) — see
+    the module comment above ``ANTHROPIC_O200K_PROXY_NOTE``.
     """
-    logger.warning("%s: %s", model, FIXED_RATIO_ESTIMATOR_NOTE)
     return EstimatingTokenCounter(chars_per_token=4.0, proxy_for="fixed_ratio_estimate")
 
 
