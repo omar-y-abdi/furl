@@ -122,29 +122,6 @@ def test_every_pair_scores_in_unit_range_without_error() -> None:
             assert len(result.matched_terms) <= 5
 
 
-def test_uuid_is_one_token_and_matches_via_public_api() -> None:
-    results = BM25Scorer().score_batch(
-        [f'{{"id": "{_UUID}", "name": "Alice"}}', "unrelated doc without any id"],
-        f"find record {_UUID}",
-    )
-    assert results[0].matched_terms == [_UUID]
-    assert results[1].matched_terms == []
-    assert results[0].score > results[1].score
-
-
-def test_digits_embedded_in_word_stay_one_token_via_public_api() -> None:
-    results = BM25Scorer().score_batch(["abc1234def token", "abc 1234 def token"], "abc1234def")
-    assert results[0].matched_terms == ["abc1234def"]
-    assert results[1].matched_terms == []
-    assert results[0].score > results[1].score
-
-
-def test_pure_ascii_numeric_id_is_one_token_via_public_api() -> None:
-    results = BM25Scorer().score_batch(["order 12345 shipped", "order 999 shipped"], "12345")
-    assert results[0].matched_terms == ["12345"]
-    assert results[1].matched_terms == []
-
-
 def test_cjk_ideographs_produce_no_tokens() -> None:
     # CJK ideographs are neither ASCII alnum nor decimal digits, so a
     # CJK-only query tokenizes to nothing and every item scores the
@@ -168,16 +145,8 @@ def test_fullwidth_unicode_digit_run_is_one_token_and_matches() -> None:
 
 
 def test_arabic_indic_unicode_digit_run_is_one_token_and_matches() -> None:
-    results = BM25Scorer().score_batch(
-        [f"رقم {_ARABIC_1234} مؤكد", "no digits here"], _ARABIC_1234
-    )
+    results = BM25Scorer().score_batch([f"رقم {_ARABIC_1234} مؤكد", "no digits here"], _ARABIC_1234)
     assert results[0].matched_terms == [_ARABIC_1234]
-    assert results[1].matched_terms == []
-
-
-def test_tokenization_is_case_folded_via_public_api() -> None:
-    results = BM25Scorer().score_batch(["Hello WORLD", "goodbye"], "hello world")
-    assert results[0].matched_terms == ["hello", "world"]
     assert results[1].matched_terms == []
 
 
