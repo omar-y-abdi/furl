@@ -32,13 +32,13 @@ use furl_core::transforms::tag_protector::{
 };
 use furl_core::transforms::{
     detect as rust_detect_chain, DetectionResult as RustDetectionResult, DiffCompressionResult,
-    DiffCompressor, DiffCompressorConfig,
-    LogCompressionResult as RustLogResult, LogCompressor as RustLogCompressor,
-    LogCompressorConfig as RustLogConfig, LogCompressorStats as RustLogStats,
-    SearchCompressionResult as RustSearchResult, SearchCompressor as RustSearchCompressor,
-    SearchCompressorConfig as RustSearchConfig, SearchCompressorStats as RustSearchStats,
-    TextCrushResult as RustTextCrushResult, TextCrusher as RustTextCrusher,
-    TextCrusherConfig as RustTextCrusherConfig, TextCrusherStats as RustTextCrusherStats,
+    DiffCompressor, DiffCompressorConfig, LogCompressionResult as RustLogResult,
+    LogCompressor as RustLogCompressor, LogCompressorConfig as RustLogConfig,
+    LogCompressorStats as RustLogStats, SearchCompressionResult as RustSearchResult,
+    SearchCompressor as RustSearchCompressor, SearchCompressorConfig as RustSearchConfig,
+    SearchCompressorStats as RustSearchStats, TextCrushResult as RustTextCrushResult,
+    TextCrusher as RustTextCrusher, TextCrusherConfig as RustTextCrusherConfig,
+    TextCrusherStats as RustTextCrusherStats,
 };
 use pyo3::exceptions::PyDeprecationWarning;
 use pyo3::prelude::*;

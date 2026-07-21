@@ -319,10 +319,7 @@ impl DiffCompressor {
             stats.output_lines = original_line_count;
             stats.compression_ratio = 1.0;
             stats.ccr_skipped_reason = Some("input below min_lines_for_ccr".into());
-            return (
-                pass_through_result(content, original_line_count),
-                stats,
-            );
+            return (pass_through_result(content, original_line_count), stats);
         }
 
         // Parse the unified diff into files + hunks (and any pre-diff
@@ -342,10 +339,7 @@ impl DiffCompressor {
             stats.output_lines = original_line_count;
             stats.compression_ratio = 1.0;
             stats.ccr_skipped_reason = Some("no diff sections parsed".into());
-            return (
-                pass_through_result(content, original_line_count),
-                stats,
-            );
+            return (pass_through_result(content, original_line_count), stats);
         }
 
         // Noise elision (DiffNoise, P2-14; config-gated, default off).
