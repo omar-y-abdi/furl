@@ -155,7 +155,7 @@ assume one):
 ## Supply chain: how the plugin fetches the engine
 
 The Claude Code plugin does not vendor the Python engine. Its hooks resolve it at
-first use with `uv run --no-project --with "furl-ctx[mcp]==1.3.0"`. Be explicit
+first use with `uv run --no-project --with "furl-ctx[mcp]==1.3.2"`. Be explicit
 about that posture (audit High-6):
 
 - **Version-pinned, not hash-pinned.** The engine version is exact
@@ -168,7 +168,7 @@ about that posture (audit High-6):
   (`tiktoken`, the `mcp` SDK) resolve to the newest compatible versions at install
   time, so transitive versions can float between installs.
 - **Hardening path for high-assurance environments.** The plugin always resolves the
-  engine through `uv run --no-project --with 'furl-ctx[mcp]==1.3.0'`. It does not consult
+  engine through `uv run --no-project --with 'furl-ctx[mcp]==1.3.2'`. It does not consult
   or prefer a `furl` already on `PATH`, so placing a vetted binary on `PATH` does not
   change what the hooks or the MCP server run. To control the fetch, point `uv` at a
   private index or mirror you trust, or pre-populate `uv`'s cache with a wheel you
