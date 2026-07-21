@@ -38,9 +38,12 @@ guard would otherwise fail every release PR forever over a version that is merel
 not tagged yet. To let those PRs pass while the guard stays armed everywhere else,
 ``test_manifest_version_has_matching_git_tag`` skips its tag assertion when the
 environment variable ``FURL_RELEASE_PR_CONTEXT`` holds the exact value ``"1"``.
-``ci.yml``'s ``test`` job sets that variable to ``"1"`` only when
-``github.head_ref`` starts with ``release-please--``, and to empty otherwise, so
-push, schedule, and workflow_dispatch runs keep the guard fully armed. Any other
+``ci.yml``'s ``test`` job sets that variable to ``"1"`` when a case-insensitive
+``startsWith`` on ``github.head_ref`` matches the prefix ``release-please--``, and
+to empty otherwise, so push, schedule, and workflow_dispatch runs keep the guard
+fully armed. GitHub's ``startsWith`` is case insensitive, and release-please always
+generates lowercase branch names such as ``release-please--branches--main``, so
+legitimate arming is unaffected. Any other
 value, unset included, leaves the assertion armed. Because setting this variable
 outside a release-PR check run disarms a real supply-chain drift guard, only
 ci.yml's branch-scoped wiring should ever set it.
@@ -218,3 +221,19 @@ def test_guard_armed_when_env_absent(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv(_RELEASE_PR_ENV_VAR, raising=False)
     monkeypatch.setattr(sys.modules[__name__], "_load_manifest_version", lambda: "1.3.0")
     test_manifest_version_has_matching_git_tag()
+
+
+def test_guard_bites_on_untagged_manifest(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Permanent proof that the tag assertion actually fires.
+
+    A manifest version with no matching tag, plus the escape hatch off, must raise
+    the drift AssertionError. This runs the real ``git tag -l`` subprocess path with
+    no mocking of the tag listing, so a future edit that deletes or waters down the
+    assertion turns this test red. The manifest read is forced to ``9.9.9`` instead
+    of relying on the live one, so it bites the same way even on a release PR, where
+    this file also runs.
+    """
+    monkeypatch.delenv(_RELEASE_PR_ENV_VAR, raising=False)
+    monkeypatch.setattr(sys.modules[__name__], "_load_manifest_version", lambda: "9.9.9")
+    with pytest.raises(AssertionError, match="v9.9.9"):
+        test_manifest_version_has_matching_git_tag()
