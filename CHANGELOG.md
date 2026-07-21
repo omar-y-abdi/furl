@@ -5,6 +5,20 @@ All notable changes to Furl will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.2](https://github.com/omar-y-abdi/furl-ctx/compare/v1.3.0...v1.3.2) (2026-07-21)
+
+
+### Bug Fixes
+
+* close wave2 review sweep gaps across CI, tests, and docs ([#146](https://github.com/omar-y-abdi/furl-ctx/issues/146)) ([68ae175](https://github.com/omar-y-abdi/furl-ctx/commit/68ae175373c14b0732a4bff9de7e5cccfd8a91b0))
+* release-PR tag-guard context skip + cyclonedx CLI repair ([#147](https://github.com/omar-y-abdi/furl-ctx/issues/147)) ([ae8167f](https://github.com/omar-y-abdi/furl-ctx/commit/ae8167ffbed3a20a4b7dca88739f973745203534))
+* surface opaque code-offload economics honestly ([#141](https://github.com/omar-y-abdi/furl-ctx/issues/141)) ([1323a3d](https://github.com/omar-y-abdi/furl-ctx/commit/1323a3d44147205bc444b8e4b77f5d399a40a453))
+
+
+### Code Refactoring
+
+* lazy-dev deletion sweep — net −4,070 lines, zero behavior change ([#145](https://github.com/omar-y-abdi/furl-ctx/issues/145)) ([8ce3585](https://github.com/omar-y-abdi/furl-ctx/commit/8ce3585dbe160c6eea47ed9f6d6186f5dc237cdc))
+
 ## [1.3.0](https://github.com/omar-y-abdi/furl-ctx/compare/v1.2.0...v1.3.0) (2026-07-18)
 
 
