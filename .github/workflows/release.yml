@@ -17,11 +17,14 @@ env:
   # Variables → New repository variable `PYPI_SKIP` = 'true'.
   # Locally via act: pass -e event.yml or set in .actrc.local (see
   # .actrc.local.example).
-  # Current state: 'true' — the `furl-ctx` PyPI project is owned by the
-  # upstream author; this fork has no PyPI trusted publisher configured, so
-  # the publish exchange fails (`invalid-publisher`). Set the variable to
-  # 'false' after configuring a trusted publisher under your own PyPI
-  # package name.
+  # Semantics: 'true' short-circuits the `publish-pypi` job's own `if:` below
+  # to skipped (no PyPI upload attempted) while still letting `create-release`
+  # proceed. Any other value (`false`, unset, or anything else) requires
+  # `publish-pypi` to actually run and succeed before `create-release` will
+  # proceed. This comment intentionally does not state which value is set
+  # right now: that is live repository state which drifts independently of
+  # this file, so check it directly with `gh variable get PYPI_SKIP` or the
+  # GitHub UI path above rather than trusting a comment to have kept up.
 
 on:
   # Triggered when release-please's release PR is merged: the bot
