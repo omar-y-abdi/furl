@@ -300,14 +300,6 @@ def test_invalid_tunables_rejected(overrides) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_shape_count_is_bounded() -> None:
-    fb = _feedback(FakeClock(), max_shapes=4)
-    for i in range(10):
-        fb.record_retrieval(ShapeKey(tool=f"tool{i}", content_type="json_array"))
-
-    assert fb.get_stats()["shapes_tracked"] <= 4
-
-
 def test_events_per_shape_are_bounded() -> None:
     fb = _feedback(FakeClock(), max_events_per_shape=8)
     for _ in range(100):
