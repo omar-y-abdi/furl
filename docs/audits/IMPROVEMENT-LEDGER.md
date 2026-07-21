@@ -31,6 +31,7 @@ last 30 days, nor a module a merged PR touched in the last 14 days.
 | 2026-07-20 | retention, per-namespace CCR spill, audit T6 | furl_ctx/cache/compression_store.py, plugins/furl/.mcp.json, plugins/furl/hooks/{compress_tool_output,pipe_compress,pretool_pipe}.py, plugins/furl/{README.md,skills/furl/SKILL.md}, tests/test_ccr_spill_plugin_namespace_gap.py | `_build_namespace_store` now wires a per-namespace durable spill gated by `FURL_CCR_SPILL`, so a capacity-evicted entry is demoted to the namespace's own `ccr-ns-<digest>-spill.sqlite3` instead of dropped at the 1000-entry cap and stays retrievable past eviction; per-namespace and `-spill` suffixed so no tenant reads another's rows, deliberately skipping the global sqlite-primary guard that would otherwise leave the sqlite-backed plugin with no spill at all; the plugin now sets `FURL_CCR_SPILL` in `.mcp.json` and the hooks so retention is real, and the #134 gap pin flips to a spill HIT alongside an isolation test proving two namespaces spill to different 0600 files under a 0700 dir | #138 |
 | 2026-07-20 | security, MCP regex-filter ReDoS (T11 pre-mortem audit) | furl_ctx/ccr/mcp_server.py, furl_ctx/ccr/regex_budget.py, tests/test_mcp_server_handlers.py, tests/test_regex_budget.py | furl_retrieve's `pattern` and furl_compress's `include_patterns`/`exclude_patterns` are matched off the event loop (run_in_executor/asyncio.to_thread), where no SIGALRM watchdog can ever arm; without RE2 they fell back to unbounded stdlib `re`, so a crafted pattern could freeze every session on the process, with only a stderr startup warning (F-alpha2) as defense, a line a stdio host's operator may never see; both handlers now refuse the call with a caller-visible structured error before ever dispatching to a worker thread when RE2 is unimportable, closing the residual regex_budget.py already documented for this exact path; the mcp extra's existing `furl-ctx[re2]` hard dependency is now pinned by a regression test so it cannot silently regress back to the vulnerable default; the real RED/GREEN discriminator is the refusal envelope, not the small fast payload used in the repro and RED proofs, `(a|b|ab)+Z` measured 0.036s/0.126s/0.498s/2.006s/8.257s at 32/36/40/44/48 chars (roughly 3.5x-4.1x per 4 extra chars), so within the module's 10,000-char cap the unbounded cost is not minutes, it is longer than any operator would wait, a de facto permanent GIL-holding freeze | #139 |
 | 2026-07-20 | test rigor, relevance/bm25 | tests/test_bm25_scorer.py | added 15 direct unit tests (tokenization boundaries, IDF known-values, hand-derived exact-score pins, the long-match bonus threshold/order-of-operations, normalization clamp, matched_terms cap) for `BM25Scorer`, previously covered only by one loose integration assertion despite sitting on `CompressionStore`'s search/search_all hot path; red-proofed by mutating the bonus threshold 8->3 chars, which left the full 2481-test suite green and 3 of the new tests red, restored with no production diff | #135 |
+| 2026-07-21 | test rigor, router_dispatch SMART_CRUSHER no-savings fallback | tests/test_router_dispatch_no_savings_fallback.py | `StrategyDispatcher.apply`'s post-dispatch fallback chain (the safety net that reverts an expanded SMART_CRUSHER result and decides whether a last-ditch LOG fallback is actually smaller before adopting it) had zero direct or indirect coverage; proved by independently disabling the expansion-revert arm, the log-adoption comparison, forcing unconditional log adoption, widening `<` to `<=` at the exact-equal boundary, and removing the `try/except` fail-open around the log compressor call — each of the 5 mutations left the full 2597-test suite 100% green; 5 new tests pin all 5 behaviors with a RED proof per test (each mutation reproduced and shown to fail only its own test, then reverted); no production code changed | #142 |
 
 ## Open candidates, fair game for future sessions
 
@@ -75,8 +76,24 @@ last 30 days, nor a module a merged PR touched in the last 14 days.
   have zero references anywhere under `tests/`; `router_dispatch.py` and
   `router_message_policy.py` sit at 1-2 test-file references versus 6-7 for
   comparably-sized siblings. (`furl_ctx/relevance/bm25.py` was the same kind
-  of gap and is now covered as of #135; the three remaining router modules
-  above are still open.)
+  of gap and is now covered as of #135; `router_dispatch.py`'s SMART_CRUSHER
+  no-savings fallback chain specifically — the expansion-revert and the
+  log-fallback adoption comparison, both boundary cases — is now covered by
+  the mutation-proofed tests added in this session, see the row below.
+  `router_dispatch.py`'s other branches, `router_blocks.py`,
+  `compressor_registry.py`, and `router_message_policy.py` remain open.)
+  Also surfaced while mutation-testing this file this session but not
+  chased down: forcing `router_dispatch.py`'s envelope-ingestion
+  `suppress_no_savings_fallback` flag to `False` (the sibling of the
+  tabular-CSV flag two lines below it, which the existing
+  `test_csv_schema_decoder_roundtrip_fuzz.py`/`test_lossless_fidelity.py`
+  suite already catches) made one `pytest` run stall past a 2-minute
+  timeout on a rerun that otherwise takes ~70 seconds; a second, careful
+  rerun of an unrelated mutation nearby completed normally, so this reads
+  as environment flakiness rather than a reproduced hang, but it was never
+  confirmed innocent either. Needs a dedicated, isolated repro (single test
+  file, `-p no:randomly` if applicable, resource monitoring) before either
+  writing a regression test or dismissing it.
 - 2026-07-20 finding while writing `BM25Scorer` tests (#135), not fixed
   there because both are dead code, not a testable behavior: the
   `avgdl = avg_doc_len or doc_len or 1` fallback in `_bm25_score` can never
@@ -153,3 +170,17 @@ would only cost a future session the time to rediscover this.
   Advanced Security / Copilot platform feature outside `ci.yml` entirely.
   Confirmed persistent across two separate PRs; left as red each time —
   nothing in this repo can fix a 400 from GitHub's own model routing.
+- 2026-07-21 session start: `python -c "import furl_ctx, re2"` passed (Phase
+  0's own smoke check), but the first full `pytest tests/ -q` run on a
+  completely untouched checkout showed 16 failures, all CCR recovery-hash
+  and lossless-fidelity tests expecting the 24-hex key width from #133
+  while the actual crush output still carried the pre-#133 12-hex key. Root
+  cause: `target/release/lib_core.so` was compiled before #133/#137/#139
+  landed (its mtime was `Jul 18 23:14`, HEAD was already at #135's merge),
+  so the environment's Rust extension was stale relative to `HEAD` even
+  though it imported fine. `maturin develop --release --extras dev,mcp`
+  rebuilt it and the exact same checkout went to 2597 passed, 0 failed.
+  Not a code regression — a container/session artifact — but worth this
+  note so a future session facing a red `pytest` on an "untouched" checkout
+  checks the compiled extension's freshness before concluding main is
+  broken and starting a root-cause-fix session per Phase 0.5.
