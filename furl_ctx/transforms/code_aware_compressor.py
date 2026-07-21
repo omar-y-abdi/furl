@@ -575,19 +575,19 @@ class CodeAwareCompressor:
             _warn_missing_dep_once()
             return self._passthrough(content)
 
-        detected, confidence = self._resolve_language(content, language)
+        detected, _confidence = self._resolve_language(content, language)
         if detected is CodeLanguage.UNKNOWN:
             return self._passthrough(content)
 
         if not self.config.enable_ccr:
             # No recovery plane → a truncating render would be silent loss.
-            return self._passthrough(content, detected, confidence)
+            return self._passthrough(content, detected)
 
         try:
             compressed_code = self._compress_with_ast(content, detected, context)
         except Exception as e:
             logger.warning("code_aware: AST compression failed (%s); passing through", e)
-            return self._passthrough(content, detected, confidence)
+            return self._passthrough(content, detected)
 
         # Build the shipped render: code + Shape-H marker as a line comment.
         cache_key = hashlib.sha256(content.encode("utf-8", "surrogatepass")).hexdigest()[:24]
@@ -603,14 +603,14 @@ class CodeAwareCompressor:
         # Savings gates (cheap, before the verification parse).
         ratio = len(shipped) / max(len(content), 1)
         if ratio >= self.config.max_shippable_ratio:
-            return self._passthrough(content, detected, confidence)
+            return self._passthrough(content, detected)
         if ratio < self.config.min_shippable_ratio:
             logger.warning(
                 "code_aware: render implausibly small (ratio=%.3f) for %s; passing through",
                 ratio,
                 detected.value,
             )
-            return self._passthrough(content, detected, confidence)
+            return self._passthrough(content, detected)
 
         # Syntax gate: the FINAL shipped bytes must parse cleanly.
         if not self._verify_syntax(shipped, detected):
@@ -619,11 +619,11 @@ class CodeAwareCompressor:
                 detected.value,
                 original_lines,
             )
-            return self._passthrough(content, detected, confidence)
+            return self._passthrough(content, detected)
 
         # CCR gate: full original persisted under the marker's hash, or veto.
         if not self._persist_to_python_ccr(content, shipped, cache_key):
-            return self._passthrough(content, detected, confidence)
+            return self._passthrough(content, detected)
 
         return CodeCompressionResult(
             compressed=shipped,
@@ -659,9 +659,7 @@ class CodeAwareCompressor:
 
     @staticmethod
     def _passthrough(
-        content: str,
-        language: CodeLanguage = CodeLanguage.UNKNOWN,
-        confidence: float = 0.0,
+        content: str, language: CodeLanguage = CodeLanguage.UNKNOWN
     ) -> CodeCompressionResult:
         """Identity result: the original bytes ship, no marker, no store row."""
         n_lines = len(content.splitlines())
