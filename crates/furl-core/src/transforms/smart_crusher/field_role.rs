@@ -57,6 +57,42 @@ pub const IDENTITY_SHAPE_FRACTION: f64 = 0.8;
 /// 0.7 mirrors the entropy gate in `detect_id_field_statistically`.
 pub const IDENTITY_ENTROPY_THRESHOLD: f64 = 0.7;
 
+/// Vowel ratio (over the alphabetic characters of a whitespace-free token)
+/// below which the token is treated as non-linguistic — i.e. not an
+/// ordinary short word or filename — for the entropy fallback below.
+///
+/// `calculate_string_entropy` normalizes by the string's OWN alphabet size
+/// (`log2(min(distinct_chars, length))`), so it cannot by itself tell a
+/// random opaque token from a short natural-language token: both tend to
+/// have mostly-distinct characters and score near 1.0. A repo-identifier
+/// corpus (real filenames and source identifiers from this project, 4-20
+/// chars) swept against synthetic random hex/base62 tokens of matching
+/// lengths at candidate vowel-ratio thresholds of 0.10/0.12/0.15/0.18/0.20
+/// found 0.10 gave the lowest false-positive rate on the natural corpus
+/// (1/96, versus ~96/96 with no corroborating check at all) while still
+/// catching the large majority of random tokens (285/300, versus 300/300
+/// uncorroborated) — see PR body for the sweep. English words average
+/// ~38-40% vowels, so 0.10 sits well below any natural-language token.
+///
+/// ASCII-only by design: only `a/e/i/o/u` count as vowels, so a single
+/// CJK/Cyrillic/etc. token, or a Latin word whose only vowels are
+/// diacritic (e.g. French `deja` written as `déjà`), reads as 0 vowels and
+/// is treated as non-linguistic. This is not a regression — pre-fix, ANY
+/// high-entropy single token was already misclassified regardless of
+/// script — but it means this fix's false-positive reduction is proven
+/// only for ASCII/English-like content; non-ASCII natural-language content
+/// remains as misclassified as before.
+pub const IDENTITY_TOKEN_VOWEL_RATIO_THRESHOLD: f64 = 0.10;
+
+/// Fraction of the sampled tokens that must independently look
+/// non-linguistic (see [`looks_non_linguistic`]) before the entropy
+/// fallback trusts its high-average-entropy reading. Deliberately a
+/// separate constant from [`IDENTITY_SHAPE_FRACTION`] even though both
+/// currently hold 0.8: the two gate unrelated evidence (regex/format shape
+/// match vs. digit-presence/vowel-ratio), and retuning one must not
+/// silently retune the other.
+pub const IDENTITY_NONLINGUISTIC_FRACTION: f64 = 0.8;
+
 /// Max values to sample per field when shape-matching. Bounds the cost to a
 /// constant per field regardless of array size. 20 mirrors the existing
 /// `values[:20]` sampling in `field_detect.rs`.
@@ -116,7 +152,8 @@ fn is_identity_shaped(stats: &FieldStats, sample: &[&Value]) -> bool {
 /// String identity: a clear majority of the sample matches ISO-8601,
 /// ISO-date, UUID, or a long hex run; OR the sample is high-entropy
 /// *token-like* (opaque ids — no whitespace, no natural-language
-/// structure).
+/// structure) AND shape-independent evidence says the tokens are not
+/// ordinary short words (see [`looks_non_linguistic`]).
 fn string_is_identity(sample: &[&Value]) -> bool {
     let strs: Vec<&str> = sample.iter().filter_map(|v| v.as_str()).collect();
     if strs.is_empty() {
@@ -150,7 +187,41 @@ fn string_is_identity(sample: &[&Value]) -> bool {
         .map(|s| calculate_string_entropy(s))
         .sum::<f64>()
         / strs.len() as f64;
-    avg_entropy > IDENTITY_ENTROPY_THRESHOLD
+    if avg_entropy <= IDENTITY_ENTROPY_THRESHOLD {
+        return false;
+    }
+
+    // High entropy alone is not enough: single-word natural-language
+    // tokens (filenames like `main.rs`, short words like `urgent`) also
+    // score near-maximal normalized entropy because the metric is
+    // normalized by the token's OWN alphabet size, not a language model.
+    // Require a majority of the sample to also look non-linguistic
+    // (contains a digit, or has an unusually low vowel ratio), mirroring
+    // the shape check's own majority-vote fraction above but gated by its
+    // own constant — this is unrelated evidence, not the same threshold.
+    let non_linguistic = strs.iter().filter(|s| looks_non_linguistic(s)).count();
+    (non_linguistic as f64 / strs.len() as f64) >= IDENTITY_NONLINGUISTIC_FRACTION
+}
+
+/// True when a whitespace-free token does not look like an ordinary
+/// natural-language word or filename: it contains a digit (hashes, ids,
+/// and counters overwhelmingly do; English words essentially never do),
+/// or its vowel ratio over alphabetic characters is below
+/// [`IDENTITY_TOKEN_VOWEL_RATIO_THRESHOLD`]. A token with no alphabetic
+/// characters at all (pure punctuation/symbols) is also non-linguistic.
+fn looks_non_linguistic(s: &str) -> bool {
+    if s.bytes().any(|b| b.is_ascii_digit()) {
+        return true;
+    }
+    let letters: Vec<char> = s.chars().filter(|c| c.is_alphabetic()).collect();
+    if letters.is_empty() {
+        return true;
+    }
+    let vowels = letters
+        .iter()
+        .filter(|c| matches!(c.to_ascii_lowercase(), 'a' | 'e' | 'i' | 'o' | 'u'))
+        .count();
+    (vowels as f64 / letters.len() as f64) < IDENTITY_TOKEN_VOWEL_RATIO_THRESHOLD
 }
 
 /// Numeric identity: a monotone / sequential counter (mirrors the
@@ -310,6 +381,113 @@ mod tests {
     }
 
     #[test]
+    fn single_word_filenames_are_content_not_identity() {
+        // `calculate_string_entropy` normalizes by the token's own alphabet
+        // size, so short single-word tokens with mostly-distinct characters
+        // score near-maximal entropy whether or not they are random — real
+        // filenames from this repo all score 0.94-1.00, well above
+        // IDENTITY_ENTROPY_THRESHOLD (0.7). Without the non-linguistic
+        // corroboration check every one of these is misclassified as
+        // identity noise, so a "which file was touched" column would be
+        // silently dropped from the dedup projection and rows describing
+        // genuinely different files would collapse together.
+        let s = stats(FieldType::String, 1.0, false);
+        let sample: Vec<Value> = [
+            "utils.py",
+            "main.rs",
+            "index.ts",
+            "router.py",
+            "field_role.rs",
+            "planning.rs",
+            "crusher.rs",
+            "walker.rs",
+            "builder.rs",
+            "config.rs",
+            "constraints.rs",
+            "observer.rs",
+            "traits.rs",
+            "pipeline.py",
+            "registry.py",
+            "compress.py",
+            "retrieve.py",
+            "tokenizer.py",
+            "redaction.py",
+            "paths.py",
+        ]
+        .iter()
+        .map(|f| json!(f))
+        .collect();
+        assert_eq!(classify_field(&s, &refs(&sample)), FieldRole::Content);
+    }
+
+    #[test]
+    fn opaque_random_tokens_with_digits_are_still_identity() {
+        // Regression guard for the fallback's actual purpose: a genuinely
+        // opaque high-entropy token stream (session ids, short random keys)
+        // with no recognized shape must still classify as VaryingIdentity.
+        // Deterministic sample: Python `random.seed(123)`,
+        // `''.join(random.choice(string.ascii_letters + string.digits) for
+        // _ in range(12))` x20 — 90% contain a digit, avg normalized
+        // entropy ~0.99.
+        let s = stats(FieldType::String, 1.0, false);
+        let sample: Vec<Value> = [
+            "drfXArg153cy",
+            "IJvv2dkivJvS",
+            "pka5BXf4Myea",
+            "uUCg5cfQjiY6",
+            "bs6BKEqE1cXt",
+            "vHZEn0MOHKZ9",
+            "uaz5XPGBRIOY",
+            "QM41FHQAxGc2",
+            "WPlU0f6FQqkv",
+            "vJz4eUDyKXvb",
+            "mLf1Oxa5wozI",
+            "GU06dOsF9WOU",
+            "oIEljICyWDca",
+            "iDmbqZwRr9BO",
+            "AagNeGwTffB5",
+            "aYIyeISOzbuq",
+            "9EcWJvAwbOOk",
+            "49AeT3RjxQpV",
+            "f04OdWHyItj6",
+            "PX6sX1yxiIvH",
+        ]
+        .iter()
+        .map(|t| json!(t))
+        .collect();
+        assert_eq!(
+            classify_field(&s, &refs(&sample)),
+            FieldRole::VaryingIdentity
+        );
+    }
+
+    #[test]
+    fn looks_non_linguistic_boundary_cases() {
+        assert!(looks_non_linguistic("abc123"), "contains a digit");
+        assert!(
+            looks_non_linguistic("bcdfg"),
+            "no vowels at all -> ratio 0.0"
+        );
+        assert!(!looks_non_linguistic("urgent"), "ordinary English word");
+        assert!(!looks_non_linguistic("main.rs"), "ordinary filename");
+        assert!(
+            looks_non_linguistic("!!!"),
+            "no alphabetic characters at all"
+        );
+        // Exact threshold: 1 vowel / 10 letters = 0.10 is NOT < 0.10, so the
+        // comparison is strict and this token stays linguistic.
+        assert!(
+            !looks_non_linguistic("bcdfghjkla"),
+            "vowel ratio exactly at the 0.10 threshold is not below it"
+        );
+        // One letter longer with the same single vowel: 1/11 ~= 0.0909 < 0.10.
+        assert!(
+            looks_non_linguistic("bcdfghjklma"),
+            "vowel ratio just below the 0.10 threshold is non-linguistic"
+        );
+    }
+
+    #[test]
     fn sequential_numeric_is_identity() {
         let s = stats(FieldType::Numeric, 1.0, false);
         let sample: Vec<Value> = (0..20).map(|i| json!(1000 + i)).collect();
@@ -345,6 +523,53 @@ mod tests {
             "unique english subject is content, not identity"
         );
         assert!(!exclude.contains("author"), "low-cardinality is content");
+    }
+
+    #[test]
+    fn compute_exclude_set_keeps_near_unique_filename_column() {
+        // Build-audit-log shape: every row touches a different, genuinely
+        // distinguishing file (near-unique, high normalized entropy) while
+        // "status" is constant. Before the non-linguistic corroboration
+        // check, "file" shape-matched nothing but tripped the entropy
+        // fallback anyway and was wrongly excluded — collapsing 20 rows
+        // that each named a DIFFERENT file into one `_dup_count:20`
+        // representative, hiding exactly the information ("which file")
+        // the log exists to record.
+        let files = [
+            "utils.py",
+            "main.rs",
+            "index.ts",
+            "router.py",
+            "field_role.rs",
+            "planning.rs",
+            "crusher.rs",
+            "walker.rs",
+            "builder.rs",
+            "config.rs",
+            "constraints.rs",
+            "observer.rs",
+            "traits.rs",
+            "pipeline.py",
+            "registry.py",
+            "compress.py",
+            "retrieve.py",
+            "tokenizer.py",
+            "redaction.py",
+            "paths.py",
+        ];
+        let items: Vec<Value> = files
+            .iter()
+            .map(|f| json!({"file": f, "status": "OK"}))
+            .collect();
+        let mut fs: BTreeMap<String, FieldStats> = BTreeMap::new();
+        fs.insert("file".into(), stats(FieldType::String, 1.0, false));
+        fs.insert("status".into(), stats(FieldType::String, 0.05, true));
+
+        let exclude = compute_exclude_set(&fs, &items);
+        assert!(
+            !exclude.contains("file"),
+            "distinct filenames are content, not identity noise"
+        );
     }
 
     #[test]
