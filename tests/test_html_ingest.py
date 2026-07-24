@@ -67,3 +67,37 @@ def test_compress_html_vetoes_on_persist_failure(monkeypatch) -> None:
     monkeypatch.setattr(html_ingest, "persist_to_python_ccr", lambda *a, **k: False)
     out = html_ingest.compress_html(_page(), token_counter=len)
     assert out is None  # vetoed → no dangling marker
+
+
+def test_adjacent_table_cells_do_not_fuse() -> None:
+    # Two cells "5" and "3" must never read as the number "53" in the
+    # extracted view the model consumes.
+    assert extract_main_content("<table><tr><td>5</td><td>3</td></tr></table>") == "5 3"
+
+
+def test_table_rows_keep_cell_and_row_structure() -> None:
+    html = "<table><tr><th>Name</th><th>Age</th></tr><tr><td>Ann</td><td>7</td></tr></table>"
+    assert extract_main_content(html) == "Name Age\nAnn 7"
+
+
+def test_inline_whitespace_between_elements_is_preserved() -> None:
+    # The whitespace between two inline elements arrives as its own data
+    # event; it must collapse to one space (browser semantics), not vanish.
+    assert extract_main_content("<p><span>Hello</span>\n  <span>World</span></p>") == "Hello World"
+
+
+def test_text_after_block_close_does_not_fuse() -> None:
+    assert extract_main_content("<div>alpha</div>beta") == "alpha\nbeta"
+    assert extract_main_content("<ul><li>one</li>two</ul>") == "one\ntwo"
+
+
+def test_deliberately_adjacent_inline_text_still_fuses() -> None:
+    # No whitespace in the source between the <b> runs: a browser renders
+    # "10USD", so the extractor must too — separators are only ever
+    # reintroduced where the source had a boundary (whitespace/cell/block).
+    assert extract_main_content("<p>Price <b>10</b><b>USD</b> total</p>") == "Price 10USD total"
+
+
+def test_intra_data_spacing_and_block_lines_unchanged() -> None:
+    assert extract_main_content("<p>keep <b>bold</b> spacing</p>") == "keep bold spacing"
+    assert extract_main_content("<p>one</p><p>two</p>") == "one\ntwo"
